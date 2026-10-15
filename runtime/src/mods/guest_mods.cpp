@@ -81,6 +81,7 @@ void set_game_calls(void (*original)(Cpu*, uint32_t), uint32_t (*call)(Cpu*, uin
 void install(const std::function<void(uint32_t, void (*)(Cpu*))>& replace);
 }
 namespace guestmods {
+bool (*read_game_texture)(uint32_t,uint32_t&,uint32_t&,std::vector<uint8_t>&)=nullptr;
 namespace {
 
 struct Chain {
@@ -95,6 +96,10 @@ struct Loaded {
     uint32_t hud_callback=0,hud_screen=0;
     uint64_t hud_step=0;
     bool hud_called=false;
+    // wwhd_hud_register_drc: a second list, GamePad only, beside the one of wwhd_hud_register
+    uint32_t drc_callback=0;
+    uint64_t drc_step=0;
+    bool drc_called=false;
     const WWHDGuestModuleV1* m=nullptr;
     uint32_t region_size=0;
     mods::json::Value options;
@@ -251,8 +256,24 @@ void svc_hud_register(Cpu* c) {
     }
     if(mod.hud_callback!=callback||mod.hud_screen!=screen)mod.hud_called=false;
     mod.hud_callback=callback;mod.hud_screen=screen;
-    if(!callback)hud::store().drop(mod.id);
-    bool any=false;for(const auto& loaded:g_loaded)any|=loaded.hud_callback!=0;
+    if(!callback)hud::store().drop(mod.id,0);
+    bool any=false;for(const auto& loaded:g_loaded)any|=loaded.hud_callback!=0||loaded.drc_callback!=0;
+    g_hud_callbacks.store(any,std::memory_order_release);c->r[3]=1;
+}
+// The mod's GamePad list (854 x 480), recorded by its own callback after the main one, so a mod can draw
+// on the TV and on the GamePad at once (a minimap marker on the GamePad's sea chart while its TV list
+// shows name tags). A null callback unregisters it.
+void svc_hud_register_drc(Cpu* c) {
+    auto& mod=owner(c);uint32_t callback=c->r[3];c->r[3]=0;
+    std::lock_guard lock(g_hud_mutex);
+    if(callback) {
+        bool found=false;for(uint32_t i=0;i<mod.m->func_count;++i)found|=mod.m->funcs[i].addr==callback;
+        if(!found){hud::store().note(mod.id,"HUD registration failed: callback must belong to this mod");return;}
+    }
+    if(mod.drc_callback!=callback)mod.drc_called=false;
+    mod.drc_callback=callback;
+    if(!callback)hud::store().drop(mod.id,1);
+    bool any=false;for(const auto& loaded:g_loaded)any|=loaded.hud_callback!=0||loaded.drc_callback!=0;
     g_hud_callbacks.store(any,std::memory_order_release);c->r[3]=1;
 }
 void svc_hud_texture(Cpu* c) {
@@ -265,6 +286,25 @@ void svc_hud_texture(Cpu* c) {
         c->r[3]=hud::store().create_image(mod.id,pixels.width,pixels.height,pixels.width*4,pixels.rgba.data(),pixels.rgba.size());
         if(!c->r[3])hud::store().note(mod.id,"HUD PNG load failed: per-mod image quota exceeded");
     }catch(const std::exception&){hud::store().note(mod.id,"HUD PNG load failed: missing, invalid or oversized texture");}
+}
+// Pictures of the running game for a mod's HUD (nothing of the game is stored): a GX2Texture in guest
+// memory decoded into the mod's buffer (RGBA8, rows top-down), and an image made from the mod's pixels.
+void svc_hud_game_pixels(Cpu* c) {
+    auto& mod=owner(c);uint32_t texture=c->r[3],buffer=c->r[4],capacity=c->r[5];c->r[3]=0;
+    uint32_t w=0,h=0;std::vector<uint8_t> rgba;
+    if(!read_game_texture||!read_game_texture(texture,w,h,rgba)||!w||!h||w>2048||h>2048||rgba.size()!=size_t(w)*h*4)return;
+    const uint32_t bytes=w*h*4;
+    if(buffer||capacity) {
+        if(capacity<bytes||!setting_buffer(mod,buffer,bytes))return;
+        std::memcpy(mem::ptr(buffer),rgba.data(),bytes);
+    }
+    c->r[3]=(w<<16)|h;
+}
+void svc_hud_image(Cpu* c) {
+    auto& mod=owner(c);uint32_t pixels=c->r[3],w=c->r[4],h=c->r[5];c->r[3]=0;
+    if(!w||!h||w>2048||h>2048||!setting_buffer(mod,pixels,w*h*4)){hud::store().note(mod.id,"HUD image failed: invalid pixel buffer");return;}
+    c->r[3]=hud::store().create_image(mod.id,w,h,w*4,(const uint8_t*)mem::ptr(pixels),size_t(w)*h*4);
+    if(!c->r[3])hud::store().note(mod.id,"HUD image failed: per-mod image quota exceeded");
 }
 void svc_hud_release(Cpu* c) {c->r[3]=hud::store().release(owner(c).id,c->r[3]);}
 void svc_hud_epoch(Cpu* c) {auto epoch=hud::store().state_generation();c->r[3]=uint32_t(epoch>>32);c->r[4]=uint32_t(epoch);}
@@ -432,7 +472,7 @@ const std::unordered_map<std::string, PpcFunc> kServices = {
     {"wwhd_config_bool",svc_config_bool},{"wwhd_config_float",svc_config_float},{"wwhd_config_string",svc_config_string},
     {"wwhd_malloc",svc_malloc},{"wwhd_free",svc_free},{"wwhd_input_read",svc_input},
     {"wwhd_file_read",svc_file_read},{"wwhd_file_write",svc_file_write},
-    {"wwhd_hud_register",svc_hud_register},{"wwhd_hud_texture",svc_hud_texture},
+    {"wwhd_hud_register",svc_hud_register},{"wwhd_hud_register_drc",svc_hud_register_drc},{"wwhd_hud_game_pixels",svc_hud_game_pixels},{"wwhd_hud_image",svc_hud_image},{"wwhd_hud_texture",svc_hud_texture},
     {"wwhd_hud_clip",svc_hud_clip},{"wwhd_hud_release",svc_hud_release},{"wwhd_hud_epoch",svc_hud_epoch},{"wwhd_hud_emit",svc_hud_emit},
     {"wwhd_setting_get",svc_setting_get},{"wwhd_setting_changed",svc_setting_changed},
     {"wwhd_logic_dt",svc_logic_dt},{"wwhd_logic_step",svc_logic_step},
@@ -856,15 +896,18 @@ bool hooks_built() { return g_mod_hook_count != 0 && g_mod_hook_flags && g_mod_b
 void frame(uint64_t step) {g_logic_step.store(step,std::memory_order_relaxed);story_notebook::logic_step(step);}
 void draw_frame(Cpu* c,uint64_t step) {
     if(!c||!g_hud_callbacks.load(std::memory_order_acquire))return;
-    for(auto& mod:g_loaded) {
+    for(auto& mod:g_loaded)for(uint32_t slot=0;slot<2;++slot) {
         uint32_t callback,screen;
         {
             std::lock_guard lock(g_hud_mutex);
-            if(!mod.hud_callback||(mod.hud_called&&mod.hud_step==step))continue;
-            mod.hud_step=step;mod.hud_called=true;callback=mod.hud_callback;screen=mod.hud_screen;
+            uint32_t& cb=slot?mod.drc_callback:mod.hud_callback;
+            uint64_t& at=slot?mod.drc_step:mod.hud_step;
+            bool& called=slot?mod.drc_called:mod.hud_called;
+            if(!cb||(called&&at==step))continue;
+            at=step;called=true;callback=cb;screen=slot?1u:mod.hud_screen;
         }
-        auto list=hud::store().begin(mod.id,screen);
-        if(!list){hud::store().drop(mod.id);continue;}
+        auto list=hud::store().begin(mod.id,screen,slot);
+        if(!list){hud::store().drop(mod.id,slot);continue;}
         Cpu saved=*c;
         try {guest_call(c,callback,{list});hud::store().commit(mod.id,list);}
         catch(...) {hud::store().fail(mod.id,list,"HUD callback failed; draw list dropped");hud::store().commit(mod.id,list);}
@@ -882,7 +925,7 @@ void state_loaded() {
     story_notebook::state_loaded();
     story_bag::state_loaded();
     story_lyt_screen::state_loaded();
-    for(auto& mod:g_loaded)mod.hud_called=false;
+    for(auto& mod:g_loaded)mod.hud_called=mod.drc_called=false;
 }
 
 }  // namespace guestmods

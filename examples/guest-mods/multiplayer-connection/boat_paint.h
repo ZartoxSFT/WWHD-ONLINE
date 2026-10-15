@@ -12,7 +12,13 @@
  * every write): the archive memory of a ship left behind may be reused by the game. One no longer
  * used keeps its copy (never written) until the space is needed: the ship may come back with the
  * same memory, still painted by us. A texture the game reloaded (hash of its first bytes changed)
- * is copied again. */
+ * is copied again.
+ *
+ * A texture the local Link's model data also uses (mpCLModelData +0x444, the same texture table at
+ * +0x30) is never painted: in 0.2.10 the boat colour darkened Link (one of the two 1024x1024 BC1
+ * textures the ship lists, 24FBC164, lies outside the ship archive). Each texture is logged with its
+ * name: model data +0x34 is the JUTNameTab (ShipCreateModelTextures::mTextureName,
+ * d_a_ship_create.cpp), read with 027ED1F0 as daShip_replaceSeaETextures and playerInit do. */
 #pragma once
 #include "wwhd_guest.h"
 #include "tunic.h"
@@ -26,6 +32,10 @@
 #define BOAT_BUDGET_BYTES (4u << 20)       /* all pristine copies (heap_size 8 MiB, tunic included) */
 #define BOAT_SCAN_PERIOD 15                /* ship executes between two scans (0.5 s) */
 #define BOAT_PAINT_MIN_SHARE 10            /* per mille of paint blocks to call a texture painted */
+#define MODEL_DATA_TEXTURE_NAMES 0x34      /* JUTNameTab* (d_a_ship_create.h mTextureName) */
+#define LINK_MODEL_DATA 0x444              /* daPy_lk_c::mpCLModelData (SDK link.h) */
+
+WWHD_GAME_FUNC(0x027ED1F0, u32, boat_texture_name, (u32 names, u32 index));
 
 typedef struct boat_texture {
     tunic_texture t;     /* surface, pristine copy, live hash */
@@ -64,11 +74,12 @@ static u32 boat_paint_share(const tunic_texture* t, const tc_palette* p) {
 static u32 boat_logged[BOAT_LOGGED_MAX];
 static u32 boat_logged_count;
 
-static void boat_log_texture(u32 gx2, int supported, u32 share) {
+static void boat_log_texture(u32 gx2, u32 name, int supported, u32 share) {
     for (u32 i = 0; i != boat_logged_count; ++i)
         if (boat_logged[i] == gx2) return;
     if (boat_logged_count != BOAT_LOGGED_MAX) boat_logged[boat_logged_count++] = gx2;
     wwhd_log_hex("multiplayer: boat texture", gx2);
+    if (name) wwhd_log((const char*)name);
     wwhd_log_hex("multiplayer: boat   format", tunic_ld32(gx2 + GX2_SURFACE_FORMAT));
     wwhd_log_int("multiplayer: boat   width", (int)tunic_ld32(gx2 + GX2_SURFACE_WIDTH));
     wwhd_log_int("multiplayer: boat   height", (int)tunic_ld32(gx2 + GX2_SURFACE_HEIGHT));
@@ -96,6 +107,23 @@ static boat_texture* boat_find(const tunic_texture* t) {
     return 0;
 }
 
+/* 1 when the local Link's model data lists this texture object or its image. */
+static int boat_used_by_link(u32 gx2, u32 image) {
+    u32 link = puppet_local_player();
+    u32 data = link ? tunic_ld32(link + LINK_MODEL_DATA) : 0;
+    u32 table = data ? tunic_ld32(data + MODEL_DATA_TEXTURE_TABLE) : 0;
+    if (!table) return 0;
+    u32 count = *(const volatile u16*)table;
+    u32 headers = tunic_ld32(table + 4);
+    if (!headers || count > TEX_TABLE_MAX) return 0;
+    for (u32 k = 0; k != count; ++k) {
+        u32 other = tunic_ld32(headers + k * TEX_HEADER_BYTES + TEX_HEADER_HD);
+        if (!other || (other & 3)) continue;
+        if (other == gx2 || tunic_ld32(other + GX2_SURFACE_IMAGE) == image) return 1;
+    }
+    return 0;
+}
+
 /* Adds the painted textures of one model; returns 1 when a new one was copied. */
 static int boat_scan_model(u32 model, const tc_palette* reference) {
     if (!model) return 0;
@@ -107,6 +135,7 @@ static int boat_scan_model(u32 model, const tc_palette* reference) {
     if (!table) return 0;
     u32 count = *(const volatile u16*)table;
     u32 headers = tunic_ld32(table + 4);
+    u32 names = tunic_ld32(data + MODEL_DATA_TEXTURE_NAMES);
     static u32 logged_data[2];
     if (logged_data[0] != data && logged_data[1] != data) {
         logged_data[logged_data[0] ? 1 : 0] = data;
@@ -119,8 +148,18 @@ static int boat_scan_model(u32 model, const tc_palette* reference) {
         if (!gx2 || (gx2 & 3)) continue;
         tunic_texture t;
         int supported = tunic_read_surface(gx2, &t);
+        u32 name = names ? boat_texture_name(names, k) : 0;
         if (!supported || t.image_size + t.mip_size > BOAT_TEXTURE_MAX_BYTES) {
-            boat_log_texture(gx2, 0, 0);
+            boat_log_texture(gx2, name, 0, 0);
+            continue;
+        }
+        if (boat_used_by_link(gx2, t.image)) {
+            if (!boat_find(&t)) {
+                boat_log_texture(gx2, name, 1, 0);
+                static u32 shared_logged;
+                if (shared_logged != gx2) wwhd_log_hex("multiplayer: boat texture shared with Link, left as is", gx2);
+                shared_logged = gx2;
+            }
             continue;
         }
         boat_texture* known = boat_find(&t);
@@ -129,7 +168,7 @@ static int boat_scan_model(u32 model, const tc_palette* reference) {
             continue;
         }
         u32 share = boat_paint_share(&t, reference);
-        boat_log_texture(gx2, 1, share);
+        boat_log_texture(gx2, name, 1, share);
         if (share < BOAT_PAINT_MIN_SHARE) continue;
         while ((boat_texture_count == BOAT_MAX_TEXTURES ||
                 boat_budget_used + t.image_size + t.mip_size > BOAT_BUDGET_BYTES) && boat_evict_one()) {}

@@ -147,6 +147,10 @@ typedef struct {
  * size is circle radius / text height. Rotation is radians about image center.
  * UVs are normalized subrect coordinates. rgba is RRGGBBAA. Set thickness>0. */
 u32 wwhd_hud_register(void (*callback)(u32 list),u32 screen);
+/* A second, independent callback drawn on the GamePad only (854x480), after the one above, so a
+ * mod can draw on the TV and the GamePad at once. Null unregisters it. Importing it makes an older
+ * host refuse the module at load. */
+u32 wwhd_hud_register_drc(void (*callback)(u32 list));
 u32 wwhd_hud_emit(u32 list,const wwhd_hud_element* element);
 /* v2: record CLIP_PUSH/CLIP_POP only through this service. PUSH uses x/y/w/h
  * and anchor, intersecting the screen and parent clip. Max depth 16; every push
@@ -158,6 +162,14 @@ u32 wwhd_hud_clip(u32 list,const wwhd_hud_element* element);
  * Returns an owned handle, zero on failure. Reuse handles between logic steps. */
 u32 wwhd_hud_texture(u32 source,const char* path);
 u32 wwhd_hud_release(u32 image);
+/* A texture of the running game (a GX2Texture in guest memory, e.g. a layout picture's) decoded
+ * into rgba (RGBA8, rows top-down; capacity >= width*height*4, in this mod's memory). Returns
+ * (width << 16) | height, 0 on failure; a null buffer with capacity 0 only queries the size.
+ * Nothing of the game is stored: decode it again in each session. */
+u32 wwhd_hud_game_pixels(u32 texture,void* rgba,u32 capacity);
+/* An image handle from this mod's RGBA8 pixels (width*height*4 bytes, top-down), like
+ * wwhd_hud_texture; release it with wwhd_hud_release, recreate it after an epoch change. */
+u32 wwhd_hud_image(const void* rgba,u32 width,u32 height);
 /* Changes after full state load; old handles are invalid. Reload PNGs on a change. */
 unsigned long long wwhd_hud_epoch(void);
 

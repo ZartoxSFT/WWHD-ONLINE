@@ -36,6 +36,7 @@
 #include "name_tag.h"
 #include "boat_paint.h"
 #include "ship_material.h"
+#include "sea_chart.h"
 
 #define MAX_REMOTES 8
 #define CFG_PERIOD 1.0      /* launcher.cfg re-read interval, seconds */
@@ -384,8 +385,155 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
     }
 }
 
-/* Names above the remote players' heads (name_tag.h), baseline at the projected head point. */
+/* ------------------------------------------------------------------ sea chart */
+
+#define CHART_ARROW_SCALE 1.0f    /* remote icon size / the game's Link icon */
+#define CHART_FACE_ARROW 0.5f     /* heading arrow beside the icon / icon size */
+#define CHART_NAME_SCALE 0.28f    /* name height on the chart (name_tag.h scale) */
+#define CHART_DEFAULT_CURSOR 0xFFFF4Du
+
+static u32 chart_arrow_texture;
+static unsigned long long chart_arrow_epoch = ~0ull;
+static wwhd_hud_element chart_element;
+
+/* Each remote player's Link icon: the game's icon (sea_chart.h) with its green in the player's
+ * tunic colours, made again when they, the decoded icon or the HUD epoch change. */
+typedef struct chart_face_image {
+    u32 image;
+    tunic_look look;
+    u32 generation;
+    unsigned long long epoch;
+} chart_face_image;
+static chart_face_image chart_faces[MAX_REMOTES];
+static u8* chart_face_work;
+
+static u32 chart_face_for(int slot, const remote_player* r, unsigned long long epoch) {
+    if (!chart_face_w || !chart_face_rgba) return 0;
+    tunic_look look = tunic_look_make(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
+    if (r->has_look) look = tunic_look_make((u16)r->look.colors[0], (u16)r->look.colors[1]);
+    chart_face_image* f = &chart_faces[slot];
+    if (f->image && f->epoch == epoch && f->generation == chart_face_generation && tunic_same_look(&f->look, &look))
+        return f->image;
+    if (f->image && f->epoch == epoch) wwhd_hud_release(f->image); /* older epochs: already gone */
+    f->image = 0;
+    u32 bytes = chart_face_w * chart_face_h * 4;
+    if (!chart_face_work) chart_face_work = (u8*)wwhd_malloc(CHART_FACE_MAX_BYTES);
+    if (!chart_face_work) return 0;
+    memcpy(chart_face_work, chart_face_rgba, bytes);
+    if (look.custom) {
+        tc_palette p = tc_palette_make(tc_565_to_888(look.primary), tc_565_to_888(look.secondary));
+        for (u32 i = 0; i < bytes; i += 4) {
+            u8* px = chart_face_work + i;
+            if (!px[3]) continue;
+            tc_u32 out;
+            if (tc_recolor_rgb(&p, ((tc_u32)px[0] << 16) | ((tc_u32)px[1] << 8) | px[2], &out)) {
+                px[0] = (u8)(out >> 16);
+                px[1] = (u8)(out >> 8);
+                px[2] = (u8)out;
+            }
+        }
+    }
+    f->image = wwhd_hud_image(chart_face_work, chart_face_w, chart_face_h);
+    f->look = look;
+    f->generation = chart_face_generation;
+    f->epoch = epoch;
+    return f->image;
+}
+
+static int sea_stage(void) {
+    return area[0] == 's' && area[1] == 'e' && area[2] == 'a' && area[3] == 0;
+}
+
+/* The remote players on the sea chart of the MAP screen, as the GameCube client drew their cursor
+ * on the map (ActorPlayerSync mPlayerCursor): the game's Link icon in their tunic colours at their
+ * place, an arrow in their cursor colour beside it towards their heading, and their name under it. Only on the Great Sea ("sea"), where their
+ * positions are sea coordinates. k: screen units per layout unit (the GamePad: 854 / 1280). */
+static void draw_chart_players(u32 list, f32 k) {
+    chart_view v;
+    if (state != READY || !sea_stage() || !chart_on_screen(&v)) return;
+    unsigned long long epoch = wwhd_hud_epoch();
+    if (epoch != chart_arrow_epoch) {
+        chart_arrow_epoch = epoch;
+        chart_arrow_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/map_player.png");
+        if (!chart_arrow_texture) wwhd_log("multiplayer: sea chart arrow not loaded, dots used");
+    }
+    f32 size = v.icon * CHART_ARROW_SCALE * k;
+    for (int i = 0; i != MAX_REMOTES; ++i) {
+        const remote_player* r = &remotes[i];
+        if (!r->active || !r->has_display) continue;
+        f32 wx = r->display.pos[0], wz = r->display.pos[2];
+        if (!(wx > -CHART_SEA_HALF && wx < CHART_SEA_HALF && wz > -CHART_SEA_HALF && wz < CHART_SEA_HALF)) continue;
+        f32 x = (v.ox + wx * v.kx) * k, y = (v.oy + wz * v.ky) * k;
+        if (!chart_finite(x) || !chart_finite(y)) continue;
+        u32 rgb = CHART_DEFAULT_CURSOR;
+        if (r->has_look) rgb = ((u32)r->look.cursor[0] << 16) | ((u32)r->look.cursor[1] << 8) | r->look.cursor[2];
+        u32 alpha = (u32)(v.alpha * 255.0f + 0.5f);
+        if (alpha > 255) alpha = 255;
+        u32 face = chart_face_for(i, r, epoch);
+        if (chart_arrow_texture) {
+            /* the arrow points up at rotation 0; heading 0 faces +z (south, down on the chart) and
+             * the HUD turns clockwise on the y-down screen: rotation = pi - heading. With the icon
+             * it sits beside it, towards the heading (screen direction (sin h, cos h)). */
+            f32 heading = (f32)r->display.rot[1] * (6.28318531f / 65536.0f);
+            f32 arrow = face ? size * CHART_FACE_ARROW : size;
+            f32 ax = x, ay = y;
+            if (face) {
+                f32 h = heading, s2 = h * h; /* sin, cos by Taylor on [-pi, pi]: no libm */
+                while (h > 3.14159265f) h -= 6.28318531f;
+                while (h < -3.14159265f) h += 6.28318531f;
+                s2 = h * h;
+                f32 sn = h * (1.0f - s2 / 6.0f * (1.0f - s2 / 20.0f * (1.0f - s2 / 42.0f * (1.0f - s2 / 72.0f))));
+                f32 cs = 1.0f - s2 / 2.0f * (1.0f - s2 / 12.0f * (1.0f - s2 / 30.0f * (1.0f - s2 / 56.0f * (1.0f - s2 / 90.0f))));
+                ax += sn * size * 0.55f;
+                ay += cs * size * 0.55f;
+            }
+            chart_element = (wwhd_hud_element){
+                .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
+                .x = ax - arrow * 0.5f, .y = ay - arrow * 0.5f, .w = arrow, .h = arrow, .thickness = 1,
+                .rotation = 3.14159265f - heading, .u1 = 1, .v1 = 1,
+                .rgba = (rgb << 8) | alpha, .image = chart_arrow_texture};
+        } else {
+            chart_element = (wwhd_hud_element){
+                .kind = WWHD_HUD_CIRCLE, .anchor = WWHD_HUD_CENTER, .x = x, .y = y,
+                .size = size * 0.3f, .thickness = 1, .u1 = 1, .v1 = 1, .rgba = (rgb << 8) | alpha};
+        }
+        wwhd_hud_emit(list, &chart_element);
+        if (face) {
+            chart_element = (wwhd_hud_element){
+                .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
+                .x = x - size * 0.5f, .y = y - size * 0.5f, .w = size, .h = size, .thickness = 1,
+                .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | alpha, .image = face};
+            wwhd_hud_emit(list, &chart_element);
+        }
+        if (names_hidden) continue;
+        char label[MP_NAME_MAX + 1];
+        u32 bytes = 0;
+        if (r->has_look)
+            while (bytes != MP_NAME_MAX && r->look.name[bytes]) {
+                label[bytes] = r->look.name[bytes];
+                ++bytes;
+            }
+        if (!bytes) bytes = format_label(label, r->uid);
+        f32 scale = CHART_NAME_SCALE * k * (v.icon / 32.0f);
+        if (scale < 0.18f * k) scale = 0.18f * k;
+        if (scale > 0.4f * k) scale = 0.4f * k;
+        name_draw(list, x, y + size * 0.5f + (f32)NAME_FONT_CAP * scale + 2.0f * k, label, bytes, rgb, scale, v.alpha);
+    }
+}
+
+/* The GamePad's own list (wwhd_hud_register_drc): the sea chart, when the menus are on the GamePad. */
+static void draw_gamepad(u32 list) {
+    if (!chart_menus_to_tv()) draw_chart_players(list, CHART_DRC_SCALE);
+}
+
+/* Names above the remote players' heads (name_tag.h), baseline at the projected head point. With
+ * the Pro Controller the MAP screen is on the TV: its sea chart instead (the game is in its menu). */
 static void draw_markers(u32 list) {
+    chart_view v;
+    if (chart_menus_to_tv() && chart_on_screen(&v)) {
+        draw_chart_players(list, 1.0f);
+        return;
+    }
     if (names_hidden) return;
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const marker* m = &markers[i];
@@ -545,6 +693,7 @@ static void multiplayer_connection_step(void* link) {
     if (state == IDLE) {
         start();
         wwhd_hud_register(draw_markers, WWHD_HUD_TV);
+        wwhd_hud_register_drc(draw_gamepad);
     }
     double dt = wwhd_logic_dt();
     refresh_launcher_settings((const daPy_lk_c*)link, dt);

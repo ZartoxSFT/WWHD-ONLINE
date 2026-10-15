@@ -7,6 +7,7 @@
 #include <chrono>
 #include <limits>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,7 @@ struct Command {
 struct List {
     std::string owner;
     uint32_t screen=0;
+    uint32_t slot=0;  // 0: wwhd_hud_register's list, 1: wwhd_hud_register_drc's (published side by side)
     size_t text_bytes=0,vertices=0;
     uint32_t clip_depth=0;
     bool invalid=false;
@@ -56,7 +58,7 @@ class Store {
     std::map<Handle,List> pending;
     std::map<Handle,OwnedImage> images;
     std::map<std::string,std::vector<std::weak_ptr<const Image>>> allocations;
-    std::map<std::pair<std::string,uint32_t>,std::shared_ptr<const List>> published;
+    std::map<std::tuple<std::string,uint32_t,uint32_t>,std::shared_ptr<const List>> published;  // owner, screen, slot
     std::atomic<bool> visible{false};
     std::atomic<float> pixel_scale[2]{0.f,0.f};
     std::map<std::string,std::string> errors;
@@ -108,12 +110,12 @@ class Store {
         list.commands.push_back(std::move(command));return true;
     }
 public:
-    Handle begin(const std::string& owner,uint32_t screen) {
+    Handle begin(const std::string& owner,uint32_t screen,uint32_t slot=0) {
         std::lock_guard lock(mutex);
-        if(owner.empty()||screen>2)return 0;
+        if(owner.empty()||screen>2||slot>1)return 0;
         size_t count=0;for(const auto& [h,list]:pending)count+=list.owner==owner;
         if(count>=kMaxLists){errors[owner]="HUD pending-list limit exceeded";return 0;}
-        Handle h=handle();if(h)pending.emplace(h,List{owner,screen});return h;
+        Handle h=handle();if(h)pending.emplace(h,List{owner,screen,slot});return h;
     }
     bool fail(const std::string& owner,Handle h,const std::string& message) {
         std::lock_guard lock(mutex);auto it=pending.find(h);
@@ -162,7 +164,7 @@ public:
     bool commit(const std::string& owner,Handle h) {
         std::lock_guard lock(mutex);auto it=pending.find(h);
         if(it==pending.end()||it->second.owner!=owner)return false;
-        auto key=std::make_pair(owner,it->second.screen);
+        auto key=std::make_tuple(owner,it->second.screen,it->second.slot);
         if(it->second.clip_depth){it->second.invalid=true;errors[owner]="HUD draw list dropped: unbalanced clip stack";}
         bool valid=!it->second.invalid;
         if(!valid||it->second.commands.empty())published.erase(key);
@@ -177,7 +179,7 @@ public:
     }
     std::vector<std::shared_ptr<const List>> snapshot(uint32_t screen) {
         std::lock_guard lock(mutex);std::vector<std::shared_ptr<const List>> out;
-        for(const auto& [key,list]:published)if(key.second==screen||key.second==2)out.push_back(list);
+        for(const auto& [key,list]:published)if(std::get<1>(key)==screen||std::get<1>(key)==2)out.push_back(list);
         return out;
     }
     void note(const std::string& owner,const std::string& message) {std::lock_guard lock(mutex);errors[owner]=message;}
@@ -185,7 +187,14 @@ public:
     void drop(const std::string& owner) {
         std::lock_guard lock(mutex);
         std::erase_if(pending,[&](const auto& item){return item.second.owner==owner;});
-        std::erase_if(published,[&](const auto& item){return item.first.first==owner;});
+        std::erase_if(published,[&](const auto& item){return std::get<0>(item.first)==owner;});
+        visible.store(!published.empty(),std::memory_order_release);
+    }
+    // one slot's lists only (the other registration of the mod keeps drawing)
+    void drop(const std::string& owner,uint32_t slot) {
+        std::lock_guard lock(mutex);
+        std::erase_if(pending,[&](const auto& item){return item.second.owner==owner&&item.second.slot==slot;});
+        std::erase_if(published,[&](const auto& item){return std::get<0>(item.first)==owner&&std::get<2>(item.first)==slot;});
         visible.store(!published.empty(),std::memory_order_release);
     }
     uint64_t state_generation() {std::lock_guard lock(mutex);return generation;}

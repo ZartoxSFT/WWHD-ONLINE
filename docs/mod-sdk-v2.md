@@ -281,6 +281,14 @@ WWHD_HOOK(WWHD_ADDR_daPy_Execute, register_box, (void* link)) {
   values. Circle `size` is the radius, text `size` the height. Images support UV subrects,
   tint, rotation and alpha or additive blending. Keep elements and text in static storage or
   your heap.
+- **TV and GamePad at once:** `wwhd_hud_register_drc(draw_pad)` registers a second callback whose
+  list is drawn on the GamePad only (854 × 480), beside the list of `wwhd_hud_register` (for
+  example name tags on the TV and markers on the GamePad's sea chart). A null callback unregisters
+  it. Older hosts lack this service and refuse a module importing it.
+- **The game's own pictures:** `wwhd_hud_game_pixels(texture, rgba, capacity)` decodes a texture
+  of the running game (a GX2Texture in guest memory, such as a layout picture's) into your
+  buffer as RGBA8; `wwhd_hud_image(rgba, width, height)` makes an image handle from your pixels
+  (after changing them, for example). Nothing of the game is stored in your package.
 - **Coordinates:** TV 1280 × 720, GamePad 854 × 480 (`WWHD_HUD_BOTH` uses TV coordinates,
   scaled). Anchors keep elements at the screen edges on wide screens.
 - **Images:** `wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/x.png")` loads your package's own

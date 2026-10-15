@@ -298,6 +298,31 @@ int main() {
     guestmods::draw_frame(&c,5);assert(hud_calls==3); // rebuilt even if restored clock repeats
     c.r[3]=0;c.r[4]=2;guestmods::svc_hud_register(&c);assert(c.r[3]==1);
     guestmods::draw_frame(&c,6);assert(hud_calls==3&&!guestmods::hud::store().active());
+    // wwhd_hud_register_drc: a second list on the GamePad beside the TV list of wwhd_hud_register
+    c.r[3]=data_base+0x84;guestmods::svc_hud_register_drc(&c);assert(c.r[3]==0);
+    c.r[3]=data_base+0x80;c.r[4]=0;guestmods::svc_hud_register(&c);assert(c.r[3]==1);
+    c.r[3]=data_base+0x80;guestmods::svc_hud_register_drc(&c);assert(c.r[3]==1);
+    guestmods::draw_frame(&c,7);assert(hud_calls==5);
+    tv=guestmods::hud::store().snapshot(0);drc=guestmods::hud::store().snapshot(1);
+    assert(tv.size()==1&&drc.size()==1&&tv[0]!=drc[0]&&tv[0]->screen==0&&drc[0]->screen==1&&drc[0]->slot==1);
+    guestmods::draw_frame(&c,7);assert(hud_calls==5);
+    c.r[3]=0;guestmods::svc_hud_register_drc(&c);assert(c.r[3]==1);  // the TV list stays
+    assert(guestmods::hud::store().snapshot(0).size()==1&&guestmods::hud::store().snapshot(1).empty());
+    guestmods::draw_frame(&c,8);assert(hud_calls==6);
+    c.r[3]=0;c.r[4]=0;guestmods::svc_hud_register(&c);assert(c.r[3]==1);
+    guestmods::draw_frame(&c,9);assert(hud_calls==6&&!guestmods::hud::store().active());
+    // wwhd_hud_game_pixels / wwhd_hud_image: a game texture decoded into the mod, an image from it
+    c.r[3]=0x10000000;c.r[4]=0;c.r[5]=0;guestmods::svc_hud_game_pixels(&c);assert(c.r[3]==0);  // no decoder
+    guestmods::read_game_texture=[](uint32_t t,uint32_t& w,uint32_t& h,std::vector<uint8_t>& rgba){
+        if(t!=0x10000000)return false;w=2;h=3;rgba.assign(24,0);rgba[0]=0x12;rgba[23]=0x34;return true;};
+    c.r[3]=0x10000000;c.r[4]=0;c.r[5]=0;guestmods::svc_hud_game_pixels(&c);assert(c.r[3]==((2u<<16)|3));
+    c.r[3]=0x10000000;c.r[4]=data_base+0x700;c.r[5]=23;guestmods::svc_hud_game_pixels(&c);assert(c.r[3]==0);  // too small
+    c.r[3]=0x10000000;c.r[4]=0x10000000;c.r[5]=24;guestmods::svc_hud_game_pixels(&c);assert(c.r[3]==0);  // not the mod's
+    c.r[3]=0x10000000;c.r[4]=data_base+0x700;c.r[5]=24;guestmods::svc_hud_game_pixels(&c);
+    assert(c.r[3]==((2u<<16)|3)&&ld8(data_base+0x700)==0x12&&ld8(data_base+0x717)==0x34);
+    c.r[3]=data_base+0x700;c.r[4]=2;c.r[5]=3;guestmods::svc_hud_image(&c);uint32_t image=c.r[3];assert(image);
+    c.r[3]=0x10000000;c.r[4]=2;c.r[5]=3;guestmods::svc_hud_image(&c);assert(c.r[3]==0);
+    c.r[3]=image;guestmods::svc_hud_release(&c);assert(c.r[3]==1);
 #ifdef _WIN32
     VirtualFree(data,0,MEM_RELEASE);
 #else
