@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "id": "enemy-multiplier",
+  "name": "Enemy multiplier (multiplayer mutator)",
+  "version": "0.1.0",
+  "game_id": "wwhd",
+  "minimum_manager_version": "1.5.0",
+  "kind": "guest",
+  "guest": {"api_version": 1, "elf": "mod.elf"},
+  "options": [
+    {"id": "multiplier", "type": "number", "name": "Copies of each enemy", "default": 4, "min": 1, "max": 9},
+    {"id": "spread", "type": "number", "name": "Distance between copies", "default": 60, "min": 0, "max": 300},
+    {"id": "randomize", "type": "bool", "name": "Randomize copies' parameters (unstable)", "default": false}
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "id": "multiplayer-connection",
+  "name": "Wind Waker multiplayer connection",
+  "version": "0.2.10",
+  "game_id": "wwhd",
+  "minimum_manager_version": "1.5.0",
+  "kind": "guest",
+  "guest": {
+    "api_version": 1,
+    "elf": "mod.elf",
+    "heap_size": 8388608
+  },
+  "options": [
+    {
+      "id": "host",
+      "type": "string",
+      "name": "Server host",
+      "default": "127.0.0.1"
+    },
+    {
+      "id": "port",
+      "type": "number",
+      "name": "Server port",
+      "default": 10014,
+      "min": 1,
+      "max": 65535
+    },
+    {
+      "id": "uid",
+      "type": "string",
+      "name": "8-byte player identity",
+      "default": "wwhduser"
+    },
+    {
+      "id": "name",
+      "type": "string",
+      "name": "Player name shown to the others (1 to 16 ASCII characters, empty: J<id>)",
+      "default": ""
+    },
+    {
+      "id": "color",
+      "type": "string",
+      "name": "Tunic colour RRGGBB (empty: original)",
+      "default": ""
+    },
+    {
+      "id": "color2",
+      "type": "string",
+      "name": "Second tunic colour RRGGBB (empty: same)",
+      "default": ""
+    },
+    {
+      "id": "ship_color",
+      "type": "string",
+      "name": "Boat colour RRGGBB (empty: original)",
+      "default": ""
+    },
+    {
+      "id": "puppet",
+      "type": "bool",
+      "name": "Show remote players as Link (experimental)",
+      "default": false
+    },
+    {
+      "id": "hide_names",
+      "type": "bool",
+      "name": "Hide the names above the other players",
+      "default": false
+    },
+    {
+      "id": "remote_tunics",
+      "type": "bool",
+      "name": "Remote Links wear their own tunic colours (experimental, may crash)",
+      "default": false
+    }
+  ]
+}
