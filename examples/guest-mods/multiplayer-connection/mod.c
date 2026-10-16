@@ -8,6 +8,9 @@
  *   every 0.1 s when moved -> CLIENT_ACTOR_SYNC_UPDATE(ActorBaseSync)
  *   at most 30 times a second when Link's animation calls, item, proc or colours changed
  *                -> CLIENT_ACTOR_SYNC_UPDATE(ActorPlayerSync with its event lists, anim_sync.h)
+ * Placed actors of the server's ActorFilter list (enemies, props) are synchronised with the
+ * historical ownership model, and the server's enemy multiplier creates the enemy copies
+ * (actor_sync.h).
  * Remote PlayerPuppets are decoded, smoothed and drawn as HUD markers above their heads and,
  * with the experimental "puppet" option, as a second Link actor (puppet.h) that replays the
  * owner's animations and wears its tunic colours.
@@ -39,6 +42,8 @@
 #include "sea_chart.h"
 #include "ship_puppet.h"
 #include "puppet_sense.h"
+#include "actor_sync.h"
+#include "particle_sync.h"
 #include "sword_swing.h"
 
 #define MAX_REMOTES 8
@@ -119,6 +124,21 @@ static void fail(const char* message) {
     wwhd_net_disconnect();
 }
 
+/* An actor packet that does not decode (frames are length-delimited, so the next one is still
+ * read): logged with its uid and size, the first times and then every 100th, and skipped. Before
+ * 0.2.30 it closed the connection; the Java server's VLQ of negative values (fixed in
+ * ActorPlayerSync.java) made every remote player's animation with an end of -1 do so. */
+static u32 dropped_frames;
+
+static void drop_frame(const char* what, const mp_u8* body, mp_u32 length) {
+    ++dropped_frames;
+    if (dropped_frames > 5 && dropped_frames % 100) return;
+    wwhd_log(what);
+    wwhd_log_int("multiplayer:   uid", (int)mp_read_update_uid(body, length));
+    wwhd_log_int("multiplayer:   bytes", (int)length);
+    wwhd_log_int("multiplayer:   skipped so far", (int)dropped_frames);
+}
+
 static int send_payload(mp_u32 id, const mp_writer* body) {
     if (id == MP_NO_ID || !body->ok) return 0;
     mp_writer w = mp_writer_make(frame, sizeof(frame));
@@ -165,6 +185,8 @@ static void clear_area_state(void) {
     pending_solver = MP_NO_ID;
     local_uid = MP_NO_ID;
     local_ticket = 0xFF;
+    as_reset_network();
+    ps_clear();
 }
 
 static void handle_init(const unsigned char* item, u32 size) {
@@ -189,6 +211,11 @@ static void handle_init(const unsigned char* item, u32 size) {
     for (int i = 0; i != 8; ++i) mp_write_u8(&body, (mp_u8)uid[i]);
     if (!send_payload(session.client_init, &body)) { fail("multiplayer: init send failed"); return; }
     wwhd_log("multiplayer: connected, identity sent");
+    as_session = &session;
+    as_mutators_changed(); /* the area loaded before the connection takes the server's values */
+    wwhd_log_int("multiplayer: actor names to synchronise", (int)session.filter_count);
+    wwhd_log_int("multiplayer: server enemy multiplier", (int)session.enemy_multiplier);
+    if (!session.factories_complete) wwhd_log("multiplayer: too many ActorSync factories, placed actors stay local");
     state = READY;
 }
 
@@ -201,8 +228,12 @@ static void handle_frame(const unsigned char* item, u32 size) {
 
     if (id == session.server_create) {
         if (!mp_read_actor_create(body, length, &session, &actor))
-            { fail("multiplayer: malformed actor create"); return; }
-        if (!actor.is_puppet) return; /* enemies/props are not handled yet */
+            { drop_frame("multiplayer: malformed actor create skipped", body, length); return; }
+        if (!actor.is_puppet) { /* a placed actor (actor_sync.h) */
+            if (!as_handle_create(body, length))
+                drop_frame("multiplayer: malformed placed actor create skipped", body, length);
+            return;
+        }
         if (actor.has_solver && actor.solver == pending_solver) {
             local_uid = actor.uid;
             local_ticket = actor.ticket;
@@ -224,11 +255,14 @@ static void handle_frame(const unsigned char* item, u32 size) {
         wwhd_log_int("multiplayer: remote player joined, uid", (int)actor.uid);
         /* the events of a create are history (the moment the player entered): not replayed */
     } else if (id == session.server_update) {
+        int placed = as_handle_update(body, length);
+        if (placed < 0) { drop_frame("multiplayer: malformed placed actor update skipped", body, length); return; }
+        if (placed) return;
         mp_u32 uid = mp_read_update_uid(body, length);
         remote_player* remote = find_remote(uid, 0);
         if (uid != local_uid && !remote) return; /* not a PlayerPuppet we track */
         if (!mp_read_actor_update(body, length, &session, &actor))
-            { fail("multiplayer: malformed actor update"); return; }
+            { drop_frame("multiplayer: malformed actor update skipped", body, length); return; }
         if (uid == local_uid) {
             local_ticket = actor.ticket;
         } else {
@@ -241,11 +275,15 @@ static void handle_frame(const unsigned char* item, u32 size) {
                 remote->has_look = 1;
                 puppet_queue_events(uid, &actor.events);
                 swing_queue(uid, &actor.events);
+                as_queue_strikes(uid, &actor.events); /* sword hits on placed actors */
+                ps_queue_particles(&actor.events);    /* its Link's particle effects */
                 ship_puppet_set(uid, &actor.look.ship);
             }
         }
     } else if (id == session.server_remove) {
-        remote_player* remote = find_remote(mp_read_actor_remove(body, length), 0);
+        mp_u32 removed = mp_read_actor_remove(body, length);
+        if (as_handle_remove(removed)) return;
+        remote_player* remote = find_remote(removed, 0);
         if (remote) {
             remote->active = 0;
             puppet_remove(remote->uid);
@@ -253,6 +291,17 @@ static void handle_frame(const unsigned char* item, u32 size) {
             swing_remove(remote->uid);
             wwhd_log_int("multiplayer: remote player left, uid", (int)remote->uid);
         }
+    } else if (id == session.server_mutators) {
+        mp_u32 multiplier;
+        int randomizer;
+        if (!mp_read_mutators(body, length, &multiplier, &randomizer)) {
+            drop_frame("multiplayer: malformed mutators skipped", body, length);
+            return;
+        }
+        session.enemy_multiplier = multiplier;
+        session.enemy_randomizer = randomizer;
+        as_mutators_changed(); /* the loaded area follows at the next step */
+        wwhd_log_int("multiplayer: server mutators changed, enemy multiplier", (int)multiplier);
     }
     /* other server packets (downloads, save updates) are ignored for now */
 }
@@ -265,6 +314,7 @@ static mp_player_look current_look(const daPy_lk_c* link) {
     look.proc = (mp_u32)link->mCurProc;
     look.ship = ship_local_state();
     look.extras = (*(const volatile u32*)((const u8*)link + PUPPET_NO_RESET_FLG0) & PUPPET_HEAVY_BOOTS) ? MP_EXTRA_HEAVY_BOOTS : 0;
+    if (outfit_is_casual((u32)link)) look.extras |= MP_EXTRA_CASUAL;
     return look;
 }
 
@@ -412,6 +462,17 @@ static void multiplayer_pump(void) {
         handle_frame(incoming, (u32)received);
         if (state != READY) return;
     }
+}
+
+/* dScnPly_Execute (025B0314, the play scene's execute, decomp d_s_play.cpp) runs every frame, also
+ * while the Start menu pauses the actors (its own dMenu_flag / isPause checks are inside it). The
+ * local Link's execute, which reads the network, does not run then, and the host transport closes
+ * the connection when 256 received frames wait (runtime/src/network_transport.cpp
+ * kMaxQueuedFrames): on the ship, with its updates and the sea's actors, a few seconds of menu
+ * were enough. The network is read here too, every frame. */
+WWHD_HOOK(0x025B0314, multiplayer_scene_pump, (u32 scene)) {
+    (void)scene;
+    multiplayer_pump();
 }
 
 #define CHART_ARROW_SCALE 1.0f    /* remote icon size / the game's Link icon */
@@ -654,6 +715,15 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
     apply_puppet_setting();
     names_hidden = cfg.has_hide_names ? cfg.hide_names : wwhd_config_bool("hide_names", 0);
     sense_enabled = wwhd_config_bool("actors_see_puppets", 1);
+    as_enabled = wwhd_config_bool("sync_actors", 1);
+    as_hit_stop = wwhd_config_bool("hit_stop", 0);
+    if (cfg.has_outfit) {
+        outfit_wanted = cfg.outfit;
+    } else {
+        char outfit[16] = {0};
+        wwhd_config_string("outfit", outfit, sizeof(outfit));
+        outfit_wanted = outfit_parse(outfit, OUTFIT_AUTO);
+    }
     refresh_ship_color_setting();
     mp_player_look look = wanted_look();
     if (!same_look(&look, &local_look)) {
@@ -724,6 +794,8 @@ static void start(void) {
 }
 
 static void stop_remote_views(void) {
+    as_session = 0;
+    as_reset_network();
     hide_markers();
     puppet_clear_all();
     ship_puppet_clear_all();
@@ -738,6 +810,7 @@ static void multiplayer_connection_step(void* link) {
     }
     double dt = wwhd_logic_dt();
     refresh_launcher_settings((const daPy_lk_c*)link, dt);
+    outfit_local_step((u32)link); /* the chosen clothes, with or without a server */
     anim_capture = state == READY && local_uid != MP_NO_ID;
     if (!anim_capture) mp_anim_events_clear(&anim_local);
     if (state == FAILED) {
@@ -800,11 +873,14 @@ static void multiplayer_connection_step(void* link) {
         }
     }
     if (local_uid != MP_NO_ID) send_player_state((const daPy_lk_c*)link, dt);
+    if (local_uid != MP_NO_ID) as_step(dt, local_uid, (const fopAc_ac_c*)link);
+    ps_step();
 
     log_clock -= dt;
     if (log_clock <= 0) {
         log_clock = LOG_PERIOD;
         log_remotes();
+        as_log_counts();
     }
 }
 

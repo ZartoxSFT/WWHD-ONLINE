@@ -8,6 +8,9 @@
 #   run_dev.ps1 -Instance 2          a second player on the same PC
 #   run_dev.ps1 -Instance 2 -CopyModsFrom 1   refresh instance 2's installed mods from instance 1
 #   run_dev.ps1 -Instance 1 -Reset   start instance 1 again from the install (deletes it)
+#   run_dev.ps1 -BuildMod            rebuild the multiplayer mod and install it first (after a pull)
+#
+# The runtime DLL folder (-MsysBin) is found from the build: MINGW64 on one PC, CLANG64 on another.
 #
 # The executable is started from the build directory on purpose: started from the portable
 # install, code-mod startup would switch to that install's cached code-mod build, which has no
@@ -18,10 +21,27 @@ param(
     [switch]$Reset,
     [string]$Distribution = (Join-Path $PSScriptRoot "..\..\..\WindWakerHD-v0.3.0-windows-x86_64"),
     [string]$BuildDir = (Join-Path $PSScriptRoot "..\..\build\windows-msys2-d"),
-    [string]$MsysBin = "C:\msys64\clang64\bin",
-    [string]$GameDir = ""
+    # the folder of the C++ runtime DLLs wwhd.exe links (libstdc++ of MINGW64, libc++ of CLANG64);
+    # empty: the bin folder of the compiler that built it (BuildDir\CMakeCache.txt)
+    [string]$MsysBin = "",
+    [string]$GameDir = "",
+    # rebuild and install the multiplayer mod first (build_mod.ps1), e.g. after a git pull
+    [switch]$BuildMod
 )
 $ErrorActionPreference = "Stop"
+
+if (-not $MsysBin) {
+    $cache = Join-Path $BuildDir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { throw "No ${cache}: build the runtime first, or pass -MsysBin" }
+    $line = Select-String -LiteralPath $cache -Pattern "^CMAKE_CXX_COMPILER:\w+=(.+)$" | Select-Object -First 1
+    if (-not $line) { throw "No CMAKE_CXX_COMPILER in ${cache}: pass -MsysBin" }
+    $MsysBin = Split-Path ($line.Matches[0].Groups[1].Value -replace "/", "\")
+}
+if (-not (Test-Path -LiteralPath $MsysBin)) { throw "-MsysBin $MsysBin does not exist" }
+
+if ($BuildMod) {
+    & (Join-Path $PSScriptRoot "build_mod.ps1") -Instance $Instance -BuildDir $BuildDir -Distribution $Distribution
+}
 
 $data = Join-Path (Resolve-Path $Distribution) "data"
 $build = Resolve-Path $BuildDir
@@ -103,9 +123,8 @@ if (-not (Test-Path -LiteralPath $cfgFile)) {
     [System.IO.File]::WriteAllText($cfgFile, ($lines -join "`n") + "`n", [System.Text.Encoding]::ASCII)
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $MsysBin "libc++.dll"))) { throw "No libc++.dll in -MsysBin $MsysBin (the clang64 runtime the build links)" }
-$env:PATH = "$MsysBin;$env:PATH"                                # libc++/libunwind/winpthread DLLs of the clang64 build
-$env:WWHD_CODE_MODS = "1"                                        # build/gen was translated with --mod-hooks
+$env:PATH = "$MsysBin;$env:PATH"                                # the C++ runtime DLLs of this build
+$env:WWHD_CODE_MODS = "1"                                     # build/gen was translated with --mod-hooks
 $env:WWHD_GUEST_BUILD_CONFIG = Join-Path $data "guest-sdk.json"  # guest translator + compiler of the install
 Remove-Item Env:WWHD_INSTALL_DIR -ErrorAction SilentlyContinue
 

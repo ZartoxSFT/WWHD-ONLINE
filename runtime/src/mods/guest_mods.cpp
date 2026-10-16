@@ -19,6 +19,7 @@
 #include "story_notebook_game.h"
 #include "guest_png.h"
 #include "story_mail.h"
+#include "mp_skins.h"
 #include "item_icons.h"
 #include "story_lyt_screen.h"
 #include "story_notebook_layout.h"
@@ -611,6 +612,7 @@ bool load_one(const std::string& path, std::string& err,const mods::packages::Gu
     Loaded loaded;
     loaded.path=path;loaded.package_path=pkg.path;loaded.data_path=pkg.data_path;loaded.id=pkg.id;loaded.name=pkg.name;loaded.version=pkg.version;loaded.m=m;loaded.region_size=reserved;loaded.options=pkg.options;
     loaded.files=std::make_unique<Files>(pkg.data_path);
+    if(pkg.id=="multiplayer-connection")mp_skins::set_directory(pkg.data_path);  // its players' skins (mp_skins.h)
     uint32_t heap_base=(m->mem_base+m->mem_size+15)&~15u;
     loaded.heap=std::make_unique<Heap>(mem::ptr(heap_base),heap_base,pkg.heap_size);
     memset(mem::ptr(m->mem_base), 0, reserved);

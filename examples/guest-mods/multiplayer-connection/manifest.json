@@ -2,7 +2,7 @@
   "format_version": 1,
   "id": "multiplayer-connection",
   "name": "Wind Waker multiplayer connection",
-  "version": "0.2.20",
+  "version": "0.2.31",
   "game_id": "wwhd",
   "minimum_manager_version": "1.5.0",
   "kind": "guest",
@@ -73,6 +73,24 @@
       "type": "bool",
       "name": "Enemies and residents react to the remote Link puppets as to the player",
       "default": true
+    },
+    {
+      "id": "sync_actors",
+      "type": "bool",
+      "name": "Synchronise enemies and objects with the other players (server's list and enemy multiplier)",
+      "default": true
+    },
+    {
+      "id": "outfit",
+      "type": "string",
+      "name": "Clothes: auto (the save), hero or casual",
+      "default": "auto"
+    },
+    {
+      "id": "hit_stop",
+      "type": "bool",
+      "name": "Keep the game's freeze when the sword hits (off: removed, as in the GameCube mod)",
+      "default": false
     },
     {
       "id": "remote_tunics",

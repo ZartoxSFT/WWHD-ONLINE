@@ -42,6 +42,7 @@
 #include "wwhd/data.h"
 #include "mp_protocol.h"
 #include "link_access.h"
+#include "outfit.h"
 #include "anim_sync.h"
 #include "tunic.h"
 
@@ -260,6 +261,8 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     volatile u32* list_p1 = (volatile u32*)(play + PLAY_XLU_LIST_P1);
     u32 saved_p0 = *list_p0, saved_p1 = *list_p1;
     puppet_build_packets(slot);
+    /* its clothes first (the local Link's other clothes while it wears them), then its colours */
+    int outfit_swapped = outfit_puppet_begin((puppet_slots[slot].remote_extras & MP_EXTRA_CASUAL) != 0);
     tunic_swap_begin(slot, ((const daPy_lk_c*)i_this)->mpCLModelData);
     *list_p0 = *(const volatile u32*)(play + PLAY_OPA_LIST_ZELDA0);
     *list_p1 = *(const volatile u32*)(play + PLAY_XLU_LIST_ZELDA1);
@@ -269,6 +272,7 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     *list_p0 = saved_p0;
     *list_p1 = saved_p1;
     tunic_swap_end();
+    outfit_puppet_end(outfit_swapped);
     return result;
 }
 
@@ -353,6 +357,12 @@ static f32 puppet_ship_mtx[12] __attribute__((aligned(16)));
 #define PUPPET_ITEM_NONE 0x100
 #define PUPPET_ITEM_SWORD 0x103
 #define PUPPET_ITEM_FAN_FLY 0x102
+/* Link's Deku Leaf gust (daPyProc_FAN_SWING_e 0x92, d_a_player_main_02.cpp procFanSwing_init):
+ * the big fan model comes from setFanModel (023E7660), not from the equipped item (makeItemType
+ * makes no model for the Deku Leaf in HD, d_a_player_main_01.cpp). A pseudo item number. */
+#define PUPPET_ITEM_FAN_SWING 0x104
+#define PUPPET_PROC_FAN_SWING 0x92
+#define PUPPET_DEKU_LEAF 0x34
 #define PUPPET_NO_RESET_FLG0 0x3B8
 #define PUPPET_HEAVY_BOOTS 0x2000000u
 
@@ -367,15 +377,17 @@ static int puppet_item_has_model(mp_u16 item) {
 
 static void puppet_apply_item(void* link, puppet_slot* s) {
     mp_u16 want = s->remote_item;
-    if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY) want = PUPPET_ITEM_NONE;
+    if (s->remote_proc == PUPPET_PROC_FAN_SWING) want = PUPPET_ITEM_FAN_SWING;
+    else if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY) want = PUPPET_ITEM_NONE;
     if (want != s->shown_item) {
         daPy_lk_c* l = (daPy_lk_c*)link;
         if (s->shown_item != PUPPET_ITEM_NONE) {
             l->mEquipItem = PUPPET_ITEM_NONE; /* never the sword case (it stops the sword music) */
             wwhd_daPy_lk_c__deleteEquipItem(link, 0);
         }
-        l->mEquipItem = want;
-        if (puppet_item_has_model(want)) wwhd_daPy_lk_c__makeItemType(link);
+        l->mEquipItem = want == PUPPET_ITEM_FAN_SWING ? PUPPET_DEKU_LEAF : want;
+        if (want == PUPPET_ITEM_FAN_SWING) wwhd_daPy_lk_c__setFanModel(link);
+        else if (puppet_item_has_model(want)) wwhd_daPy_lk_c__makeItemType(link);
         else if (want == PUPPET_ITEM_SWORD) wwhd_daPy_lk_c__setSwordModel(link, 1);
         else if (want == PUPPET_ITEM_FAN_FLY) wwhd_daPy_lk_c__setParachuteFanModel(link, 1.0f);
         s->shown_item = want;
@@ -383,6 +395,9 @@ static void puppet_apply_item(void* link, puppet_slot* s) {
     volatile u32* flags = (volatile u32*)((u8*)link + PUPPET_NO_RESET_FLG0);
     if (s->remote_extras & MP_EXTRA_HEAVY_BOOTS) *flags |= PUPPET_HEAVY_BOOTS;
     else *flags &= ~PUPPET_HEAVY_BOOTS;
+    volatile u32* flags1 = (volatile u32*)((u8*)link + OUTFIT_FLG1); /* its hat (draw) */
+    if (s->remote_extras & MP_EXTRA_CASUAL) *flags1 |= OUTFIT_CASUAL;
+    else *flags1 &= ~OUTFIT_CASUAL;
 }
 
 /* setItemModel (in the visual tail) sets Link's footstep, sword and shield sound types, one

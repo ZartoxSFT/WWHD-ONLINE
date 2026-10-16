@@ -141,6 +141,235 @@ static void test_init(void) {
 
 static const mp_transform kTransform = {{1.0f, 2.0f, -1.0f}, {0x1234, -1, 0}};
 
+#define BASE_BYTES 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, \
+                   0x12, 0x34, 0xFF, 0xFF, 0x00, 0x00 /* kTransform as ActorBaseSync::write */
+
+/* Factories, filter and enemy multiplier; placed actors (ActorSync::getOrCreate with a game UID,
+ * ActorSync::create, SyncedActor::readUpdate) with ActorHealthSync and a GameCube-only component. */
+static mp_u32 build_actor_init(mp_u8* out, mp_u32 capacity) {
+    mp_writer w = mp_writer_make(out, capacity);
+    mp_write_vlq(&w, 4);
+    mp_write_string(&w, "SERVER_ACTOR_SYNC_CREATE");
+    mp_write_string(&w, "SERVER_ACTOR_SYNC_UPDATE");
+    mp_write_string(&w, "SERVER_ACTOR_SYNC_REMOVE");
+    mp_write_string(&w, "SERVER_MUTATORS");
+    mp_write_vlq(&w, 6);
+    mp_write_string(&w, "CLIENT_INIT_PACKET");
+    mp_write_string(&w, "CLIENT_ACTOR_SYNC_CREATE");
+    mp_write_string(&w, "CLIENT_ACTOR_SYNC_UPDATE");
+    mp_write_string(&w, "CLIENT_ACTOR_SYNC_REMOVE");
+    mp_write_string(&w, "CLIENT_ACTOR_EXCLUSIVE_ADD");
+    mp_write_string(&w, "CLIENT_ACTOR_EXCLUSIVE_REMOVE");
+    mp_write_vlq(&w, 2);
+    mp_write_string(&w, "ActorSync");
+    mp_write_vlq(&w, 6);
+    mp_write_string(&w, "DefaultCreators"); /* a KTML base entry: no actor has this name */
+    mp_write_vlq(&w, 1);
+    mp_write_string(&w, "ActorBaseSync");
+    mp_write_string(&w, "Default");
+    mp_write_vlq(&w, 2);
+    mp_write_string(&w, "ActorBaseSync");
+    mp_write_string(&w, "ActorHealthSync");
+    mp_write_string(&w, "Bk");
+    mp_write_vlq(&w, 3);
+    mp_write_string(&w, "ActorBaseSync");
+    mp_write_string(&w, "ActorHealthSync");
+    mp_write_string(&w, "BokoblinSync");
+    mp_write_string(&w, "Spawned"); /* actors created while playing (WWHD) */
+    mp_write_vlq(&w, 2);
+    mp_write_string(&w, "ActorBaseSync");
+    mp_write_string(&w, "ActorSpawnSync");
+    mp_write_string(&w, "Pl"); /* a variable component: not usable for a placed actor */
+    mp_write_vlq(&w, 1);
+    mp_write_string(&w, "ActorPlayerSync");
+    mp_write_string(&w, "PlayerPuppet");
+    mp_write_vlq(&w, 2);
+    mp_write_string(&w, "ActorBaseSync");
+    mp_write_string(&w, "ActorPlayerSync");
+    mp_write_string(&w, "ActorFilter");
+    mp_write_vlq(&w, 6);
+    mp_write_string(&w, "Bk");
+    mp_write_string(&w, "#enemy_multiplier=4");
+    mp_write_string(&w, "#enemy_randomizer=1");
+    mp_write_string(&w, "Fmastr1");
+    mp_write_string(&w, "NotAnActorName");
+    mp_write_string(&w, "kotubo");
+    assert(w.ok);
+    return w.size;
+}
+
+static void test_placed_actors(void) {
+    static mp_u8 init[1024];
+    static mp_session s;
+    mp_u32 size = build_actor_init(init, sizeof(init));
+    assert(mp_parse_init(init, size, &s));
+    assert(s.client_remove == 3 && s.client_exclusive_add == 4 && s.client_exclusive_remove == 5);
+    assert(s.server_mutators == 3);
+    {
+        static const mp_u8 mutators[] = {0x86, 0x01}, too_many[] = {0x01, 0xC0, 0x00}, cut[] = {0x86};
+        mp_u32 m = 0;
+        int random = 0;
+        assert(mp_read_mutators(mutators, sizeof(mutators), &m, &random) && m == 6 && random == 1);
+        assert(mp_read_mutators(too_many, sizeof(too_many), &m, &random) && m == MP_MULTIPLIER_MAX && !random);
+        assert(!mp_read_mutators(cut, sizeof(cut), &m, &random));
+    }
+    assert(s.factories_complete && s.factory_count == 4); /* Default, Bk, Spawned, Pl */
+    assert(s.enemy_multiplier == 4 && s.enemy_randomizer == 1 && s.filter_count == 3);
+    assert(mp_filter_contains(&s, "Bk") && mp_filter_contains(&s, "Fmastr1") && mp_filter_contains(&s, "kotubo"));
+    assert(!mp_filter_contains(&s, "B") && !mp_filter_contains(&s, "Bkk") && !mp_filter_contains(&s, "#enemy_m"));
+    mp_u32 bk = mp_find_factory(&s, "Bk"), def = mp_find_factory(&s, "Default"), pl = mp_find_factory(&s, "Pl");
+    assert(bk != MP_NO_ID && def != MP_NO_ID && pl != MP_NO_ID && mp_find_factory(&s, "kotubo") == def);
+    assert(s.factories[bk].usable && s.factories[bk].count == 3 && s.factories[bk].base_index == 0);
+    assert(s.factories[bk].health_index == 1 && s.factories[bk].kinds[2] == MP_COMPONENT_BOKOBLIN);
+    assert(!s.factories[pl].usable);
+    for (mp_u32 cut = 0; cut != size; ++cut) assert(!mp_parse_init(init, cut, &s));
+
+    /* the multiplier entry: out of range is clamped, garbage gives 1 */
+    {
+        static const char* const entries[] = {"#enemy_multiplier=99", "#enemy_multiplier=x2", "#enemy_multiplier=0"};
+        static const mp_u32 wanted[] = {MP_MULTIPLIER_MAX, 1, 1};
+        for (int i = 0; i != 3; ++i) {
+            mp_u8 filter[64];
+            mp_writer fw = mp_writer_make(filter, sizeof(filter));
+            mp_write_vlq(&fw, 1);
+            mp_write_string(&fw, entries[i]);
+            mp_reader r = mp_reader_make(fw.data, fw.size);
+            s.enemy_multiplier = 7;
+            s.filter_count = 0;
+            assert(mp_read_actor_filter(&r, &s) && r.pos == r.size && s.enemy_multiplier == wanted[i]);
+            assert(s.filter_count == 0);
+        }
+        size = build_actor_init(init, sizeof(init));
+        assert(mp_parse_init(init, size, &s));
+    }
+
+    static const mp_u8 uid[] = {0xAA, 0xBB, 0xCC};
+    mp_actor_values v = {.has_transform = 1, .transform = kTransform, .has_health = 1, .health = 5, .status = 0x10};
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_create(&w, &s.factories[bk], 5, uid, sizeof(uid), "Bk", &v);
+    static const mp_u8 create[] = {
+        0x01, 0x83, 0xAA, 0xBB, 0xCC, 0x85, 'B', 'k', 0, 'B', 'k', 0,
+        0x83,                                      /* three components */
+        0x80, BASE_BYTES,
+        0x81, 0x00, 0x05, 0x00, 0x00, 0x00, 0x10,  /* ActorHealthSync */
+        0x82, 0, 0, 0, 0, 0, 0,                    /* BokoblinSync, not applied */
+    };
+    expect_bytes(&w, create, sizeof(create));
+
+    /* an 8-character name is written whole */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_create(&w, &s.factories[def], 0, uid, 1, "pflwrx77", &v);
+    assert(w.ok && memcmp(w.data + 4, "pflwrx77\0pflwrx77\0", 18) == 0);
+
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_actor_values hurt = {.has_health = 1, .health = -1, .status = 0};
+    mp_write_actor_update(&w, &s.factories[bk], 7, 3, &hurt);
+    static const mp_u8 update[] = {0x87, 0x03, 0x81, 0x81, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00};
+    expect_bytes(&w, update, sizeof(update));
+
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_create(&w, &s.factories[pl], 0, uid, 1, "Pl", &v);
+    assert(!w.ok); /* never written with a variable component */
+
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_uid(&w, 300);
+    static const mp_u8 exclusive[] = {0x02, 0xAC};
+    expect_bytes(&w, exclusive, sizeof(exclusive));
+
+    /* SERVER_ACTOR_SYNC_CREATE as SyncedActorComponent.makeCreatePacket writes it */
+    static const mp_u8 server_create[] = {
+        0x89, 0x01, 0x83, 0xAA, 0xBB, 0xCC, 0x00, 'B', 'k', 0, 'B', 'k', 0,
+        0x02, 0x84, 0x82,                          /* ticket 2, owner 4, two components */
+        0x80, BASE_BYTES,
+        0x82, 1, 2, 3, 4, 5, 6,
+    };
+    static mp_placed_actor a;
+    assert(mp_read_placed_create(server_create, sizeof(server_create), &s, &a));
+    assert(a.uid == 9 && a.ticket == 2 && a.owner == 4 && !a.has_solver && a.factory == bk);
+    assert(a.game_uid_size == 3 && memcmp(a.game_uid, uid, 3) == 0 && mp_name_equals(a.name, "Bk"));
+    assert(a.values.has_transform && !a.values.has_health && a.values.transform.rot[1] == -1);
+    assert(a.values.transform.pos[2] == -1.0f);
+    for (mp_u32 cut = 0; cut != sizeof(server_create); ++cut)
+        assert(!mp_read_placed_create(server_create, cut, &s, &a));
+
+    /* another name takes the Default factory; a name with an unusable factory is skipped */
+    static const mp_u8 server_create_default[] = {
+        0x8A, 0x00, 0x01, 0x85, 'k', 'o', 't', 'u', 'b', 'o', 0, 'k', 'o', 't', 'u', 'b', 'o', 0,
+        0x01, 0x80, 0x81, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    assert(mp_read_placed_create(server_create_default, sizeof(server_create_default), &s, &a));
+    assert(a.uid == 10 && a.has_solver && a.solver == 5 && a.game_uid_size == 0 && a.factory == def);
+    assert(a.values.has_health && a.values.health == 0 && a.values.status == 1 && a.owner == 0);
+    static const mp_u8 server_create_pl[] = {0x8B, 0x00, 0x00, 'P', 'l', 0, 'P', 'l', 0, 0x01, 0x80, 0x81, 0x80, 0xFF};
+    assert(mp_read_placed_create(server_create_pl, sizeof(server_create_pl), &s, &a) && a.factory == MP_NO_ID);
+
+    /* SERVER_ACTOR_SYNC_UPDATE: an index past the factory is rejected */
+    static const mp_u8 server_update[] = {0x89, 0x05, 0x86, 0x81, 0x81, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00};
+    assert(mp_read_placed_update(server_update, sizeof(server_update), &s.factories[bk], &a));
+    assert(a.uid == 9 && a.ticket == 5 && a.owner == 6 && a.values.has_health && a.values.health == 2);
+    assert(!a.values.has_transform);
+    static const mp_u8 server_update_bad[] = {0x89, 0x05, 0x86, 0x81, 0x83, 0, 0, 0, 0, 0, 0};
+    assert(!mp_read_placed_update(server_update_bad, sizeof(server_update_bad), &s.factories[bk], &a));
+
+    /* a spawned actor: no game UID, factory "Spawned", ActorSpawnSync after ActorBaseSync */
+    mp_u32 sp = mp_find_factory(&s, MP_SPAWN_FACTORY);
+    assert(sp != MP_NO_ID && s.factories[sp].usable && s.factories[sp].kinds[1] == MP_COMPONENT_SPAWN);
+    assert(s.factories[sp].health_index == 0xFF);
+    mp_actor_values item = {.has_transform = 1, .transform = kTransform,
+                            .spawn = {.proc = 0xFF, .params = 0x28FF0101, .argument = 0xFF,
+                                      .angle = {0, -2, 0xFF}, .scale = {10, 10, 10}, .room = 3,
+                                      .speed_f = 2.0f, .speed = {0.0f, 1.0f, 0.0f}, .gravity = -4.0f,
+                                      .variant = 2}};
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_create_named(&w, &s.factories[sp], 0x100001, 0, 0, "item", MP_SPAWN_FACTORY, &item);
+    static const mp_u8 spawn_create[] = {
+        0x00, 0x40, 0x00, 0x81,                          /* no game UID, solver 0x100001 */
+        'i', 't', 'e', 'm', 0, 'S', 'p', 'a', 'w', 'n', 'e', 'd', 0,
+        0x82, 0x80, BASE_BYTES,
+        0x81,                                            /* ActorSpawnSync */
+        0x00, 0xFF, 0x28, 0xFF, 0x01, 0x01, 0xFF,       /* proc, params, argument */
+        0x00, 0x00, 0xFF, 0xFE, 0x00, 0xFF,             /* angle */
+        0x0A, 0x0A, 0x0A, 0x03,                         /* scale, room */
+        0x40, 0x00, 0x00, 0x00,                         /* speedF 2 */
+        0x00, 0x00, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xC0, 0x80, 0x00, 0x00,                         /* gravity -4 */
+        0x02,                                           /* variant (an arrow's element) */
+    };
+    expect_bytes(&w, spawn_create, sizeof(spawn_create));
+    /* the server's create of it to another client: uid, no game UID, no solver */
+    mp_u8 relay[128];
+    mp_writer rw = mp_writer_make(relay, sizeof(relay));
+    mp_write_vlq(&rw, 12); mp_write_u8(&rw, 0); mp_write_u8(&rw, 0);
+    mp_write_string(&rw, "item"); mp_write_string(&rw, MP_SPAWN_FACTORY);
+    mp_write_u8(&rw, 1); mp_write_vlq(&rw, 4);
+    for (mp_u32 i = 17; i != sizeof(spawn_create); ++i) mp_write_u8(&rw, spawn_create[i]);
+    assert(rw.ok && mp_read_placed_create(rw.data, rw.size, &s, &a));
+    assert(a.uid == 12 && a.game_uid_size == 0 && !a.has_solver && a.factory == sp && a.owner == 4);
+    assert(a.values.has_transform && a.values.has_spawn && a.values.spawn.proc == 0xFF);
+    assert(a.values.spawn.params == 0x28FF0101 && a.values.spawn.angle[1] == -2 && a.values.spawn.room == 3);
+    assert(a.values.spawn.speed[1] == 1.0f && a.values.spawn.gravity == -4.0f && a.values.spawn.scale[2] == 10);
+    assert(a.values.spawn.variant == 2);
+    for (mp_u32 cut = 0; cut != rw.size; ++cut) assert(!mp_read_placed_create(rw.data, cut, &s, &a));
+    /* an owner's update of it: the position only */
+    mp_actor_values moved = {.has_transform = 1, .transform = kTransform};
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_update(&w, &s.factories[sp], 12, 2, &moved);
+    assert(w.ok && w.size == 1 + 1 + 1 + 1 + 18 && w.data[2] == 0x81 && w.data[3] == 0x80);
+    /* an arrow shot: its parameters changed, the spawn component goes with the position */
+    mp_actor_values shot = item;
+    shot.has_spawn = 1;
+    shot.spawn.params = 1;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_actor_update(&w, &s.factories[sp], 12, 2, &shot);
+    assert(w.ok && w.size == 1 + 1 + 1 + (1 + 18) + (1 + 38) && w.data[2] == 0x82 && w.data[22] == 0x81);
+    mp_u8 relay2[128];
+    mp_writer uw = mp_writer_make(relay2, sizeof(relay2));
+    mp_write_vlq(&uw, 12); mp_write_u8(&uw, 2); mp_write_vlq(&uw, 4);
+    for (mp_u32 i = 2; i != w.size; ++i) mp_write_u8(&uw, w.data[i]);
+    assert(uw.ok && mp_read_placed_update(uw.data, uw.size, &s.factories[sp], &a));
+    assert(a.values.has_transform && a.values.has_spawn && a.values.spawn.params == 1 && a.owner == 4);
+}
+
 static void test_client_packets(void) {
     mp_session s = parsed_session();
     mp_player_look look = mp_player_look_default();
@@ -176,6 +405,9 @@ static void test_client_packets(void) {
         0x00,                                     /* WWHD extension: no ship */
         0x00,                                     /* WWHD extension: no extras */
         0x00,                                     /* WWHD extension: no sword swings */
+        0x00,                                     /* WWHD extension: no strikes */
+        0x00,                                     /* WWHD extension: no particles */
+        0x00,                                     /* WWHD extension: no skin */
     };
     expect_bytes(&payload, create, sizeof(create));
 
@@ -205,6 +437,9 @@ static void test_client_packets(void) {
         0x00,                                     /* no ship */
         0x00,                                     /* no extras */
         0x00,                                     /* no sword swings */
+        0x00,                                     /* no strikes */
+        0x00,                                     /* no particles */
+        0x00,                                     /* no skin */
     };
     expect_bytes(&payload, look_update, sizeof(look_update));
 
@@ -213,9 +448,12 @@ static void test_client_packets(void) {
     payload = mp_writer_make(buffer, sizeof(buffer));
     mp_write_look_update(&payload, &s, 300, 5, &red);
     assert(payload.ok && payload.size == sizeof(look_update) + 5);
-    assert(memcmp(payload.data + sizeof(look_update) - 4, "Tetra", 6) == 0);
-    assert(payload.data[payload.size - 3] == 0x00 && payload.data[payload.size - 2] == 0x00 &&
-           payload.data[payload.size - 1] == 0x00); /* no ship, no extras, no swings */
+    assert(memcmp(payload.data + sizeof(look_update) - 7, "Tetra", 6) == 0);
+    assert(payload.data[payload.size - 6] == 0x00 &&
+           payload.data[payload.size - 5] == 0x00 && payload.data[payload.size - 4] == 0x00 &&
+           payload.data[payload.size - 3] == 0x00 && payload.data[payload.size - 2] == 0x00 &&
+           payload.data[payload.size - 1] == 0x00);
+    /* no ship, no extras, no swings, no strikes, no particles, no skin */
 
     /* without an ActorBaseSync in the factory an update cannot be encoded */
     mp_session no_base = s;
@@ -359,6 +597,8 @@ static void test_launcher_cfg(void) {
         "puppet=1\n"
         "name = Captain Tetra \n"
         "hide_names=1\n"
+        "outfit=casual\n"
+        "skin=miku_2\n"
         "unknown=whatever\n"
         "no equals sign\n"
         "=empty key\n";
@@ -373,14 +613,22 @@ static void test_launcher_cfg(void) {
     assert(cfg.has_puppet && cfg.puppet == 1);
     assert(cfg.has_name && strcmp(cfg.name, "Captain Tetra") == 0);
     assert(cfg.has_hide_names && cfg.hide_names == 1);
+    assert(cfg.has_outfit && cfg.outfit == 1);
+    assert(mp_parse_launcher_cfg("outfit=hero", 11, &cfg) && cfg.has_outfit && cfg.outfit == 0);
+    assert(mp_parse_launcher_cfg("outfit=auto\n", 12, &cfg) && cfg.has_outfit && cfg.outfit == -1);
+    assert(mp_parse_launcher_cfg(text, sizeof(text) - 1, &cfg) && cfg.has_skin && strcmp(cfg.skin, "miku_2") == 0);
+    assert(mp_parse_launcher_cfg("skin=\n", 6, &cfg) && cfg.has_skin && cfg.skin[0] == 0); /* Link */
+    assert(mp_parse_launcher_cfg("skin=Miku\n", 10, &cfg) && !cfg.has_skin);
+    assert(mp_parse_launcher_cfg("skin=abcdefghijklm", 18, &cfg) && !cfg.has_skin);
+    assert(mp_parse_launcher_cfg("skin=../x", 9, &cfg) && !cfg.has_skin);
 
     /* malformed values are dropped one by one, the rest still applies */
     static const char bad[] =
         "uid=short\nport=70000\ncolor=12345G\ncolor2=#ABCDEF\npuppet=yes\nhost=\nport=abc\n"
-        "name=SeventeenLetters!\nhide_names=yes\n";
+        "name=SeventeenLetters!\nhide_names=yes\noutfit=pyjama\n";
     assert(mp_parse_launcher_cfg(bad, sizeof(bad) - 1, &cfg));
     assert(!cfg.has_uid && !cfg.has_port && !cfg.has_color && !cfg.has_puppet && !cfg.has_host);
-    assert(!cfg.has_name && !cfg.has_hide_names);
+    assert(!cfg.has_name && !cfg.has_hide_names && !cfg.has_outfit);
     assert(cfg.has_color2 && cfg.color2 == 0xABCDEF);
 
     /* a last line without newline, an empty file, an oversized file */
@@ -418,6 +666,9 @@ static void write_player_by_hand(mp_writer* w, const mp_player_look* l) {
     mp_write_u8(w, 0);                                    /* WWHD extension: no ship */
     mp_write_u8(w, 0);                                    /* WWHD extension: no extras */
     mp_write_u8(w, 0);                                    /* WWHD extension: no sword swings */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no strikes */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no particles */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no skin */
 }
 
 static void sample_events(mp_anim_events* e) {
@@ -470,12 +721,15 @@ static void test_player_events(void) {
     assert(a.events.equip_item_count == 2 && a.events.unequip_count == 1 && a.events.dropped == 0);
     /* every truncation fails, except the ones that end the component after one of the optional
      * WWHD blocks (an older mod), or after the hit list (a GameCube client) */
-    for (mp_u32 cut = 0; cut != w.size - 4; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
-    assert(mp_read_actor_update(w.data, w.size - 4, &s, &a) && a.has_look && a.look.name[0] == 0);
+    for (mp_u32 cut = 0; cut != w.size - 7; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 7, &s, &a) && a.has_look && a.look.name[0] == 0);
     assert(a.events.move_count == 1 && a.look.ship.flags == 0);
-    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.has_look && a.look.ship.flags == 0);
-    assert(mp_read_actor_update(w.data, w.size - 2, &s, &a) && a.has_look && a.look.extras == 0);
-    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.events.swing_count == 0);
+    assert(mp_read_actor_update(w.data, w.size - 6, &s, &a) && a.has_look && a.look.ship.flags == 0);
+    assert(mp_read_actor_update(w.data, w.size - 5, &s, &a) && a.has_look && a.look.extras == 0);
+    assert(mp_read_actor_update(w.data, w.size - 4, &s, &a) && a.has_look && a.events.swing_count == 0);
+    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.has_look && a.events.strike_count == 0);
+    assert(mp_read_actor_update(w.data, w.size - 2, &s, &a) && a.has_look && a.events.particle_count == 0);
+    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.look.skin[0] == 0);
 
     /* the extras: iron boots */
     {
@@ -485,7 +739,8 @@ static void test_player_events(void) {
         mp_write_vlq(&bw, 77); mp_write_u8(&bw, 3); mp_write_vlq(&bw, 77);
         mp_write_vlq(&bw, 1); mp_write_vlq(&bw, 1);
         mp_write_player_events(&bw, &booted, 0);
-        assert(bw.ok && bw.data[bw.size - 2] == MP_EXTRA_HEAVY_BOOTS && bw.data[bw.size - 1] == 0x00);
+        assert(bw.ok && bw.data[bw.size - 5] == MP_EXTRA_HEAVY_BOOTS && bw.data[bw.size - 4] == 0x00 &&
+               bw.data[bw.size - 3] == 0x00 && bw.data[bw.size - 2] == 0x00 && bw.data[bw.size - 1] == 0x00);
         assert(mp_read_actor_update(bw.data, bw.size, &s, &a) && a.look.extras == MP_EXTRA_HEAVY_BOOTS);
     }
 
@@ -504,12 +759,13 @@ static void test_player_events(void) {
         static const mp_u8 ship_bytes[] = {0x2F, 0x44, 0xBB, 0x90, 0x00, 0xC0, 0x00, 0x00, 0x00,
                                            0xC8, 0x43, 0x50, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0xFF, 0xFD,
                                            0x12, 0x34, 0x56};
-        assert(sw.ok && sw.size > sizeof(ship_bytes) + 2 && sw.data[sw.size - 2] == 0x00 &&
-               sw.data[sw.size - 1] == 0x00); /* then no extras, no swings */
-        assert(memcmp(sw.data + sw.size - 2 - sizeof(ship_bytes), ship_bytes, sizeof(ship_bytes)) == 0);
+        assert(sw.ok && sw.size > sizeof(ship_bytes) + 5 && sw.data[sw.size - 5] == 0x00 && sw.data[sw.size - 4] == 0x00 &&
+               sw.data[sw.size - 3] == 0x00 && sw.data[sw.size - 2] == 0x00 &&
+               sw.data[sw.size - 1] == 0x00); /* no extras, swings, strikes, particles, skin */
+        assert(memcmp(sw.data + sw.size - 5 - sizeof(ship_bytes), ship_bytes, sizeof(ship_bytes)) == 0);
         assert(mp_read_actor_update(sw.data, sw.size, &s, &a) && a.has_look);
         assert(mp_same_ship(&a.look.ship, &sailing.ship));
-        for (mp_u32 cut = sw.size - 2 - sizeof(ship_bytes) + 1; cut != sw.size - 2; ++cut)
+        for (mp_u32 cut = sw.size - 5 - sizeof(ship_bytes) + 1; cut != sw.size - 5; ++cut)
             assert(!mp_read_actor_update(sw.data, cut, &s, &a)); /* a cut ship block is malformed */
         mp_ship_state moved = sailing.ship;
         moved.pos[2] += 1.0f;
@@ -594,6 +850,11 @@ static void test_player_events(void) {
             sw->capsule[c] = k;
         }
     }
+    for (mp_u32 i = 0; i != MP_MAX_STRIKES; ++i) {
+        mp_strike* k = &full.strike[full.strike_count++];
+        k->target = k->tg_offset = 0xFFFFFFFFu;
+        k->at_sprm = k->at_type = k->gat_sprm = 0xFFFFFFFFu;
+    }
     update = mp_writer_make(buffer, 4096);
     mp_write_player_update(&update, &s, 0xFFFFFFFFu, 5, &look, &full);
     assert(update.ok && update.size + 16 <= 4096 + 16);
@@ -672,9 +933,11 @@ static void test_swings(void) {
                b->capsule[c].radius == 15.0f + (float)c);
     assert(a.events.swing[2].count == 1 && a.events.swing[2].capsule[0].end[1] == 86.0f);
     /* a cut swing block is malformed; the block can only be dropped whole */
-    mp_u32 block = 1 + 3 * (4 + 12 + 1) + 5 * 28;
-    for (mp_u32 cut = w.size - block + 1; cut != w.size; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
-    assert(mp_read_actor_update(w.data, w.size - block, &s, &a) && a.events.swing_count == 0);
+    mp_u32 block = 1 + 3 * (4 + 12 + 1) + 5 * 28; /* then the empty strike, particle and skin blocks */
+    for (mp_u32 cut = w.size - 3 - block + 1; cut != w.size - 3; ++cut)
+        assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 3 - block, &s, &a) && a.events.swing_count == 0);
+    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.events.swing_count == 3);
 
     /* more swings than a message keeps: the newest survives in the last slot */
     mp_anim_events many;
@@ -696,7 +959,7 @@ static void test_swings(void) {
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
     mp_write_player_events(&w, &look, 0);
-    w.size -= 1; /* replace the empty swing block */
+    w.size -= 4; /* replace the empty swing, strike, particle and skin blocks */
     mp_write_u8(&w, MP_MAX_SWINGS + 1);
     for (mp_u32 i = 0; i != MP_MAX_SWINGS + 1; ++i) {
         mp_write_u32(&w, i); mp_write_f32(&w, 0); mp_write_f32(&w, 0); mp_write_f32(&w, 0);
@@ -713,7 +976,7 @@ static void test_swings(void) {
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
     mp_write_player_events(&w, &look, 0);
-    w.size -= 1;
+    w.size -= 4;
     mp_write_u8(&w, 1); mp_write_u32(&w, 2);
     mp_write_f32(&w, 0); mp_write_f32(&w, 0); mp_write_f32(&w, 0);
     mp_write_u8(&w, 0x81);
@@ -741,10 +1004,199 @@ static void test_swings(void) {
     mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
     mp_write_vlq(&c, 1);
     mp_write_player_events(&c, &look, 0);
-    c.size -= 1; /* a sender before the swings: the extras, then the next index */
+    c.size -= 4; /* a sender before the swings: the extras, then the next index */
     mp_write_vlq(&c, 0);
     mp_write_base(&c, &kTransform);
     assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.events.swing_count == 0);
+}
+
+/* The skin (WWHD extension after the particles): a string, kept only when it is a valid id. */
+static void test_skin(void) {
+    mp_session s = parsed_session();
+    mp_player_look look = mp_player_look_default();
+    assert(look.skin[0] == 0);
+    mp_set_skin(&look, "miku_2", 6);
+    assert(strcmp(look.skin, "miku_2") == 0);
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, 0);
+    assert(w.ok && memcmp(w.data + w.size - 7, "miku_2", 7) == 0 && w.data[w.size - 8] == 0x00); /* after the particles */
+    static mp_actor_state a;
+    assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && strcmp(a.look.skin, "miku_2") == 0);
+    for (mp_u32 cut = w.size - 7 + 1; cut != w.size; ++cut)
+        assert(!mp_read_actor_update(w.data, cut, &s, &a)); /* a cut string is malformed */
+    assert(mp_read_actor_update(w.data, w.size - 7, &s, &a) && a.look.skin[0] == 0); /* an older sender */
+    /* ids the mod cannot use read as no skin, the packet stays valid */
+    static const char* const bad[] = {"Miku", "a-b", "abcdefghijklm", "../x"};
+    for (int i = 0; i != 4; ++i) {
+        w = mp_writer_make(buffer, sizeof(buffer));
+        mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+        mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+        mp_write_player_events(&w, &look, 0);
+        w.size -= 7;
+        mp_write_string(&w, bad[i]);
+        assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && a.look.skin[0] == 0);
+    }
+    mp_player_look other = look;
+    mp_set_skin(&other, "Miku", 4);
+    assert(other.skin[0] == 0);
+    /* in a server create, the next component's index (bit 7 set) after the particles is no skin */
+    mp_u8 packet[1024];
+    mp_writer c = mp_writer_make(packet, sizeof(packet));
+    mp_write_vlq(&c, 42); mp_write_u8(&c, 0); mp_write_u8(&c, 0);
+    mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
+    mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
+    mp_write_vlq(&c, 1);
+    mp_write_player_events(&c, &look, 0);
+    c.size -= 7; /* a sender before the skin */
+    mp_write_vlq(&c, 0);
+    mp_write_base(&c, &kTransform);
+    assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.look.skin[0] == 0);
+    c.size = 0;
+    mp_write_vlq(&c, 42); mp_write_u8(&c, 0); mp_write_u8(&c, 0);
+    mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
+    mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
+    mp_write_vlq(&c, 1);
+    mp_write_player_events(&c, &look, 0);
+    mp_write_vlq(&c, 0);
+    mp_write_base(&c, &kTransform);
+    assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && strcmp(a.look.skin, "miku_2") == 0);
+}
+
+/* The strike block (WWHD extension after the swings): sword hits on placed actors. */
+static void test_strikes(void) {
+    mp_session s = parsed_session();
+    mp_player_look look = mp_player_look_default();
+    mp_anim_events e;
+    mp_anim_events_clear(&e);
+    mp_strike hit = {.target = 300, .tg_offset = 0x4A0, .at_index = 3, .atp = 2, .se = 1, .mtrl = 0,
+                     .hit_mark = 3, .spl = 0, .at_sprm = 0x1D, .at_type = 2, .gat_sprm = 0x20,
+                     .vec = {0.0f, 1.0f, -1.0f}, .pos = {10.0f, 20.0f, 30.0f}};
+    e.strike[mp_strike_slot(&e)] = hit;
+    assert(!mp_anim_events_empty(&e) && e.strike_count == 1);
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_strikes(&w, &e);
+    static const mp_u8 strike_bytes[] = {
+        0x01,                         /* one strike */
+        0x02, 0xAC,                   /* target uid 300 */
+        0x09, 0xA0,                   /* collider offset 0x4A0 */
+        0x80, 0x80,                   /* attacker: the Link, no collider offset */
+        0x03, 0x02, 0x01, 0x00, 0x03, 0x00, /* mAtCyl, atp, se, mtrl, hit mark, spl */
+        0x00, 0x00, 0x00, 0x1D,       /* at SPrm */
+        0x00, 0x00, 0x00, 0x02,       /* at type */
+        0x00, 0x00, 0x00, 0x20,       /* GObjAt SPrm */
+        0x00, 0x00, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00,
+        0x41, 0x20, 0x00, 0x00, 0x41, 0xA0, 0x00, 0x00, 0x41, 0xF0, 0x00, 0x00,
+    };
+    expect_bytes(&w, strike_bytes, sizeof(strike_bytes));
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_strikes(&w, 0);
+    static const mp_u8 none[] = {0x00};
+    expect_bytes(&w, none, sizeof(none));
+
+    /* round trip through an update; a cut block is malformed, a missing one is none */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, &e);
+    static mp_actor_state a;
+    assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && a.events.strike_count == 1);
+    const mp_strike* k = &a.events.strike[0];
+    assert(k->target == 300 && k->tg_offset == 0x4A0 && k->at_index == 3 && k->atp == 2 && k->hit_mark == 3);
+    assert(k->at_sprm == 0x1D && k->at_type == 2 && k->gat_sprm == 0x20 && k->vec[2] == -1.0f && k->pos[1] == 20.0f);
+    assert(k->attacker == 0 && k->at_offset == 0);
+    /* a bomb's explosion: its uid and collider offset */
+    {
+        mp_anim_events b;
+        mp_anim_events_clear(&b);
+        mp_strike bomb = hit;
+        bomb.attacker = 500;
+        bomb.at_offset = 0x6A8;
+        b.strike[mp_strike_slot(&b)] = bomb;
+        mp_writer bw = mp_writer_make(frame_buffer, sizeof(frame_buffer));
+        mp_write_strikes(&bw, &b);
+        assert(bw.ok && bw.data[5] == 0x03 && bw.data[6] == 0xF4 && bw.data[7] == 0x0D && bw.data[8] == 0xA8);
+        mp_reader br = mp_reader_make(bw.data, bw.size);
+        mp_anim_events back;
+        mp_anim_events_clear(&back);
+        mp_read_strikes(&br, &back);
+        assert(br.ok && br.pos == bw.size && back.strike_count == 1 && back.strike[0].attacker == 500);
+        assert(back.strike[0].at_offset == 0x6A8 && back.strike[0].tg_offset == 0x4A0);
+    }
+    for (mp_u32 cut = w.size - 2 - sizeof(strike_bytes) + 1; cut != w.size - 2; ++cut)
+        assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 2 - sizeof(strike_bytes), &s, &a) && a.events.strike_count == 0);
+
+    /* the particle block: the hammer's shock wave, with an angle and a scale, and a plain spark */
+    mp_anim_events pe;
+    mp_anim_events_clear(&pe);
+    mp_particle wave = {.group = 1, .id = 0x8125, .flags = MP_PARTICLE_ANGLE | MP_PARTICLE_SCALE,
+                        .pos = {1.0f, 2.0f, 3.0f}, .angle = {0, -1, 2}, .scale = {1.0f, 0.5f, 1.0f}, .alpha = 0xFF};
+    mp_particle spark = {.group = 0, .id = 0x0010, .flags = 0, .pos = {0, 0, 0}, .alpha = 0x80};
+    pe.particle[mp_particle_slot(&pe)] = wave;
+    pe.particle[mp_particle_slot(&pe)] = spark;
+    assert(!mp_anim_events_empty(&pe));
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_particles(&w, &pe);
+    static const mp_u8 particle_bytes[] = {
+        0x02,
+        0x01, 0x81, 0x25, 0x03, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+        0x00, 0x00, 0xFF, 0xFF, 0x00, 0x02, 0x3F, 0x80, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x3F, 0x80,
+        0x00, 0x00, 0xFF,
+        0x00, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80,
+    };
+    expect_bytes(&w, particle_bytes, sizeof(particle_bytes));
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, &pe);
+    assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.events.particle_count == 2);
+    assert(a.events.particle[0].id == 0x8125 && a.events.particle[0].angle[1] == -1);
+    assert(a.events.particle[0].scale[1] == 0.5f && a.events.particle[1].alpha == 0x80);
+    assert(a.events.particle[1].scale[0] == 1.0f && a.events.particle[1].flags == 0);
+    for (mp_u32 cut = w.size - 1 - sizeof(particle_bytes) + 1; cut != w.size - 1; ++cut)
+        assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.events.particle_count == 2);
+    /* with the emitter's rotation: 9 floats after the position */
+    mp_anim_events pm;
+    mp_anim_events_clear(&pm);
+    mp_particle turned = spark;
+    turned.flags = MP_PARTICLE_MATRIX;
+    for (int c = 0; c != 9; ++c) turned.matrix[c] = (float)c;
+    pm.particle[mp_particle_slot(&pm)] = turned;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_particles(&w, &pm);
+    assert(w.ok && w.size == 1 + 1 + 2 + 1 + 12 + 36 + 1 && w.data[4] == MP_PARTICLE_MATRIX);
+    mp_reader pr = mp_reader_make(w.data, w.size);
+    mp_anim_events back;
+    mp_anim_events_clear(&back);
+    mp_read_particles(&pr, &back);
+    assert(pr.ok && pr.pos == w.size && back.particle_count == 1 && back.particle[0].matrix[8] == 8.0f);
+    mp_reader plain = mp_reader_make(particle_bytes, sizeof(particle_bytes));
+    mp_anim_events_clear(&back);
+    mp_read_particles(&plain, &back);
+    assert(plain.ok && back.particle[1].matrix[0] == 1.0f && back.particle[1].matrix[1] == 0.0f &&
+           back.particle[1].matrix[4] == 1.0f); /* identity without the flag */
+    mp_u8 bad[] = {0x01, 0x00, 0x00, 0x10, 0x08};
+    mp_reader br = mp_reader_make(bad, sizeof(bad));
+    mp_read_particles(&br, &back);
+    assert(!br.ok); /* an unknown flag is malformed */
+
+    /* bounded: the newest survives in the last slot; append keeps them */
+    mp_anim_events many;
+    mp_anim_events_clear(&many);
+    for (mp_u32 i = 0; i != MP_MAX_STRIKES + 3; ++i) {
+        mp_strike x = hit;
+        x.target = i;
+        many.strike[mp_strike_slot(&many)] = x;
+    }
+    assert(many.strike_count == MP_MAX_STRIKES && many.dropped == 3);
+    assert(many.strike[MP_MAX_STRIKES - 1].target == MP_MAX_STRIKES + 2);
+    mp_anim_events joined;
+    mp_anim_events_clear(&joined);
+    mp_anim_events_append(&joined, &e);
+    assert(joined.strike_count == 1 && joined.strike[0].tg_offset == 0x4A0);
 }
 
 static int near_byte(unsigned a, unsigned b) { return a > b ? a - b <= 1 : b - a <= 1; }
@@ -866,7 +1318,10 @@ int main(void) {
     test_launcher_cfg();
     test_player_events();
     test_swings();
+    test_strikes();
+    test_skin();
     test_tunic_colors();
+    test_placed_actors();
     puts("mp_protocol_test: ok");
     return 0;
 }

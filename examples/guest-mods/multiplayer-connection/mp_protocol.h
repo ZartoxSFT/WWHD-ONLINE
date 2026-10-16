@@ -181,25 +181,118 @@ static inline void mp_write_frame(mp_writer* w, mp_u32 id, const mp_u8* payload,
  * component name, so an unsupported one in PlayerPuppet is an init failure here too. */
 enum {
     MP_COMPONENT_UNSUPPORTED = 0,
-    MP_COMPONENT_BASE = 1,   /* ActorBaseSync */
-    MP_COMPONENT_PLAYER = 2, /* ActorPlayerSync */
+    MP_COMPONENT_BASE = 1,     /* ActorBaseSync: 3 f32 position, 3 s16 shape angle */
+    MP_COMPONENT_PLAYER = 2,   /* ActorPlayerSync */
+    MP_COMPONENT_HEALTH = 3,   /* ActorHealthSync: s16 health, u32 actor_status */
+    MP_COMPONENT_CHUCHU = 4,   /* ChuChuSync: s16 state, u8 clipping */
+    MP_COMPONENT_BOKOBLIN = 5, /* BokoblinSync: 6 state bytes */
+    MP_COMPONENT_PROPS = 6,    /* PropsSync: u8 state, u8 thrown, u8 grounded, s16 model angle */
+    MP_COMPONENT_SPAWN = 7,    /* ActorSpawnSync (WWHD): how to create the actor, see mp_spawn */
 };
+
+/* Synchronised actors other than the players (ActorSync factories and ActorFilter).
+ *
+ * Every factory of the ActorSync initializer is kept when its name can be an actor name (at most
+ * MP_ACTOR_NAME_MAX characters, the stage name table's char[8]; ActorSync::getFactory falls back
+ * to "Default" otherwise). A factory is usable when all its components have a fixed size: the
+ * guest then writes and reads it whole, even the components it does not apply (ChuChuSync,
+ * BokoblinSync, PropsSync carry GameCube field offsets, see their WindWakerClient sources: the
+ * guest sends zeros and ignores what it receives, which keeps the stream aligned).
+ *
+ * ActorFilter (ActorFilter.java, from resources/WWServer/actorList.ktml) lists the actor names to
+ * synchronise. Protocol extension (WWHD), backward compatible: an entry
+ * MP_MULTIPLIER_ENTRY + decimal number carries the server's enemy multiplier, and
+ * MP_RANDOMIZER_ENTRY + 0 or 1 whether the copies take random variants (actor_sync.h). The
+ * GameCube client only adds them to its name set, where no actor name matches them. */
+#define MP_MAX_FACTORIES 64
+#define MP_ACTOR_NAME_MAX 8
+#define MP_MAX_FILTER 512
+#define MP_GAME_UID_MAX 64
+#define MP_MULTIPLIER_ENTRY "#enemy_multiplier="
+#define MP_MULTIPLIER_MAX 15
+#define MP_RANDOMIZER_ENTRY "#enemy_randomizer="
+
+typedef struct mp_factory {
+    char name[MP_ACTOR_NAME_MAX + 1];
+    mp_u8 count;
+    mp_u8 usable;       /* every component has a fixed size */
+    mp_u8 base_index;   /* first ActorBaseSync, 0xFF when none */
+    mp_u8 health_index; /* first ActorHealthSync, 0xFF when none */
+    mp_u8 kinds[MP_MAX_COMPONENTS];
+} mp_factory;
 
 typedef struct mp_session {
     /* server -> client (index in the first init list) */
     mp_u32 server_create, server_update, server_remove;
+    mp_u32 server_mutators; /* WWHD extension (ActorFilter.java): the mutators changed */
     /* client -> server (index in the second init list) */
     mp_u32 client_init, client_change_manager, client_leave_manager;
     mp_u32 client_create, client_update, client_remove;
+    mp_u32 client_exclusive_add, client_exclusive_remove; /* SyncedActorClient, VLQ uid */
     /* "PlayerPuppet" factory from the ActorSync initializer, in component index order */
     mp_u32 puppet_component_count;
     mp_u8 puppet_components[MP_MAX_COMPONENTS];
     mp_u32 puppet_base_index;
     int has_actor_sync;
+    /* the other factories; factories_complete = 0 when one could not be kept (table full) */
+    mp_u32 factory_count;
+    int factories_complete;
+    mp_factory factories[MP_MAX_FACTORIES];
+    /* ActorFilter names (at most MP_ACTOR_NAME_MAX characters, not NUL-terminated at 8) */
+    mp_u32 filter_count;
+    char filter[MP_MAX_FILTER][MP_ACTOR_NAME_MAX];
+    mp_u32 enemy_multiplier; /* 1 when the server sends none */
+    int enemy_randomizer;    /* 0 when the server sends none */
 } mp_session;
 
 static inline void mp_assign_id(const char* s, mp_u32 n, mp_u32 index, const char* name, mp_u32* id) {
     if (mp_string_equals(s, n, name)) *id = index;
+}
+
+static inline mp_u32 mp_component_size(mp_u8 kind) {
+    if (kind == MP_COMPONENT_BASE) return 18;
+    if (kind == MP_COMPONENT_HEALTH) return 6;
+    if (kind == MP_COMPONENT_CHUCHU) return 3;
+    if (kind == MP_COMPONENT_BOKOBLIN) return 6;
+    if (kind == MP_COMPONENT_PROPS) return 5;
+    if (kind == MP_COMPONENT_SPAWN) return 38;
+    return 0; /* variable (ActorPlayerSync) or unknown */
+}
+
+static inline mp_u8 mp_component_kind(const char* name, mp_u32 n) {
+    if (mp_string_equals(name, n, "ActorBaseSync")) return MP_COMPONENT_BASE;
+    if (mp_string_equals(name, n, "ActorPlayerSync")) return MP_COMPONENT_PLAYER;
+    if (mp_string_equals(name, n, "ActorHealthSync")) return MP_COMPONENT_HEALTH;
+    if (mp_string_equals(name, n, "ChuChuSync")) return MP_COMPONENT_CHUCHU;
+    if (mp_string_equals(name, n, "BokoblinSync")) return MP_COMPONENT_BOKOBLIN;
+    if (mp_string_equals(name, n, "PropsSync")) return MP_COMPONENT_PROPS;
+    if (mp_string_equals(name, n, "ActorSpawnSync")) return MP_COMPONENT_SPAWN;
+    return MP_COMPONENT_UNSUPPORTED;
+}
+
+/* a (up to MP_ACTOR_NAME_MAX characters, NUL-terminated when shorter) equals the C string b */
+static inline int mp_name_equals(const char* a, const char* b) {
+    for (mp_u32 i = 0; i != MP_ACTOR_NAME_MAX; ++i) {
+        if (a[i] != b[i]) return 0;
+        if (!a[i]) return 1;
+    }
+    return b[MP_ACTOR_NAME_MAX] == 0;
+}
+
+/* ActorSync::getFactory: the factory named like the actor, else "Default"; MP_NO_ID when none. */
+static inline mp_u32 mp_find_factory(const mp_session* s, const char* name) {
+    mp_u32 fallback = MP_NO_ID;
+    for (mp_u32 i = 0; i != s->factory_count; ++i) {
+        if (mp_name_equals(s->factories[i].name, name)) return i;
+        if (mp_name_equals(s->factories[i].name, "Default")) fallback = i;
+    }
+    return fallback;
+}
+
+static inline int mp_filter_contains(const mp_session* s, const char* name) {
+    for (mp_u32 i = 0; i != s->filter_count; ++i)
+        if (mp_name_equals(s->filter[i], name)) return 1;
+    return 0;
 }
 
 /* ActorSync::readSyncTable: VLQ factories, each = name + VLQ components + names. */
@@ -210,23 +303,73 @@ static inline int mp_read_actor_sync(mp_reader* r, mp_session* s) {
         const char* factory = mp_read_string(r, &n);
         int puppet = mp_string_equals(factory, n, "PlayerPuppet");
         mp_u32 count = mp_read_vlq(r);
+        mp_factory* kept = 0;
         if (puppet) {
             if (count > MP_MAX_COMPONENTS) return 0;
             s->puppet_component_count = count;
             s->puppet_base_index = MP_NO_ID;
+        } else if (r->ok && n <= MP_ACTOR_NAME_MAX) {
+            if (s->factory_count == MP_MAX_FACTORIES || count > MP_MAX_COMPONENTS) {
+                s->factories_complete = 0;
+            } else {
+                kept = &s->factories[s->factory_count++];
+                for (mp_u32 i = 0; i != MP_ACTOR_NAME_MAX + 1; ++i) kept->name[i] = i < n ? factory[i] : 0;
+                kept->count = (mp_u8)count;
+                kept->usable = 1;
+                kept->base_index = kept->health_index = 0xFF;
+            }
         }
         for (mp_u32 c = 0; r->ok && c != count; ++c) {
             const char* component = mp_read_string(r, &n);
+            if (!r->ok) break;
+            mp_u8 kind = mp_component_kind(component, n);
+            if (kept) {
+                kept->kinds[c] = kind;
+                if (!mp_component_size(kind)) kept->usable = 0;
+                if (kind == MP_COMPONENT_BASE && kept->base_index == 0xFF) kept->base_index = (mp_u8)c;
+                if (kind == MP_COMPONENT_HEALTH && kept->health_index == 0xFF) kept->health_index = (mp_u8)c;
+            }
             if (!puppet) continue;
-            mp_u8 kind = MP_COMPONENT_UNSUPPORTED;
-            if (mp_string_equals(component, n, "ActorBaseSync")) kind = MP_COMPONENT_BASE;
-            else if (mp_string_equals(component, n, "ActorPlayerSync")) kind = MP_COMPONENT_PLAYER;
-            else return 0;
+            if (kind != MP_COMPONENT_BASE && kind != MP_COMPONENT_PLAYER) return 0;
             s->puppet_components[c] = kind;
             if (kind == MP_COMPONENT_BASE && s->puppet_base_index == MP_NO_ID)
                 s->puppet_base_index = c;
         }
         if (puppet) s->has_actor_sync = 1;
+    }
+    return r->ok;
+}
+
+/* ActorFilter: VLQ count + names. Names longer than an actor name are not kept (none can match). */
+static inline int mp_read_actor_filter(mp_reader* r, mp_session* s) {
+    mp_u32 count = mp_read_vlq(r);
+    mp_u32 prefix = sizeof(MP_MULTIPLIER_ENTRY) - 1;
+    mp_u32 random_prefix = sizeof(MP_RANDOMIZER_ENTRY) - 1;
+    for (mp_u32 i = 0; r->ok && i != count; ++i) {
+        mp_u32 n;
+        const char* name = mp_read_string(r, &n);
+        if (!r->ok) break;
+        int randomizer = n == random_prefix + 1;
+        for (mp_u32 k = 0; randomizer && k != random_prefix; ++k) randomizer = name[k] == MP_RANDOMIZER_ENTRY[k];
+        if (randomizer) {
+            s->enemy_randomizer = name[random_prefix] == '1';
+            continue;
+        }
+        int setting = n > prefix;
+        for (mp_u32 k = 0; setting && k != prefix; ++k) setting = name[k] == MP_MULTIPLIER_ENTRY[k];
+        if (setting) {
+            mp_u32 value = 0;
+            for (mp_u32 k = prefix; k != n && value <= MP_MULTIPLIER_MAX; ++k) {
+                if (name[k] < '0' || name[k] > '9') { value = 0; break; }
+                value = value * 10 + (mp_u32)(name[k] - '0');
+            }
+            if (value > MP_MULTIPLIER_MAX) value = MP_MULTIPLIER_MAX;
+            s->enemy_multiplier = value ? value : 1;
+            continue;
+        }
+        if (n == 0 || n > MP_ACTOR_NAME_MAX || s->filter_count == MP_MAX_FILTER) continue;
+        char* kept = s->filter[s->filter_count++];
+        for (mp_u32 k = 0; k != MP_ACTOR_NAME_MAX; ++k) kept[k] = k < n ? name[k] : 0;
     }
     return r->ok;
 }
@@ -251,11 +394,7 @@ static inline int mp_skip_resource(mp_reader* r, int depth) {
 static inline int mp_skip_initializer(mp_reader* r, const char* name, mp_u32 n, mp_session* s) {
     mp_u32 count;
     if (mp_string_equals(name, n, "ActorSync")) return mp_read_actor_sync(r, s);
-    if (mp_string_equals(name, n, "ActorFilter")) {
-        count = mp_read_vlq(r);
-        for (mp_u32 i = 0; r->ok && i != count; ++i) mp_read_string(r, &n);
-        return r->ok;
-    }
+    if (mp_string_equals(name, n, "ActorFilter")) return mp_read_actor_filter(r, s);
     if (mp_string_equals(name, n, "SaveServer")) {
         /* SaveServer::readMap: VLQ entries of {u8 type, u8 length} */
         count = mp_read_vlq(r);
@@ -281,12 +420,18 @@ static inline int mp_skip_initializer(mp_reader* r, const char* name, mp_u32 n, 
 static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s) {
     mp_reader r = mp_reader_make(payload, size);
     mp_u32 n, count;
-    s->server_create = s->server_update = s->server_remove = MP_NO_ID;
+    s->server_create = s->server_update = s->server_remove = s->server_mutators = MP_NO_ID;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
+    s->client_exclusive_add = s->client_exclusive_remove = MP_NO_ID;
     s->puppet_component_count = 0;
     s->puppet_base_index = MP_NO_ID;
     s->has_actor_sync = 0;
+    s->factory_count = 0;
+    s->factories_complete = 1;
+    s->filter_count = 0;
+    s->enemy_multiplier = 1;
+    s->enemy_randomizer = 0;
 
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -294,6 +439,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_ACTOR_SYNC_CREATE", &s->server_create);
         mp_assign_id(name, n, i, "SERVER_ACTOR_SYNC_UPDATE", &s->server_update);
         mp_assign_id(name, n, i, "SERVER_ACTOR_SYNC_REMOVE", &s->server_remove);
+        mp_assign_id(name, n, i, "SERVER_MUTATORS", &s->server_mutators);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -304,6 +450,8 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_CREATE", &s->client_create);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_UPDATE", &s->client_update);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_REMOVE", &s->client_remove);
+        mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
+        mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -353,6 +501,7 @@ static inline void mp_read_base(mp_reader* r, mp_transform* t) {
  * Then the player's extras (WWHD, optional the same way, after the ship block): u8, bit 7 clear,
  * MP_EXTRA_HEAVY_BOOTS when the iron boots are on (daPy_lk_c::mNoResetFlg0 0x2000000). */
 #define MP_EXTRA_HEAVY_BOOTS 0x01
+#define MP_EXTRA_CASUAL 0x02      /* casual clothes worn (outfit.h) */
 #define MP_EXTRAS 0x7F
 #define MP_SHIP_PRESENT 0x01 /* the player's stage has its ship */
 #define MP_SHIP_RIDING 0x02  /* Link is on it */
@@ -372,6 +521,12 @@ typedef struct mp_ship_state {
     float hook[3];
 } mp_ship_state;
 
+/* Protocol extension (WWHD, after the particles, optional the same way): the player's skin, a
+ * NUL-terminated string, empty for Link. A skin is another Link model the player chose
+ * (skin.h); its id is 1 to MP_SKIN_MAX of a-z 0-9 _, anything else reads as no skin. The Java
+ * server keeps and forwards it (ActorPlayerSync.java skin). */
+#define MP_SKIN_MAX 12
+
 typedef struct mp_player_look {
     mp_u16 item;
     mp_u32 proc;
@@ -380,6 +535,7 @@ typedef struct mp_player_look {
     char name[MP_NAME_MAX + 1];
     mp_ship_state ship;
     mp_u8 extras; /* MP_EXTRA_* */
+    char skin[MP_SKIN_MAX + 1]; /* "" for Link */
 } mp_player_look;
 
 static inline mp_player_look mp_player_look_default(void) {
@@ -406,7 +562,24 @@ static inline mp_player_look mp_player_look_default(void) {
     l.ship.tiller = l.ship.sail = l.ship.cannon_pitch = l.ship.cannon_yaw = l.ship.crane = l.ship.rope = 0;
     l.ship.neck_pitch = l.ship.neck_turn = 0;
     l.extras = 0;
+    for (int i = 0; i != MP_SKIN_MAX + 1; ++i) l.skin[i] = 0;
     return l;
+}
+
+/* A skin id: 1 to MP_SKIN_MAX of a-z 0-9 _. */
+static inline int mp_skin_valid(const char* text, mp_u32 length) {
+    if (length == 0 || length > MP_SKIN_MAX) return 0;
+    for (mp_u32 i = 0; i != length; ++i) {
+        char c = text[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return 0;
+    }
+    return 1;
+}
+
+/* Copies a valid skin id, else no skin. */
+static inline void mp_set_skin(mp_player_look* l, const char* text, mp_u32 length) {
+    mp_u32 n = mp_skin_valid(text, length) ? length : 0;
+    for (mp_u32 i = 0; i != MP_SKIN_MAX + 1; ++i) l->skin[i] = i < n ? text[i] : 0;
 }
 
 /* Copies a name keeping printable ASCII only (others become '?'), at most MP_NAME_MAX. */
@@ -462,6 +635,49 @@ typedef struct mp_swing_capsule {
     float start[3], end[3], radius;
 } mp_swing_capsule;
 
+/* WWHD extension after the swings: the hits of the player's sword on synchronised placed actors
+ * (actor_sync.h), a byte count (bit 7 clear) then the records. The historical hit list
+ * (ActorPlayerSync HitPacket: actor uid, collider offset, capsule index) stays empty: its
+ * receivers replayed the hit with their copy of the player's capsule, whose attack values the
+ * HD puppet does not have; a record here carries them. */
+#define MP_MAX_STRIKES 8       /* per message; the newest replaces the last slot */
+
+typedef struct mp_strike {
+    mp_u32 target;      /* the synchronised actor's uid */
+    mp_u32 tg_offset;   /* its hit collider (cCcD_Obj), bytes from the actor */
+    mp_u32 attacker;    /* 0: the player's Link; else the uid of its spawned actor (bomb, arrow...) */
+    mp_u32 at_offset;   /* with an attacker: its attack collider, bytes from it */
+    mp_u8 at_index;     /* the player's collider: 0..2 mAtCps, 3 mAtCyl */
+    mp_u8 atp;          /* cCcD_ObjAt::mAtp, the damage */
+    mp_u8 se, mtrl, hit_mark, spl; /* dCcD_GObjAt */
+    mp_u32 at_sprm;     /* cCcD_ObjAt::mSPrm */
+    mp_u32 at_type;     /* cCcD_ObjAt::mType */
+    mp_u32 gat_sprm;    /* dCcD_GObjAt::mSPrm */
+    float vec[3];       /* dCcD_GObjAt::mVec */
+    float pos[3];       /* the hit position */
+} mp_strike;
+
+/* WWHD extension after the strikes: particle effects the player's Link made (hammer on the
+ * ground, sword sparks and splashes...), replayed where they were (particle_sync.h). A byte count
+ * (bit 7 clear), then per particle: u8 group, u16 id, u8 flags (1 angle, 2 scale, 4 matrix),
+ * f32 x y z, [f32 rotation 3x3, row by row], [s16 angle x y z], [f32 scale x y z], u8 alpha. */
+#define MP_MAX_PARTICLES 8
+#define MP_PARTICLE_ANGLE 1
+#define MP_PARTICLE_SCALE 2
+#define MP_PARTICLE_MATRIX 4
+#define MP_PARTICLE_FLAGS 7
+
+typedef struct mp_particle {
+    mp_u8 group;
+    mp_u16 id;
+    mp_u8 flags;
+    float pos[3];
+    float matrix[9];   /* the emitter's global rotation, when MP_PARTICLE_MATRIX */
+    mp_s16 angle[3];
+    float scale[3];
+    mp_u8 alpha;
+} mp_particle;
+
 typedef struct mp_swing {
     mp_u32 at_type;
     float vec[3];
@@ -505,6 +721,8 @@ typedef struct mp_anim_events {
     mp_u32 equip_item_count, unequip_count; /* setAnimeEquipItem / setAnimeUnequip: no data */
     mp_u32 hit_count;                       /* decoded and dropped (no hit replay yet) */
     mp_u32 swing_count;                     /* WWHD extension */
+    mp_u32 strike_count;                    /* WWHD extension */
+    mp_u32 particle_count;                  /* WWHD extension */
     mp_u32 dropped;                         /* events beyond MP_MAX_EVENTS or MP_MAX_SWINGS */
     mp_move_anim move[MP_MAX_EVENTS];
     mp_single_anim single[MP_MAX_EVENTS];
@@ -512,16 +730,33 @@ typedef struct mp_anim_events {
     mp_reset_upper reset[MP_MAX_EVENTS];
     mp_u32 sword[MP_MAX_EVENTS];            /* setAnimeEquipSword(b1) */
     mp_swing swing[MP_MAX_SWINGS];
+    mp_strike strike[MP_MAX_STRIKES];
+    mp_particle particle[MP_MAX_PARTICLES];
 } mp_anim_events;
 
 static inline void mp_anim_events_clear(mp_anim_events* e) {
     e->move_count = e->single_count = e->upper_count = e->reset_count = e->sword_count = 0;
     e->equip_item_count = e->unequip_count = e->hit_count = e->swing_count = e->dropped = 0;
+    e->strike_count = e->particle_count = 0;
 }
 
 static inline int mp_anim_events_empty(const mp_anim_events* e) {
     return !(e->move_count | e->single_count | e->upper_count | e->reset_count | e->sword_count |
-             e->equip_item_count | e->unequip_count | e->swing_count);
+             e->equip_item_count | e->unequip_count | e->swing_count | e->strike_count | e->particle_count);
+}
+
+/* Slot for one more particle (the newest survives in the last slot). */
+static inline mp_u32 mp_particle_slot(mp_anim_events* e) {
+    if (e->particle_count < MP_MAX_PARTICLES) return e->particle_count++;
+    ++e->dropped;
+    return MP_MAX_PARTICLES - 1;
+}
+
+/* Slot for one more strike (the newest survives in the last slot). */
+static inline mp_u32 mp_strike_slot(mp_anim_events* e) {
+    if (e->strike_count < MP_MAX_STRIKES) return e->strike_count++;
+    ++e->dropped;
+    return MP_MAX_STRIKES - 1;
 }
 
 /* Slot for one more swing (the newest survives in the last slot, like mp_anim_slot). */
@@ -553,6 +788,10 @@ static inline void mp_anim_events_append(mp_anim_events* dst, const mp_anim_even
         dst->sword[mp_anim_slot(&dst->sword_count, &dst->dropped)] = src->sword[i];
     for (mp_u32 i = 0; i != src->swing_count; ++i)
         dst->swing[mp_swing_slot(dst)] = src->swing[i];
+    for (mp_u32 i = 0; i != src->strike_count; ++i)
+        dst->strike[mp_strike_slot(dst)] = src->strike[i];
+    for (mp_u32 i = 0; i != src->particle_count; ++i)
+        dst->particle[mp_particle_slot(dst)] = src->particle[i];
     dst->equip_item_count += src->equip_item_count;
     dst->unequip_count += src->unequip_count;
     dst->dropped += src->dropped;
@@ -658,6 +897,102 @@ static inline void mp_read_swings(mp_reader* r, mp_anim_events* e) {
     }
 }
 
+static inline void mp_write_strikes(mp_writer* w, const mp_anim_events* e) {
+    mp_u32 count = e ? e->strike_count : 0;
+    if (count > MP_MAX_STRIKES) count = MP_MAX_STRIKES;
+    mp_write_u8(w, (mp_u8)count);
+    for (mp_u32 i = 0; i != count; ++i) {
+        const mp_strike* k = &e->strike[i];
+        mp_write_vlq(w, k->target);
+        mp_write_vlq(w, k->tg_offset);
+        mp_write_vlq(w, k->attacker);
+        mp_write_vlq(w, k->at_offset);
+        mp_write_u8(w, k->at_index);
+        mp_write_u8(w, k->atp);
+        mp_write_u8(w, k->se);
+        mp_write_u8(w, k->mtrl);
+        mp_write_u8(w, k->hit_mark);
+        mp_write_u8(w, k->spl);
+        mp_write_u32(w, k->at_sprm);
+        mp_write_u32(w, k->at_type);
+        mp_write_u32(w, k->gat_sprm);
+        for (int c = 0; c != 3; ++c) mp_write_f32(w, k->vec[c]);
+        for (int c = 0; c != 3; ++c) mp_write_f32(w, k->pos[c]);
+    }
+}
+
+/* The strike block when it is there (a byte with bit 7 clear, as for the swings). */
+static inline void mp_read_strikes(mp_reader* r, mp_anim_events* e) {
+    e->strike_count = 0;
+    if (!r->ok || r->pos >= r->size || (r->data[r->pos] & 0x80)) return;
+    mp_u32 count = mp_read_u8(r);
+    for (mp_u32 i = 0; r->ok && i != count; ++i) {
+        mp_strike k;
+        k.target = mp_read_vlq(r);
+        k.tg_offset = mp_read_vlq(r);
+        k.attacker = mp_read_vlq(r);
+        k.at_offset = mp_read_vlq(r);
+        k.at_index = mp_read_u8(r);
+        k.atp = mp_read_u8(r);
+        k.se = mp_read_u8(r);
+        k.mtrl = mp_read_u8(r);
+        k.hit_mark = mp_read_u8(r);
+        k.spl = mp_read_u8(r);
+        k.at_sprm = mp_read_u32(r);
+        k.at_type = mp_read_u32(r);
+        k.gat_sprm = mp_read_u32(r);
+        for (int c = 0; c != 3; ++c) k.vec[c] = mp_read_f32(r);
+        for (int c = 0; c != 3; ++c) k.pos[c] = mp_read_f32(r);
+        if (r->ok) e->strike[mp_strike_slot(e)] = k;
+    }
+}
+
+static inline void mp_write_particles(mp_writer* w, const mp_anim_events* e) {
+    mp_u32 count = e ? e->particle_count : 0;
+    if (count > MP_MAX_PARTICLES) count = MP_MAX_PARTICLES;
+    mp_write_u8(w, (mp_u8)count);
+    for (mp_u32 i = 0; i != count; ++i) {
+        const mp_particle* p = &e->particle[i];
+        mp_write_u8(w, p->group);
+        mp_write_u16(w, p->id);
+        mp_write_u8(w, (mp_u8)(p->flags & MP_PARTICLE_FLAGS));
+        for (int c = 0; c != 3; ++c) mp_write_f32(w, p->pos[c]);
+        if (p->flags & MP_PARTICLE_MATRIX)
+            for (int c = 0; c != 9; ++c) mp_write_f32(w, p->matrix[c]);
+        if (p->flags & MP_PARTICLE_ANGLE)
+            for (int c = 0; c != 3; ++c) mp_write_u16(w, (mp_u16)p->angle[c]);
+        if (p->flags & MP_PARTICLE_SCALE)
+            for (int c = 0; c != 3; ++c) mp_write_f32(w, p->scale[c]);
+        mp_write_u8(w, p->alpha);
+    }
+}
+
+/* The particle block when it is there (a byte with bit 7 clear, as for the strikes). */
+static inline void mp_read_particles(mp_reader* r, mp_anim_events* e) {
+    e->particle_count = 0;
+    if (!r->ok || r->pos >= r->size || (r->data[r->pos] & 0x80)) return;
+    mp_u32 count = mp_read_u8(r);
+    for (mp_u32 i = 0; r->ok && i != count; ++i) {
+        mp_particle p;
+        p.group = mp_read_u8(r);
+        p.id = mp_read_u16(r);
+        p.flags = mp_read_u8(r);
+        if (p.flags & ~(mp_u32)MP_PARTICLE_FLAGS) r->ok = 0;
+        for (int c = 0; c != 3; ++c) p.pos[c] = mp_read_f32(r);
+        for (int c = 0; c != 9; ++c) p.matrix[c] = (c % 4) ? 0.0f : 1.0f;
+        if (p.flags & MP_PARTICLE_MATRIX)
+            for (int c = 0; c != 9; ++c) p.matrix[c] = mp_read_f32(r);
+        for (int c = 0; c != 3; ++c) p.angle[c] = 0;
+        for (int c = 0; c != 3; ++c) p.scale[c] = 1.0f;
+        if (p.flags & MP_PARTICLE_ANGLE)
+            for (int c = 0; c != 3; ++c) p.angle[c] = (mp_s16)mp_read_u16(r);
+        if (p.flags & MP_PARTICLE_SCALE)
+            for (int c = 0; c != 3; ++c) p.scale[c] = mp_read_f32(r);
+        p.alpha = mp_read_u8(r);
+        if (r->ok) e->particle[mp_particle_slot(e)] = p;
+    }
+}
+
 static inline int mp_same_ship(const mp_ship_state* a, const mp_ship_state* b) {
     if (a->flags != b->flags) return 0;
     if (a->flags & MP_SHIP_COLOR)
@@ -689,6 +1024,9 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
         mp_write_ship(w, &l->ship);
         mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
         mp_write_swings(w, 0);
+        mp_write_strikes(w, 0);
+        mp_write_particles(w, 0);
+        mp_write_string(w, l->skin);
         return;
     }
     mp_write_vlq(w, e->move_count);
@@ -725,6 +1063,9 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     mp_write_ship(w, &l->ship);
     mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
     mp_write_swings(w, e);
+    mp_write_strikes(w, e);
+    mp_write_particles(w, e);
+    mp_write_string(w, l->skin);
 }
 
 static inline void mp_write_player(mp_writer* w, const mp_player_look* l) {
@@ -795,6 +1136,12 @@ static inline void mp_read_player_events(mp_reader* r, mp_player_look* l, mp_ani
     /* the extras, the same way: a byte with bit 7 clear, else none (a sender before them) */
     l->extras = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? (mp_u8)(mp_read_u8(r) & MP_EXTRAS) : 0;
     mp_read_swings(r, e); /* the swings, the same way (a sender before them: none) */
+    mp_read_strikes(r, e); /* then the strikes */
+    mp_read_particles(r, e); /* then the particles */
+    /* then the skin, the same way (a string: its first byte has bit 7 clear) */
+    mp_u32 skin_length = 0;
+    const char* skin = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? mp_read_string(r, &skin_length) : "";
+    mp_set_skin(l, skin, skin_length);
     if (!r->ok) mp_anim_events_clear(e);
 }
 
@@ -950,6 +1297,249 @@ static inline int mp_read_actor_update(const mp_u8* payload, mp_u32 size, const 
 /* SERVER_ACTOR_SYNC_REMOVE: VLQ uid. */
 static inline mp_u32 mp_read_actor_remove(const mp_u8* payload, mp_u32 size) {
     return mp_read_update_uid(payload, size);
+}
+
+/* ------------------------------------------------------------------ other synchronised actors */
+
+/* ActorSpawnSync (WWHD extension): an actor the game created while playing (an item dropped by an
+ * enemy, a bomb, an arrow, a boomerang), as the others create it again: its process name, the
+ * fields of its parameter block (fopAcM_prm_class), its speeds after creation and one byte of the
+ * actor's own state (variant: an arrow's element, daArrow_c::mArrowType).
+ * Wire: u16 proc, u32 params, u8 argument, s16 angle x y z, u8 scale x y z, u8 room,
+ * f32 speedF, f32 speed x y z, f32 gravity, u8 variant (38 bytes). The owner also sends it in an
+ * update when the actor's parameters change (an arrow is shot when Link sets them to 1). */
+typedef struct mp_spawn {
+    mp_u16 proc;
+    mp_u32 params;
+    mp_u8 argument;
+    mp_s16 angle[3];
+    mp_u8 scale[3];
+    mp_u8 room;
+    float speed_f;
+    float speed[3];
+    float gravity;
+    mp_u8 variant;
+} mp_spawn;
+
+/* What the guest applies of an actor's components: ActorBaseSync, ActorHealthSync, ActorSpawnSync. */
+typedef struct mp_actor_values {
+    int has_transform;
+    mp_transform transform;
+    int has_health;
+    mp_s16 health;     /* fopAc_ac_c::health, written as a short like ActorHealthSync */
+    mp_u32 status;     /* fopAc_ac_c::actor_status */
+    int has_spawn;     /* in a create, or in an update when the owner's parameters changed */
+    mp_spawn spawn;
+} mp_actor_values;
+
+static inline void mp_write_spawn(mp_writer* w, const mp_spawn* p) {
+    mp_write_u16(w, p->proc);
+    mp_write_u32(w, p->params);
+    mp_write_u8(w, p->argument);
+    for (int i = 0; i != 3; ++i) mp_write_u16(w, (mp_u16)p->angle[i]);
+    for (int i = 0; i != 3; ++i) mp_write_u8(w, p->scale[i]);
+    mp_write_u8(w, p->room);
+    mp_write_f32(w, p->speed_f);
+    for (int i = 0; i != 3; ++i) mp_write_f32(w, p->speed[i]);
+    mp_write_f32(w, p->gravity);
+    mp_write_u8(w, p->variant);
+}
+
+static inline void mp_read_spawn(mp_reader* r, mp_spawn* p) {
+    p->proc = mp_read_u16(r);
+    p->params = mp_read_u32(r);
+    p->argument = mp_read_u8(r);
+    for (int i = 0; i != 3; ++i) p->angle[i] = (mp_s16)mp_read_u16(r);
+    for (int i = 0; i != 3; ++i) p->scale[i] = mp_read_u8(r);
+    p->room = mp_read_u8(r);
+    p->speed_f = mp_read_f32(r);
+    for (int i = 0; i != 3; ++i) p->speed[i] = mp_read_f32(r);
+    p->gravity = mp_read_f32(r);
+    p->variant = mp_read_u8(r);
+}
+
+static inline void mp_write_component(mp_writer* w, mp_u8 kind, const mp_actor_values* v) {
+    if (kind == MP_COMPONENT_BASE) {
+        mp_write_base(w, &v->transform);
+    } else if (kind == MP_COMPONENT_HEALTH) {
+        mp_write_u16(w, (mp_u16)v->health);
+        mp_write_u32(w, v->status);
+    } else if (kind == MP_COMPONENT_SPAWN) {
+        mp_write_spawn(w, &v->spawn);
+    } else {
+        mp_u32 size = mp_component_size(kind);
+        if (!size) w->ok = 0;
+        for (mp_u32 i = 0; i != size; ++i) mp_write_u8(w, 0); /* not applied by the guest */
+    }
+}
+
+/* SyncedActor::writeUpdate: VLQ count, then (VLQ index, data) for every component (full) or for
+ * the first ActorBaseSync / ActorHealthSync / ActorSpawnSync the values carry. */
+static inline int mp_component_wanted(const mp_factory* f, mp_u32 i, int full, const mp_actor_values* v) {
+    if (full) return 1;
+    if (v->has_transform && i == f->base_index) return 1;
+    if (v->has_health && i == f->health_index) return 1;
+    if (v->has_spawn && f->kinds[i] == MP_COMPONENT_SPAWN) {
+        for (mp_u32 k = 0; k != i; ++k)
+            if (f->kinds[k] == MP_COMPONENT_SPAWN) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+static inline void mp_write_actor_components(mp_writer* w, const mp_factory* f, int full,
+                                             const mp_actor_values* v) {
+    if (!f->usable) {
+        w->ok = 0;
+        return;
+    }
+    mp_u32 count = 0;
+    for (mp_u32 i = 0; i != f->count; ++i)
+        if (mp_component_wanted(f, i, full, v)) ++count;
+    mp_write_vlq(w, count);
+    for (mp_u32 i = 0; i != f->count; ++i) {
+        if (!mp_component_wanted(f, i, full, v)) continue;
+        mp_write_vlq(w, i);
+        mp_write_component(w, f->kinds[i], v);
+    }
+}
+
+/* CLIENT_ACTOR_SYNC_CREATE (ActorSync::getOrCreate): byte hasGameUID [VLQ size, game UID], VLQ
+ * solver, game name, properties name (the factory), full update. A placed actor has a game UID and
+ * its name as both names; a spawned one none, and the factory MP_SPAWN_FACTORY. */
+#define MP_SPAWN_FACTORY "Spawned"
+
+static inline void mp_write_name8(mp_writer* w, const char* name) {
+    char text[MP_ACTOR_NAME_MAX + 1];
+    for (mp_u32 i = 0; i != MP_ACTOR_NAME_MAX + 1; ++i) text[i] = 0;
+    for (mp_u32 i = 0; i != MP_ACTOR_NAME_MAX && name[i]; ++i) text[i] = name[i];
+    mp_write_string(w, text);
+}
+
+static inline void mp_write_actor_create_named(mp_writer* w, const mp_factory* f, mp_u32 solver,
+                                               const mp_u8* game_uid, mp_u32 game_uid_size, const char* name,
+                                               const char* properties, const mp_actor_values* v) {
+    mp_write_u8(w, game_uid_size != 0);
+    if (game_uid_size) {
+        mp_write_vlq(w, game_uid_size);
+        for (mp_u32 i = 0; i != game_uid_size; ++i) mp_write_u8(w, game_uid[i]);
+    }
+    mp_write_vlq(w, solver);
+    mp_write_name8(w, name);
+    mp_write_name8(w, properties);
+    mp_write_actor_components(w, f, 1, v);
+}
+
+static inline void mp_write_actor_create(mp_writer* w, const mp_factory* f, mp_u32 solver,
+                                         const mp_u8* game_uid, mp_u32 game_uid_size, const char* name,
+                                         const mp_actor_values* v) {
+    mp_write_actor_create_named(w, f, solver, game_uid, game_uid_size, name, name, v);
+}
+
+/* CLIENT_ACTOR_SYNC_UPDATE of a placed actor: VLQ uid, ticket, the components the values carry. */
+static inline void mp_write_actor_update(mp_writer* w, const mp_factory* f, mp_u32 uid, mp_u8 ticket,
+                                         const mp_actor_values* v) {
+    mp_write_vlq(w, uid);
+    mp_write_u8(w, ticket);
+    mp_write_actor_components(w, f, 0, v);
+}
+
+/* CLIENT_ACTOR_SYNC_REMOVE, CLIENT_ACTOR_EXCLUSIVE_ADD and _REMOVE: VLQ uid. */
+static inline void mp_write_actor_uid(mp_writer* w, mp_u32 uid) {
+    mp_write_vlq(w, uid);
+}
+
+typedef struct mp_placed_actor {
+    mp_u32 uid;
+    mp_u32 owner;      /* the owner player's PlayerPuppet uid, 0 for none */
+    mp_u8 ticket;
+    int has_solver;
+    mp_u32 solver;
+    mp_u32 game_uid_size; /* 0: none, or longer than MP_GAME_UID_MAX */
+    mp_u8 game_uid[MP_GAME_UID_MAX];
+    char name[MP_ACTOR_NAME_MAX + 1]; /* properties name */
+    mp_u32 factory;    /* index in the session, MP_NO_ID: no usable factory (body not read) */
+    mp_actor_values values;
+} mp_placed_actor;
+
+static inline int mp_read_actor_body(mp_reader* r, const mp_factory* f, mp_placed_actor* a) {
+    a->values.has_transform = a->values.has_health = a->values.has_spawn = 0;
+    a->ticket = mp_read_u8(r);
+    a->owner = mp_read_vlq(r);
+    mp_u32 count = mp_read_vlq(r);
+    for (mp_u32 i = 0; r->ok && i != count; ++i) {
+        mp_u32 index = mp_read_vlq(r);
+        if (!r->ok || index >= f->count) return 0;
+        mp_u8 kind = f->kinds[index];
+        if (kind == MP_COMPONENT_BASE) {
+            mp_read_base(r, &a->values.transform);
+            a->values.has_transform = 1;
+        } else if (kind == MP_COMPONENT_HEALTH) {
+            a->values.health = (mp_s16)mp_read_u16(r);
+            a->values.status = mp_read_u32(r);
+            a->values.has_health = 1;
+        } else if (kind == MP_COMPONENT_SPAWN) {
+            mp_read_spawn(r, &a->values.spawn);
+            a->values.has_spawn = 1;
+        } else {
+            mp_u32 size = mp_component_size(kind);
+            if (!size) return 0;
+            mp_skip(r, size);
+        }
+    }
+    return r->ok;
+}
+
+/* SERVER_ACTOR_SYNC_CREATE of an actor that is not a PlayerPuppet. Returns 0 when malformed. */
+static inline int mp_read_placed_create(const mp_u8* payload, mp_u32 size, const mp_session* s,
+                                        mp_placed_actor* a) {
+    mp_reader r = mp_reader_make(payload, size);
+    mp_u32 n;
+    a->values.has_transform = a->values.has_health = a->values.has_spawn = 0;
+    a->ticket = 0xFF;
+    a->owner = 0;
+    a->uid = mp_read_vlq(&r);
+    a->game_uid_size = 0;
+    if (mp_read_u8(&r)) {
+        mp_u32 length = mp_read_vlq(&r);
+        if (r.ok && length <= MP_GAME_UID_MAX && length <= r.size - r.pos) {
+            for (mp_u32 i = 0; i != length; ++i) a->game_uid[i] = r.data[r.pos + i];
+            a->game_uid_size = length;
+        }
+        mp_skip(&r, length);
+    }
+    a->has_solver = mp_read_u8(&r) != 0;
+    a->solver = a->has_solver ? mp_read_vlq(&r) : MP_NO_ID;
+    mp_read_string(&r, &n);
+    const char* properties = mp_read_string(&r, &n);
+    if (!r.ok) return 0;
+    for (mp_u32 i = 0; i != MP_ACTOR_NAME_MAX + 1; ++i) a->name[i] = (i < n && n <= MP_ACTOR_NAME_MAX) ? properties[i] : 0;
+    a->factory = n <= MP_ACTOR_NAME_MAX ? mp_find_factory(s, a->name) : MP_NO_ID;
+    if (a->factory != MP_NO_ID && !s->factories[a->factory].usable) a->factory = MP_NO_ID;
+    if (a->factory == MP_NO_ID) return 1;
+    return mp_read_actor_body(&r, &s->factories[a->factory], a) && r.pos == r.size;
+}
+
+/* SERVER_ACTOR_SYNC_UPDATE of a placed actor whose factory the caller knows. */
+static inline int mp_read_placed_update(const mp_u8* payload, mp_u32 size, const mp_factory* f,
+                                        mp_placed_actor* a) {
+    mp_reader r = mp_reader_make(payload, size);
+    a->uid = mp_read_vlq(&r);
+    return mp_read_actor_body(&r, f, a) && r.pos == r.size;
+}
+
+/* SERVER_MUTATORS (WWHD extension): VLQ enemy multiplier, u8 randomizer. The server sends it to
+ * every client when its mutators change while it runs; 0 when malformed. */
+static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer) {
+    mp_reader r = mp_reader_make(payload, size);
+    mp_u32 m = mp_read_vlq(&r);
+    mp_u8 random = mp_read_u8(&r);
+    if (!r.ok || r.pos != r.size) return 0;
+    if (m < 1) m = 1;
+    if (m > MP_MULTIPLIER_MAX) m = MP_MULTIPLIER_MAX;
+    *multiplier = m;
+    *randomizer = random != 0;
+    return 1;
 }
 
 /* Splits one received transport item (VLQ id + VLQ length + payload). */

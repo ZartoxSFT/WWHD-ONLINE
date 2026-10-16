@@ -37,6 +37,7 @@
 #define SWING_CYL_RADIUS 0x0C          /* cM3dGCyl::mCenter (bottom), mRadius, mHeight */
 #define SWING_CYL_HEIGHT 0x10
 #define SWING_AT_CPS_SRC 0x101CEDA8    /* l_at_cps_src (canonical USA data) */
+#define SWING_LINK_FAN_WIND 0x7EC4     /* daPy_lk_c::mFanWindCps (d_a_player_main.h), the Deku Leaf's gust */
 #define SWING_PLAY_MASS 0x4EF8         /* play + 0x4EF8: dCcMassS_Mng */
 #define SWING_PRIORITY 1               /* the priority of Link's own sword */
 #define SWING_PLAYERS 8
@@ -52,8 +53,26 @@ static void swing_stf(u32 address, f32 value) { *(volatile f32*)address = value;
 static int swing_sent_logged;
 
 /* Adds the attack colliders the local Link registered with the mass manager this step. */
+/* The Deku Leaf's gust (its own attack type and vector), when Link set it this step. */
+static void swing_capture_fan(u32 l, mp_anim_events* out) {
+    u32 cps = l + SWING_LINK_FAN_WIND;
+    if (!(swing_ld32(cps + SWING_AT_SPRM) & SWING_SPRM_SET)) return;
+    mp_swing s;
+    s.count = 1;
+    u32 shape = cps + SWING_SHAPE;
+    for (u32 k = 0; k != 3; ++k) {
+        s.capsule[0].start[k] = swing_ldf(shape + SWING_CPS_START + k * 4);
+        s.capsule[0].end[k] = swing_ldf(shape + SWING_CPS_END + k * 4);
+        s.vec[k] = swing_ldf(cps + SWING_AT_VEC + k * 4);
+    }
+    s.capsule[0].radius = swing_ldf(shape + SWING_CPS_RADIUS);
+    s.at_type = swing_ld32(cps + SWING_AT_TYPE);
+    out->swing[mp_swing_slot(out)] = s;
+}
+
 static void swing_capture(const void* link, mp_anim_events* out) {
     u32 l = (u32)link;
+    if (l) swing_capture_fan(l, out);
     if (!l || !(swing_ld32(l + SWING_LINK_NO_RESET_FLG0) & SWING_CUT_AT_FLG)) return;
     mp_swing s;
     s.count = 0;

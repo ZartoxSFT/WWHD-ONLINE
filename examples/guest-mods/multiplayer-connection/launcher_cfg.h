@@ -5,8 +5,10 @@
  *
  * Format: UTF-8/ASCII lines "key=value", '#' comments, CR/LF or LF, at most 4096 bytes.
  * Keys: uid (exactly 8 bytes), host, port (1..65535), color, color2, ship_color, cursor
- * (RRGGBB with an optional '#'), puppet (0/1), hide_names (0/1: no name above any player), name (1..16 printable ASCII characters, shown
- * above the player's head on the other clients). Unknown keys are ignored; a malformed value is ignored on its own
+ * (RRGGBB with an optional '#'), puppet (0/1), hide_names (0/1: no name above any player),
+ * outfit (auto, hero, casual: the clothes, outfit.h), name (1..16 printable ASCII characters, shown
+ * above the player's head on the other clients), skin (another Link model, skin.h: 1..12 of a-z 0-9 _,
+ * the file skin_<id>.szs next to launcher.cfg; empty for Link). Unknown keys are ignored; a malformed value is ignored on its own
  * (the key keeps its manifest option), so a half-written file never breaks the mod.
  * Freestanding C, shared by the PowerPC guest and the native tests. */
 #pragma once
@@ -26,8 +28,12 @@ typedef struct mp_launcher_cfg {
     int puppet;
     int has_hide_names;
     int hide_names;
+    int has_outfit;
+    int outfit;          /* -1 auto (the save), 0 hero's clothes, 1 casual clothes */
     int has_name;
     char name[17];
+    int has_skin;
+    char skin[13];       /* "" for Link */
 } mp_launcher_cfg;
 
 /* "RRGGBB" with an optional leading '#'; 0 when malformed. */
@@ -100,6 +106,26 @@ static inline void mp_cfg_value(const char* key, unsigned int key_length, const 
             cfg->hide_names = value[0] == '1';
             cfg->has_hide_names = 1;
         }
+    } else if (mp_cfg_key(key, key_length, "outfit")) {
+        if (length == 4 && value[0] == 'a' && value[1] == 'u' && value[2] == 't' && value[3] == 'o') {
+            cfg->outfit = -1;
+            cfg->has_outfit = 1;
+        } else if (length == 4 && value[0] == 'h' && value[1] == 'e' && value[2] == 'r' && value[3] == 'o') {
+            cfg->outfit = 0;
+            cfg->has_outfit = 1;
+        } else if (length == 6 && value[0] == 'c' && value[1] == 'a' && value[2] == 's' && value[3] == 'u' &&
+                   value[4] == 'a' && value[5] == 'l') {
+            cfg->outfit = 1;
+            cfg->has_outfit = 1;
+        }
+    } else if (mp_cfg_key(key, key_length, "skin")) {
+        if (length > 12) return;
+        for (unsigned int i = 0; i != length; ++i) {
+            char c = value[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return;
+        }
+        for (unsigned int i = 0; i != 13; ++i) cfg->skin[i] = i < length ? value[i] : 0;
+        cfg->has_skin = 1;
     } else if (mp_cfg_key(key, key_length, "puppet")) {
         if (length == 1 && (value[0] == '0' || value[0] == '1')) {
             cfg->puppet = value[0] == '1';

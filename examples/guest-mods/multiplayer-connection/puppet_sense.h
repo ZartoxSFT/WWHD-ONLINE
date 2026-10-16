@@ -6,8 +6,9 @@
  * (fopAc_Execute 025D475C, the process method of every actor, decomp f_op_actor.cpp), player 0 is
  * the nearest Link to it, the local one or a puppet (puppet.h), and gets its value back after. So an
  * enemy near a puppet notices it, turns to it and comes for it, a resident looks at it, exactly as
- * with the player. Only what the actor does in its own execute sees the puppet; nothing is sent to
- * the server (the actors are not synchronised yet).
+ * with the player. Only what the actor does in its own execute sees the puppet. For a synchronised
+ * actor (actor_sync.h) whose owner is another player, its execute runs here too, between the
+ * network values.
  *
  * Known effects, documented: attacks on a puppet hurt nobody (its colliders are not registered,
  * the puppet does not run the player's logic); an actor that keeps the player's pointer keeps the
@@ -56,7 +57,8 @@ static u32 sense_nearest_puppet(const fopAc_ac_c* actor, u32 local) {
     return found;
 }
 
-WWHD_REPLACE(0x025D475C, s32, sense_execute, (void* actor)) {
+/* Runs an actor's execute (fopAc_Execute, replaced in actor_sync.h, which calls this). */
+static s32 sense_execute(void* actor) {
     if (!sense_enabled || !actor) return sense_execute_original(actor);
     u8 group = ((const fopAc_ac_c*)actor)->group;
     if (group != SENSE_GROUP_ENEMY && group != SENSE_GROUP_NPC) return sense_execute_original(actor);
