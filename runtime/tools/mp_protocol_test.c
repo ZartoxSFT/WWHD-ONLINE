@@ -175,6 +175,7 @@ static void test_client_packets(void) {
         0x00,                                     /* WWHD extension: empty name */
         0x00,                                     /* WWHD extension: no ship */
         0x00,                                     /* WWHD extension: no extras */
+        0x00,                                     /* WWHD extension: no sword swings */
     };
     expect_bytes(&payload, create, sizeof(create));
 
@@ -203,6 +204,7 @@ static void test_client_packets(void) {
         0x00,                                     /* empty name */
         0x00,                                     /* no ship */
         0x00,                                     /* no extras */
+        0x00,                                     /* no sword swings */
     };
     expect_bytes(&payload, look_update, sizeof(look_update));
 
@@ -211,8 +213,9 @@ static void test_client_packets(void) {
     payload = mp_writer_make(buffer, sizeof(buffer));
     mp_write_look_update(&payload, &s, 300, 5, &red);
     assert(payload.ok && payload.size == sizeof(look_update) + 5);
-    assert(memcmp(payload.data + sizeof(look_update) - 3, "Tetra", 6) == 0);
-    assert(payload.data[payload.size - 2] == 0x00 && payload.data[payload.size - 1] == 0x00); /* no ship, no extras */
+    assert(memcmp(payload.data + sizeof(look_update) - 4, "Tetra", 6) == 0);
+    assert(payload.data[payload.size - 3] == 0x00 && payload.data[payload.size - 2] == 0x00 &&
+           payload.data[payload.size - 1] == 0x00); /* no ship, no extras, no swings */
 
     /* without an ActorBaseSync in the factory an update cannot be encoded */
     mp_session no_base = s;
@@ -414,6 +417,7 @@ static void write_player_by_hand(mp_writer* w, const mp_player_look* l) {
     mp_write_string(w, l->name);                          /* WWHD extension: name */
     mp_write_u8(w, 0);                                    /* WWHD extension: no ship */
     mp_write_u8(w, 0);                                    /* WWHD extension: no extras */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no sword swings */
 }
 
 static void sample_events(mp_anim_events* e) {
@@ -464,14 +468,14 @@ static void test_player_events(void) {
     assert(a.events.reset_count == 1 && a.events.reset[0].upper == 2 && a.events.reset[0].morf == (float)2.4f);
     assert(a.events.sword_count == 1 && a.events.sword[0] == 1);
     assert(a.events.equip_item_count == 2 && a.events.unequip_count == 1 && a.events.dropped == 0);
-    /* every truncation fails, except the ones that drop only the ship (a mod before the ship
-     * extension) or the name and the ship (a GameCube client or an older mod ends the component
-     * after the hit list) */
-    for (mp_u32 cut = 0; cut != w.size - 3; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
-    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.has_look && a.look.name[0] == 0);
+    /* every truncation fails, except the ones that end the component after one of the optional
+     * WWHD blocks (an older mod), or after the hit list (a GameCube client) */
+    for (mp_u32 cut = 0; cut != w.size - 4; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 4, &s, &a) && a.has_look && a.look.name[0] == 0);
     assert(a.events.move_count == 1 && a.look.ship.flags == 0);
-    assert(mp_read_actor_update(w.data, w.size - 2, &s, &a) && a.has_look && a.look.ship.flags == 0);
-    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.look.extras == 0);
+    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.has_look && a.look.ship.flags == 0);
+    assert(mp_read_actor_update(w.data, w.size - 2, &s, &a) && a.has_look && a.look.extras == 0);
+    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.events.swing_count == 0);
 
     /* the extras: iron boots */
     {
@@ -481,7 +485,7 @@ static void test_player_events(void) {
         mp_write_vlq(&bw, 77); mp_write_u8(&bw, 3); mp_write_vlq(&bw, 77);
         mp_write_vlq(&bw, 1); mp_write_vlq(&bw, 1);
         mp_write_player_events(&bw, &booted, 0);
-        assert(bw.ok && bw.data[bw.size - 1] == MP_EXTRA_HEAVY_BOOTS);
+        assert(bw.ok && bw.data[bw.size - 2] == MP_EXTRA_HEAVY_BOOTS && bw.data[bw.size - 1] == 0x00);
         assert(mp_read_actor_update(bw.data, bw.size, &s, &a) && a.look.extras == MP_EXTRA_HEAVY_BOOTS);
     }
 
@@ -500,11 +504,12 @@ static void test_player_events(void) {
         static const mp_u8 ship_bytes[] = {0x2F, 0x44, 0xBB, 0x90, 0x00, 0xC0, 0x00, 0x00, 0x00,
                                            0xC8, 0x43, 0x50, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0xFF, 0xFD,
                                            0x12, 0x34, 0x56};
-        assert(sw.ok && sw.size > sizeof(ship_bytes) + 1 && sw.data[sw.size - 1] == 0x00); /* then no extras */
-        assert(memcmp(sw.data + sw.size - 1 - sizeof(ship_bytes), ship_bytes, sizeof(ship_bytes)) == 0);
+        assert(sw.ok && sw.size > sizeof(ship_bytes) + 2 && sw.data[sw.size - 2] == 0x00 &&
+               sw.data[sw.size - 1] == 0x00); /* then no extras, no swings */
+        assert(memcmp(sw.data + sw.size - 2 - sizeof(ship_bytes), ship_bytes, sizeof(ship_bytes)) == 0);
         assert(mp_read_actor_update(sw.data, sw.size, &s, &a) && a.has_look);
         assert(mp_same_ship(&a.look.ship, &sailing.ship));
-        for (mp_u32 cut = sw.size - 1 - sizeof(ship_bytes) + 1; cut != sw.size - 1; ++cut)
+        for (mp_u32 cut = sw.size - 2 - sizeof(ship_bytes) + 1; cut != sw.size - 2; ++cut)
             assert(!mp_read_actor_update(sw.data, cut, &s, &a)); /* a cut ship block is malformed */
         mp_ship_state moved = sailing.ship;
         moved.pos[2] += 1.0f;
@@ -579,9 +584,19 @@ static void test_player_events(void) {
         full.sword[full.sword_count++] = 0xFFFFFFFFu;
     }
     full.move[0].anm0 = full.move[0].anm1 = full.move[0].mode = 0xFFFFFFFFu;
-    update = mp_writer_make(buffer, 2048);
+    for (mp_u32 i = 0; i != MP_MAX_SWINGS; ++i) {
+        mp_swing* sw = &full.swing[full.swing_count++];
+        sw->at_type = 0xFFFFFFFFu;
+        sw->vec[0] = sw->vec[1] = sw->vec[2] = 1.0f;
+        sw->count = MP_SWING_CAPSULES;
+        for (mp_u32 c = 0; c != MP_SWING_CAPSULES; ++c) {
+            mp_swing_capsule k = {{1, 2, 3}, {4, 5, 6}, 7};
+            sw->capsule[c] = k;
+        }
+    }
+    update = mp_writer_make(buffer, 4096);
     mp_write_player_update(&update, &s, 0xFFFFFFFFu, 5, &look, &full);
-    assert(update.ok && update.size + 16 <= 2048 + 16);
+    assert(update.ok && update.size + 16 <= 4096 + 16);
 
     /* more events than a list keeps on reading: consumed, counted, the rest still decodes */
     mp_writer w2 = mp_writer_make(frame_buffer, sizeof(frame_buffer));
@@ -600,6 +615,136 @@ static void test_player_events(void) {
     assert(mp_read_actor_update(w2.data, w2.size, &s, &a));
     assert(a.events.move_count == MP_MAX_EVENTS && a.events.dropped == 1);
     assert(a.events.move[MP_MAX_EVENTS - 1].anm0 == MP_MAX_EVENTS);
+}
+
+/* The sword swing block (WWHD extension after the extras). */
+static void test_swings(void) {
+    mp_session s = parsed_session();
+    mp_player_look look = mp_player_look_default();
+    mp_anim_events e;
+    mp_anim_events_clear(&e);
+    mp_swing one = {.at_type = 2, .vec = {0.0f, 0.0f, 1.0f}, .count = 1,
+                    .capsule = {{{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}, 20.0f}}};
+    e.swing[mp_swing_slot(&e)] = one;
+    assert(!mp_anim_events_empty(&e) && e.swing_count == 1);
+
+    /* bytes by hand: count, attack type, vector, capsule count, start, end, radius */
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_swings(&w, &e);
+    static const mp_u8 swing_bytes[] = {
+        0x01,                                                 /* one swing */
+        0x00, 0x00, 0x00, 0x02,                               /* AT_TYPE_SWORD */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00,
+        0x01,                                                 /* one capsule */
+        0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+        0x40, 0x80, 0x00, 0x00, 0x40, 0xA0, 0x00, 0x00, 0x40, 0xC0, 0x00, 0x00,
+        0x41, 0xA0, 0x00, 0x00,                               /* radius 20 */
+    };
+    expect_bytes(&w, swing_bytes, sizeof(swing_bytes));
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_swings(&w, 0);
+    static const mp_u8 no_swing[] = {0x00};
+    expect_bytes(&w, no_swing, sizeof(no_swing));
+
+    /* round trip through an update: three blade capsules, then a spin attack's cylinder */
+    mp_swing blade = {.at_type = 0x10000, .vec = {-1.5f, 0.25f, 8.0f}, .count = 3};
+    for (mp_u32 c = 0; c != 3; ++c) {
+        mp_swing_capsule k = {{(float)c, -100.0f, 2.5f}, {10.0f, (float)c, -3.0f}, 15.0f + (float)c};
+        blade.capsule[c] = k;
+    }
+    mp_swing spin = {.at_type = 2, .vec = {0, 0, 0}, .count = 1,
+                     .capsule = {{{5.0f, 6.0f, 7.0f}, {5.0f, 86.0f, 7.0f}, 120.0f}}};
+    e.swing[mp_swing_slot(&e)] = blade;
+    e.swing[mp_swing_slot(&e)] = spin;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, &e);
+    static mp_actor_state a;
+    assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look);
+    assert(a.events.swing_count == 3 && a.events.dropped == 0 && !mp_anim_events_empty(&a.events));
+    assert(a.events.swing[0].at_type == 2 && a.events.swing[0].capsule[0].radius == 20.0f);
+    const mp_swing* b = &a.events.swing[1];
+    assert(b->at_type == 0x10000 && b->count == 3 && b->vec[0] == -1.5f && b->vec[2] == 8.0f);
+    for (mp_u32 c = 0; c != 3; ++c)
+        assert(b->capsule[c].start[0] == (float)c && b->capsule[c].start[1] == -100.0f &&
+               b->capsule[c].end[1] == (float)c && b->capsule[c].end[2] == -3.0f &&
+               b->capsule[c].radius == 15.0f + (float)c);
+    assert(a.events.swing[2].count == 1 && a.events.swing[2].capsule[0].end[1] == 86.0f);
+    /* a cut swing block is malformed; the block can only be dropped whole */
+    mp_u32 block = 1 + 3 * (4 + 12 + 1) + 5 * 28;
+    for (mp_u32 cut = w.size - block + 1; cut != w.size; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - block, &s, &a) && a.events.swing_count == 0);
+
+    /* more swings than a message keeps: the newest survives in the last slot */
+    mp_anim_events many;
+    mp_anim_events_clear(&many);
+    for (mp_u32 i = 0; i != MP_MAX_SWINGS + 2; ++i) {
+        mp_swing x = one;
+        x.at_type = i;
+        many.swing[mp_swing_slot(&many)] = x;
+    }
+    assert(many.swing_count == MP_MAX_SWINGS && many.dropped == 2);
+    assert(many.swing[0].at_type == 0 && many.swing[MP_MAX_SWINGS - 1].at_type == MP_MAX_SWINGS + 1);
+    mp_anim_events joined;
+    mp_anim_events_clear(&joined);
+    mp_anim_events_append(&joined, &e);
+    assert(joined.swing_count == 3 && joined.swing[1].at_type == 0x10000);
+
+    /* from another sender: more swings and capsules than kept, consumed and counted */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, 0);
+    w.size -= 1; /* replace the empty swing block */
+    mp_write_u8(&w, MP_MAX_SWINGS + 1);
+    for (mp_u32 i = 0; i != MP_MAX_SWINGS + 1; ++i) {
+        mp_write_u32(&w, i); mp_write_f32(&w, 0); mp_write_f32(&w, 0); mp_write_f32(&w, 0);
+        mp_write_u8(&w, MP_SWING_CAPSULES + 1);
+        for (mp_u32 c = 0; c != MP_SWING_CAPSULES + 1; ++c)
+            for (int k = 0; k != 7; ++k) mp_write_f32(&w, (float)c);
+    }
+    assert(w.ok && mp_read_actor_update(w.data, w.size, &s, &a));
+    assert(a.events.swing_count == MP_MAX_SWINGS && a.events.dropped == (MP_MAX_SWINGS + 1) + 1);
+    assert(a.events.swing[MP_MAX_SWINGS - 1].at_type == MP_MAX_SWINGS);
+    assert(a.events.swing[0].count == MP_SWING_CAPSULES && a.events.swing[0].capsule[3].radius == 3.0f);
+    /* a capsule count with bit 7 set is malformed */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_player_events(&w, &look, 0);
+    w.size -= 1;
+    mp_write_u8(&w, 1); mp_write_u32(&w, 2);
+    mp_write_f32(&w, 0); mp_write_f32(&w, 0); mp_write_f32(&w, 0);
+    mp_write_u8(&w, 0x81);
+    assert(!mp_read_actor_update(w.data, w.size, &s, &a));
+
+    /* in a server create, the next component's index (bit 7 set) after the extras is no swing
+     * block; a swing block before it is read, then the index */
+    mp_u8 packet[1024];
+    mp_writer c = mp_writer_make(packet, sizeof(packet));
+    mp_write_vlq(&c, 42); mp_write_u8(&c, 0); mp_write_u8(&c, 0);
+    mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
+    mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
+    mp_write_vlq(&c, 1);
+    mp_anim_events only;
+    mp_anim_events_clear(&only);
+    only.swing[mp_swing_slot(&only)] = one;
+    mp_write_player_events(&c, &look, &only);
+    mp_write_vlq(&c, 0);
+    mp_write_base(&c, &kTransform);
+    assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.has_look);
+    assert(a.events.swing_count == 1 && a.events.swing[0].capsule[0].end[2] == 6.0f);
+    c.size = 0;
+    mp_write_vlq(&c, 42); mp_write_u8(&c, 0); mp_write_u8(&c, 0);
+    mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
+    mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
+    mp_write_vlq(&c, 1);
+    mp_write_player_events(&c, &look, 0);
+    c.size -= 1; /* a sender before the swings: the extras, then the next index */
+    mp_write_vlq(&c, 0);
+    mp_write_base(&c, &kTransform);
+    assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.events.swing_count == 0);
 }
 
 static int near_byte(unsigned a, unsigned b) { return a > b ? a - b <= 1 : b - a <= 1; }
@@ -720,6 +865,7 @@ int main(void) {
     test_colors();
     test_launcher_cfg();
     test_player_events();
+    test_swings();
     test_tunic_colors();
     puts("mp_protocol_test: ok");
     return 0;

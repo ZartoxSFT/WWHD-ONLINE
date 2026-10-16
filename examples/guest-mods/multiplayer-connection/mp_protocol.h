@@ -447,6 +447,28 @@ static inline mp_u32 mp_rgb565_to_888(mp_u16 c) {
 
 /* ------------------------------------------------------------------ animation events */
 
+/* Protocol extension (WWHD, after the extras, optional the same way): the owner's sword swings,
+ * for the scenery that the game cuts through its mass collision manager (dCcMassS_Mng: grass,
+ * flowers, bushes, small trees), which are not actors and so outside the historical hit list.
+ * u8 count (bit 7 clear), then per swing: u32 attack type (dCcD_GObjInf::mAtType), f32 x, y, z
+ * attack vector (mGObjAt.mVec), u8 capsule count (bit 7 clear), then per capsule f32 start x, y,
+ * z, end x, y, z and radius. One swing is one logic step of the attack colliders Link registers
+ * with the mass manager (daPy_lk_c::setCollision 024076CC); a spin attack's cylinder travels as
+ * the capsule from its centre to its top. Events: sent once, never kept by the server. */
+#define MP_MAX_SWINGS 4        /* per message; the newest swing replaces the last slot */
+#define MP_SWING_CAPSULES 4    /* mAtCps[0..2], or the spin attack's mAtCyl */
+
+typedef struct mp_swing_capsule {
+    float start[3], end[3], radius;
+} mp_swing_capsule;
+
+typedef struct mp_swing {
+    mp_u32 at_type;
+    float vec[3];
+    mp_u32 count;
+    mp_swing_capsule capsule[MP_SWING_CAPSULES];
+} mp_swing;
+
 /* The ActorPlayerSync event lists (ActorPlayerSync.h packet structs, same field order as
  * ActorPlayerSync::write). Each list records one daPy_lk_c call of the owner's Link, replayed
  * on the remote Link. Field names follow the HD signatures (wwhd/bindings.h). */
@@ -482,22 +504,31 @@ typedef struct mp_anim_events {
     mp_u32 move_count, single_count, upper_count, reset_count, sword_count;
     mp_u32 equip_item_count, unequip_count; /* setAnimeEquipItem / setAnimeUnequip: no data */
     mp_u32 hit_count;                       /* decoded and dropped (no hit replay yet) */
-    mp_u32 dropped;                         /* events beyond MP_MAX_EVENTS */
+    mp_u32 swing_count;                     /* WWHD extension */
+    mp_u32 dropped;                         /* events beyond MP_MAX_EVENTS or MP_MAX_SWINGS */
     mp_move_anim move[MP_MAX_EVENTS];
     mp_single_anim single[MP_MAX_EVENTS];
     mp_upper_anim upper[MP_MAX_EVENTS];
     mp_reset_upper reset[MP_MAX_EVENTS];
     mp_u32 sword[MP_MAX_EVENTS];            /* setAnimeEquipSword(b1) */
+    mp_swing swing[MP_MAX_SWINGS];
 } mp_anim_events;
 
 static inline void mp_anim_events_clear(mp_anim_events* e) {
     e->move_count = e->single_count = e->upper_count = e->reset_count = e->sword_count = 0;
-    e->equip_item_count = e->unequip_count = e->hit_count = e->dropped = 0;
+    e->equip_item_count = e->unequip_count = e->hit_count = e->swing_count = e->dropped = 0;
 }
 
 static inline int mp_anim_events_empty(const mp_anim_events* e) {
     return !(e->move_count | e->single_count | e->upper_count | e->reset_count | e->sword_count |
-             e->equip_item_count | e->unequip_count);
+             e->equip_item_count | e->unequip_count | e->swing_count);
+}
+
+/* Slot for one more swing (the newest survives in the last slot, like mp_anim_slot). */
+static inline mp_u32 mp_swing_slot(mp_anim_events* e) {
+    if (e->swing_count < MP_MAX_SWINGS) return e->swing_count++;
+    ++e->dropped;
+    return MP_MAX_SWINGS - 1;
 }
 
 /* Slot for one more event of a list holding *count entries: a full list reuses its last slot,
@@ -520,6 +551,8 @@ static inline void mp_anim_events_append(mp_anim_events* dst, const mp_anim_even
         dst->reset[mp_anim_slot(&dst->reset_count, &dst->dropped)] = src->reset[i];
     for (mp_u32 i = 0; i != src->sword_count; ++i)
         dst->sword[mp_anim_slot(&dst->sword_count, &dst->dropped)] = src->sword[i];
+    for (mp_u32 i = 0; i != src->swing_count; ++i)
+        dst->swing[mp_swing_slot(dst)] = src->swing[i];
     dst->equip_item_count += src->equip_item_count;
     dst->unequip_count += src->unequip_count;
     dst->dropped += src->dropped;
@@ -582,6 +615,49 @@ static inline void mp_read_ship(mp_reader* r, mp_ship_state* s) {
     if (r->ok) s->flags = flags;
 }
 
+static inline void mp_write_swings(mp_writer* w, const mp_anim_events* e) {
+    mp_u32 count = e ? e->swing_count : 0;
+    if (count > MP_MAX_SWINGS) count = MP_MAX_SWINGS;
+    mp_write_u8(w, (mp_u8)count);
+    for (mp_u32 i = 0; i != count; ++i) {
+        const mp_swing* s = &e->swing[i];
+        mp_u32 n = s->count > MP_SWING_CAPSULES ? MP_SWING_CAPSULES : s->count;
+        mp_write_u32(w, s->at_type);
+        for (int k = 0; k != 3; ++k) mp_write_f32(w, s->vec[k]);
+        mp_write_u8(w, (mp_u8)n);
+        for (mp_u32 c = 0; c != n; ++c) {
+            for (int k = 0; k != 3; ++k) mp_write_f32(w, s->capsule[c].start[k]);
+            for (int k = 0; k != 3; ++k) mp_write_f32(w, s->capsule[c].end[k]);
+            mp_write_f32(w, s->capsule[c].radius);
+        }
+    }
+}
+
+/* The swing block when it is there (a byte with bit 7 clear, as for the ship block). Counts
+ * above the limits are consumed and counted in e->dropped. */
+static inline void mp_read_swings(mp_reader* r, mp_anim_events* e) {
+    e->swing_count = 0;
+    if (!r->ok || r->pos >= r->size || (r->data[r->pos] & 0x80)) return;
+    mp_u32 count = mp_read_u8(r);
+    for (mp_u32 i = 0; r->ok && i != count; ++i) {
+        mp_swing s;
+        s.at_type = mp_read_u32(r);
+        for (int k = 0; k != 3; ++k) s.vec[k] = mp_read_f32(r);
+        mp_u32 n = mp_read_u8(r);
+        if (n & 0x80) r->ok = 0;
+        s.count = 0;
+        for (mp_u32 c = 0; r->ok && c != n; ++c) {
+            mp_swing_capsule capsule;
+            for (int k = 0; k != 3; ++k) capsule.start[k] = mp_read_f32(r);
+            for (int k = 0; k != 3; ++k) capsule.end[k] = mp_read_f32(r);
+            capsule.radius = mp_read_f32(r);
+            if (s.count < MP_SWING_CAPSULES) s.capsule[s.count++] = capsule;
+            else ++e->dropped;
+        }
+        if (r->ok && s.count) e->swing[mp_swing_slot(e)] = s;
+    }
+}
+
 static inline int mp_same_ship(const mp_ship_state* a, const mp_ship_state* b) {
     if (a->flags != b->flags) return 0;
     if (a->flags & MP_SHIP_COLOR)
@@ -612,6 +688,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
         mp_write_string(w, l->name);
         mp_write_ship(w, &l->ship);
         mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
+        mp_write_swings(w, 0);
         return;
     }
     mp_write_vlq(w, e->move_count);
@@ -647,6 +724,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     mp_write_string(w, l->name);
     mp_write_ship(w, &l->ship);
     mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
+    mp_write_swings(w, e);
 }
 
 static inline void mp_write_player(mp_writer* w, const mp_player_look* l) {
@@ -716,6 +794,7 @@ static inline void mp_read_player_events(mp_reader* r, mp_player_look* l, mp_ani
     mp_read_ship(r, &l->ship);
     /* the extras, the same way: a byte with bit 7 clear, else none (a sender before them) */
     l->extras = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? (mp_u8)(mp_read_u8(r) & MP_EXTRAS) : 0;
+    mp_read_swings(r, e); /* the swings, the same way (a sender before them: none) */
     if (!r->ok) mp_anim_events_clear(e);
 }
 

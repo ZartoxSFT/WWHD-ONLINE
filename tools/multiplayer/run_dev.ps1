@@ -18,7 +18,7 @@ param(
     [switch]$Reset,
     [string]$Distribution = (Join-Path $PSScriptRoot "..\..\..\WindWakerHD-v0.3.0-windows-x86_64"),
     [string]$BuildDir = (Join-Path $PSScriptRoot "..\..\build\windows-msys2-d"),
-    [string]$MsysBin = "D:\msys64\mingw64\bin",
+    [string]$MsysBin = "C:\msys64\clang64\bin",
     [string]$GameDir = ""
 )
 $ErrorActionPreference = "Stop"
@@ -103,7 +103,8 @@ if (-not (Test-Path -LiteralPath $cfgFile)) {
     [System.IO.File]::WriteAllText($cfgFile, ($lines -join "`n") + "`n", [System.Text.Encoding]::ASCII)
 }
 
-$env:PATH = "$MsysBin;$env:PATH"                                # libstdc++/libgcc/winpthread DLLs
+if (-not (Test-Path -LiteralPath (Join-Path $MsysBin "libc++.dll"))) { throw "No libc++.dll in -MsysBin $MsysBin (the clang64 runtime the build links)" }
+$env:PATH = "$MsysBin;$env:PATH"                                # libc++/libunwind/winpthread DLLs of the clang64 build
 $env:WWHD_CODE_MODS = "1"                                        # build/gen was translated with --mod-hooks
 $env:WWHD_GUEST_BUILD_CONFIG = Join-Path $data "guest-sdk.json"  # guest translator + compiler of the install
 Remove-Item Env:WWHD_INSTALL_DIR -ErrorAction SilentlyContinue

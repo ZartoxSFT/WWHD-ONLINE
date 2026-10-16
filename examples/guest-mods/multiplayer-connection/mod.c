@@ -39,6 +39,7 @@
 #include "sea_chart.h"
 #include "ship_puppet.h"
 #include "puppet_sense.h"
+#include "sword_swing.h"
 
 #define MAX_REMOTES 8
 #define CFG_PERIOD 1.0      /* launcher.cfg re-read interval, seconds */
@@ -83,9 +84,9 @@ typedef struct marker {
 
 /* 1 MiB transport payload limit plus its VLQ length prefix. */
 static unsigned char incoming[1024 * 1024 + 8];
-/* An ActorPlayerSync update with every event list full takes about 1.6 KiB. */
-static mp_u8 payload[2048];
-static mp_u8 frame[2048 + 16];
+/* An ActorPlayerSync update with every event list and the sword swings full takes about 2.2 KiB. */
+static mp_u8 payload[4096];
+static mp_u8 frame[4096 + 16];
 
 static int state;
 static mp_session session;
@@ -159,6 +160,7 @@ static void clear_area_state(void) {
     for (int i = 0; i != MAX_REMOTES; ++i) remotes[i].active = markers[i].visible = 0;
     puppet_clear_all();
     ship_puppet_clear_all();
+    swing_clear_all();
     mp_anim_events_clear(&anim_local);
     pending_solver = MP_NO_ID;
     local_uid = MP_NO_ID;
@@ -238,6 +240,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
                 remote->look = actor.look;
                 remote->has_look = 1;
                 puppet_queue_events(uid, &actor.events);
+                swing_queue(uid, &actor.events);
                 ship_puppet_set(uid, &actor.look.ship);
             }
         }
@@ -247,6 +250,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
             remote->active = 0;
             puppet_remove(remote->uid);
             ship_puppet_remove(remote->uid);
+            swing_remove(remote->uid);
             wwhd_log_int("multiplayer: remote player left, uid", (int)remote->uid);
         }
     }
@@ -723,6 +727,7 @@ static void stop_remote_views(void) {
     hide_markers();
     puppet_clear_all();
     ship_puppet_clear_all();
+    swing_clear_all();
 }
 
 static void multiplayer_connection_step(void* link) {
@@ -782,6 +787,8 @@ static void multiplayer_connection_step(void* link) {
     update_markers(dt, (const fopAc_ac_c*)link);
     puppet_step((const fopAc_ac_c*)link);
     ship_puppet_step();
+    swing_step(link);
+    if (anim_capture) swing_capture(link, &anim_local);
     update_clock -= dt;
     if (local_uid != MP_NO_ID && update_clock <= 0) {
         update_clock += UPDATE_PERIOD;
