@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Minimal stand-in for the historical Java server, for local tests of the multiplayer guest mod.
 
-usage: fake_server.py [--host 0.0.0.0] [--port 10014] [--bot [--mirror]]
+usage: fake_server.py [--host 0.0.0.0] [--port 10014] [--bot [--mirror] [--ship]]
 
 --bot adds a scripted PlayerPuppet to every area a client enters, circling the first position
 that client reported, and prints the client's ActorBaseSync positions once per second, so one
 game instance is enough to see both directions of the synchronization.
 --mirror makes the bot copy the client's ActorPlayerSync updates (animation calls, item,
 colours): with the "puppet" option the bot's Link replays the player's own animations.
+--ship puts the bot on its King of Red Lions (ActorPlayerSync ship block, mp_protocol.h): the ship
+sails a 1200-unit circle 2500 units east of that position, sail up, painted blue, the bot's Link
+on board; with
+the "puppet" option the client shows it as a ship puppet (on a stage that has the local ship).
 
 It is NOT the reference server. The real ActorSync server logic lives in
 com.kirbymimi.serverCommon, which is missing from this workspace, so this script only
@@ -141,31 +145,70 @@ class Actor:
         return vlq(self.uid) + b"\0" + vlq(self.uid) + components
 
 
+SHIP_PRESENT, SHIP_RIDING, SHIP_SAIL, SHIP_COLOR = 1, 2, 4, 8
+SHIP_PART_SAIL = 1 << 4  # bits 4-5: daShip_c::mPart (1 sail, 2 cannon, 3 crane)
+BOT_SHIP_COLOR = bytes([0x20, 0x60, 0xFF])  # a blue boat, to see its own paint
+
+
+def ship_block(x, y, z, heading,
+               flags=SHIP_PRESENT | SHIP_RIDING | SHIP_SAIL | SHIP_COLOR | SHIP_PART_SAIL):
+    """WWHD extension after the name: u8 flags, then x, y, z and the three angles when present,
+    then r, g, b with SHIP_COLOR."""
+    out = bytes([flags]) + struct.pack(">fffhhh", x, y, z, 0, heading, 0)
+    return out + BOT_SHIP_COLOR if flags & SHIP_COLOR else out
+
+
+def s16(angle):
+    """Radians (0 facing +z, growing towards +x) as a game angle."""
+    value = int(angle / (2 * math.pi) * 65536) & 0xFFFF
+    return value - 0x10000 if value >= 0x8000 else value
+
+
 class Bot:
     """Scripted PlayerPuppet shown to the clients of one area."""
 
-    def __init__(self, uid, area, centre):
-        self.area, self.centre = area, centre
+    def __init__(self, uid, area, centre, ship=False):
+        self.area, self.centre, self.ship = area, centre, ship
         self.actor = Actor(uid, "PlayerPuppet", "PlayerPuppet", self.components(0.0))
 
     def pose(self, t):
-        """ActorBaseSync on a 150-unit circle around the centre, one turn every ~8 s."""
+        """ActorBaseSync on a 150-unit circle around the centre, one turn every ~8 s; with the
+        ship, on board: at the ship's place on its own circle."""
         x, y, z = self.centre
+        if self.ship:
+            sx, sy, sz, heading = self.ship_pose(t)
+            return base_component(sx, sy, sz, heading)
         angle = t * 0.8
         heading = int(math.degrees(angle + math.pi) / 360 * 65536) & 0xFFFF
         heading = heading - 0x10000 if heading >= 0x8000 else heading
         return base_component(x + 150 * math.cos(angle), y, z + 150 * math.sin(angle), heading)
 
+    def ship_pose(self, t):
+        """1200-unit circle 2500 units east of the centre, one turn every ~40 s, bow forward."""
+        x, y, z = self.centre
+        angle = t * 0.16
+        px, pz = x + 2500 + 1200 * math.cos(angle), z + 1200 * math.sin(angle)
+        # velocity (-sin, cos): heading atan2(dx, dz)
+        heading = s16(math.atan2(-math.sin(angle), math.cos(angle)))
+        return px, y, pz, heading
+
+    def player_component(self, t):
+        if not self.ship:
+            return BOT_PLAYER_COMPONENT
+        return BOT_PLAYER_COMPONENT + ship_block(*self.ship_pose(t))
+
     def components(self, t):
-        return vlq(2) + vlq(0) + self.pose(t) + vlq(1) + BOT_PLAYER_COMPONENT
+        return vlq(2) + vlq(0) + self.pose(t) + vlq(1) + self.player_component(t)
 
     def update(self, t):
+        if self.ship:
+            return vlq(2) + vlq(0) + self.pose(t) + vlq(1) + self.player_component(t)
         return vlq(1) + vlq(0) + self.pose(t)
 
 
 class Server:
-    def __init__(self, bot=False, mirror=False):
-        self.mirror = mirror
+    def __init__(self, bot=False, mirror=False, ship=False):
+        self.mirror, self.ship = mirror, ship
         self.lock = threading.Lock()
         self.clients = []
         self.next_uid = 1
@@ -181,7 +224,7 @@ class Server:
             position = read_base(actor.components)
             if position is None:
                 return
-            bot = Bot(self.next_uid, client.area, position[:3])
+            bot = Bot(self.next_uid, client.area, position[:3], self.ship)
             self.next_uid += 1
             self.bots[client.area] = bot
             client.log(f"bot uid={bot.actor.uid} circles {tuple(round(v, 1) for v in position[:3])}")
@@ -330,8 +373,10 @@ def main():
     parser.add_argument("--bot", action="store_true", help="add a scripted remote player")
     parser.add_argument("--mirror", action="store_true",
                         help="the bot copies the player's animations, item and colours")
+    parser.add_argument("--ship", action="store_true",
+                        help="the bot sails its King of Red Lions (ship puppet test)")
     args = parser.parse_args()
-    server = Server(args.bot, args.mirror)
+    server = Server(args.bot, args.mirror, args.ship)
     listener = socket.create_server((args.host, args.port))
     print(f"fake multiplayer server on {args.host}:{args.port}{' with bot' if args.bot else ''}",
           flush=True)

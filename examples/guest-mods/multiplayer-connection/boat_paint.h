@@ -49,6 +49,7 @@ static int boat_wanted_custom, boat_applied_custom;
 static u32 boat_wanted_rgb, boat_applied_rgb;
 static int boat_scan_clock;
 static int boat_budget_logged;
+static int boat_remote_wanted; /* a remote ship wants another paint: the textures are copied too */
 
 /* Per mille of the colour blocks / pixels of the live image that are red/orange paint. */
 static u32 boat_paint_share(const tunic_texture* t, const tc_palette* p) {
@@ -231,7 +232,8 @@ static void boat_refresh(u32 ship) {
                   (boat_wanted_custom && boat_wanted_rgb != boat_applied_rgb);
     if (!changed && --boat_scan_clock > 0) return;
     boat_scan_clock = BOAT_SCAN_PERIOD;
-    if (!boat_wanted_custom && !boat_applied_custom) return; /* never painted: nothing to do */
+    /* never painted and no remote ship in another paint: nothing to do */
+    if (!boat_wanted_custom && !boat_applied_custom && !boat_remote_wanted) return;
 
     for (u32 i = 0; i != boat_texture_count; ++i) boat_textures[i].seen = 0;
     tc_palette reference = tc_palette_make_boat(TC_BOAT_RED);
@@ -253,4 +255,155 @@ static void boat_refresh(u32 ship) {
         boat_write_all();
         if (changed) wwhd_log(boat_wanted_custom ? "multiplayer: boat paint applied" : "multiplayer: original boat paint restored");
     }
+}
+
+/* ------------------------------------------------------------------ remote ships' own paint
+ *
+ * The ship textures are shared by every ship (the puppets use the ship archive's model data), so
+ * a remote ship in another paint gets its own copy of each painted texture: the HD texture object
+ * (0xC0 bytes, HD_TEXTURE_BYTES) and its image and mips at the same address modulo 64 KiB
+ * (tiling), made from the pristine copy and recoloured with that player's paint (none: the
+ * original). While that puppet runs daShip_Draw its copies replace the texture objects in the
+ * shared texture tables of the body and head model data, with the table's dirty mask set like
+ * the game's own setResTIMG (tunic_mark_dirty), and the originals come back after. As for the
+ * remote tunics (tunic.h), whether the HD J3D binds the texture while the model is entered
+ * (daShip_Draw) or later is not in the sources: if later, every ship shows the local paint. The
+ * mod heap (8 MiB at most, runtime/src/mods/packages.cpp) holds the copies of about three ships;
+ * a ship without room keeps the shared paint (logged). */
+#define BOAT_CLONE_SLOTS 4 /* SHIP_PUPPET_MAX */
+#define BOAT_SWAP_MAX 16
+
+typedef struct boat_clone {
+    int ready;
+    u32 source_gx2;     /* the shared texture object it stands for */
+    int custom;
+    u32 rgb;
+    u8* gx2;            /* texture object copy */
+    u8* image_raw;
+    u8* mip_raw;
+    u32 image, mip;
+} boat_clone;
+
+static boat_clone boat_clones[BOAT_CLONE_SLOTS][BOAT_MAX_TEXTURES];
+static int boat_clone_full[BOAT_CLONE_SLOTS];
+static u32 boat_swap_table[BOAT_SWAP_MAX], boat_swap_index[BOAT_SWAP_MAX], boat_swap_original[BOAT_SWAP_MAX];
+static u32 boat_swap_count;
+
+static void boat_free_clone(boat_clone* c) {
+    if (c->gx2) wwhd_free(c->gx2);
+    if (c->image_raw) wwhd_free(c->image_raw);
+    if (c->mip_raw) wwhd_free(c->mip_raw);
+    c->gx2 = c->image_raw = c->mip_raw = 0;
+    c->ready = 0;
+    c->source_gx2 = 0;
+}
+
+static void boat_free_slot(int slot) {
+    if (slot < 0 || slot >= BOAT_CLONE_SLOTS) return;
+    for (u32 k = 0; k != BOAT_MAX_TEXTURES; ++k) boat_free_clone(&boat_clones[slot][k]);
+    boat_clone_full[slot] = 0;
+}
+
+static boat_clone* boat_clone_for(int slot, u32 gx2, int make) {
+    boat_clone* empty = 0;
+    for (u32 k = 0; k != BOAT_MAX_TEXTURES; ++k) {
+        boat_clone* c = &boat_clones[slot][k];
+        if (c->gx2 && c->source_gx2 == gx2) return c;
+        if (!c->gx2 && !empty) empty = c;
+    }
+    return make ? empty : 0;
+}
+
+/* Keeps slot's copies in paint (custom, rgb); no copies while it is the local paint. */
+static void boat_prepare_slot(int slot, int custom, u32 rgb) {
+    if (slot < 0 || slot >= BOAT_CLONE_SLOTS) return;
+    int same = custom == boat_applied_custom && (!custom || rgb == boat_applied_rgb);
+    if (same) {
+        for (u32 k = 0; k != BOAT_MAX_TEXTURES; ++k) boat_clones[slot][k].ready = 0;
+        return;
+    }
+    boat_remote_wanted = 1;
+    if (boat_clone_full[slot]) return;
+    /* copies of textures the ship no longer uses go first */
+    for (u32 k = 0; k != BOAT_MAX_TEXTURES; ++k) {
+        boat_clone* c = &boat_clones[slot][k];
+        if (!c->gx2) continue;
+        int used = 0;
+        for (u32 i = 0; i != boat_texture_count; ++i) used |= boat_textures[i].seen && boat_textures[i].t.gx2 == c->source_gx2;
+        if (!used) boat_free_clone(c);
+    }
+    tc_palette p = tc_palette_make_boat(rgb);
+    for (u32 i = 0; i != boat_texture_count; ++i) {
+        if (!boat_textures[i].seen) continue;
+        const tunic_texture* t = &boat_textures[i].t;
+        boat_clone* c = boat_clone_for(slot, t->gx2, 1);
+        if (!c) return;
+        if (c->ready && c->custom == custom && c->rgb == rgb) continue;
+        if (!c->gx2) {
+            c->gx2 = (u8*)wwhd_malloc(HD_TEXTURE_BYTES);
+            c->image_raw = tunic_alloc_congruent(t->image_size, t->image, &c->image);
+            if (t->mip_size) c->mip_raw = tunic_alloc_congruent(t->mip_size, t->mip, &c->mip);
+            if (!c->gx2 || !c->image_raw || (t->mip_size && !c->mip_raw)) {
+                boat_free_slot(slot);
+                boat_clone_full[slot] = 1;
+                wwhd_log_int("multiplayer: no mod heap left for one more ship paint, shared paint kept for ship", slot);
+                return;
+            }
+            c->source_gx2 = t->gx2;
+        }
+        memcpy((void*)c->image, t->pristine, t->image_size);
+        if (t->mip_size) memcpy((void*)c->mip, t->pristine + t->image_size, t->mip_size);
+        if (custom) {
+            tc_recolor_surface(&p, t->format, (u8*)c->image, t->image_size);
+            if (t->mip_size) tc_recolor_surface(&p, t->format, (u8*)c->mip, t->mip_size);
+        }
+        memcpy(c->gx2, (const void*)t->gx2, HD_TEXTURE_BYTES);
+        tunic_st32((u32)c->gx2 + GX2_SURFACE_IMAGE, c->image);
+        tunic_st32((u32)c->gx2 + GX2_SURFACE_MIP, t->mip_size ? c->mip : 0);
+        c->custom = custom;
+        c->rgb = rgb;
+        c->ready = 1;
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            wwhd_log("multiplayer: a remote ship has its own paint copies");
+        }
+    }
+}
+
+/* Around a puppet ship's daShip_Draw: its copies in the shared tables of one model. */
+static void boat_swap_model(int slot, u32 model) {
+    u32 data = model ? tunic_ld32(model + BOAT_MODEL_DATA) : 0;
+    u32 table = data ? tunic_ld32(data + MODEL_DATA_TEXTURE_TABLE) : 0;
+    if (!table) return;
+    u32 count = *(const volatile u16*)table;
+    u32 headers = tunic_ld32(table + 4);
+    if (!headers || count > TEX_TABLE_MAX) return;
+    for (u32 j = 0; j != count && boat_swap_count != BOAT_SWAP_MAX; ++j) {
+        u32 header = headers + j * TEX_HEADER_BYTES;
+        u32 gx2 = tunic_ld32(header + TEX_HEADER_HD);
+        boat_clone* c = gx2 ? boat_clone_for(slot, gx2, 0) : 0;
+        if (!c || !c->ready) continue;
+        boat_swap_table[boat_swap_count] = table;
+        boat_swap_index[boat_swap_count] = j;
+        boat_swap_original[boat_swap_count++] = gx2;
+        tunic_st32(header + TEX_HEADER_HD, (u32)c->gx2);
+        tunic_mark_dirty(table, j);
+    }
+}
+
+static void boat_swap_begin(int slot, u32 ship) {
+    boat_swap_count = 0;
+    if (slot < 0 || slot >= BOAT_CLONE_SLOTS || !ship) return;
+    boat_swap_model(slot, boat_morf_model(ship, BOAT_BODY_MORF));
+    boat_swap_model(slot, boat_morf_model(ship, BOAT_HEAD_MORF));
+}
+
+static void boat_swap_end(void) {
+    for (u32 k = 0; k != boat_swap_count; ++k) {
+        u32 headers = tunic_ld32(boat_swap_table[k] + 4);
+        tunic_st32(headers + boat_swap_index[k] * TEX_HEADER_BYTES + TEX_HEADER_HD, boat_swap_original[k]);
+        tunic_mark_dirty(boat_swap_table[k], boat_swap_index[k]);
+    }
+    boat_swap_count = 0;
 }

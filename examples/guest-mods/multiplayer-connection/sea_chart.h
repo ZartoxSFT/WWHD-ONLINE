@@ -284,11 +284,14 @@ static void chart_icon_refresh(u32 menu) {
 
 /* ---- the menu's updates ---- */
 
+static void multiplayer_pump(void); /* mod.c: reads the network while the game is paused */
+
 WWHD_HOOK(0x02678B74, chart_progress_icons, (u32 menu)) {
     chart_menu = menu;
     chart_step = wwhd_logic_step();
     chart_busy = 0;
     chart_icon_refresh(menu);
+    if (chart_menu_open()) multiplayer_pump();
 }
 
 WWHD_HOOK(0x02678B00, chart_hide_panes, (u32 menu)) {

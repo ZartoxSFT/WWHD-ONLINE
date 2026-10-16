@@ -116,6 +116,10 @@ typedef struct puppet_slot {
     mp_transform target;
     tunic_look look;         /* remote tunic colours (ActorPlayerSync colors[0..1]) */
     mp_anim_events pending;  /* animation calls to replay at the next execute */
+    mp_u32 remote_proc;      /* the owner's current proc (ActorPlayerSync curProc) */
+    mp_u16 remote_item;      /* the owner's mEquipItem (ActorPlayerSync item) */
+    mp_u8 remote_extras;     /* MP_EXTRA_* */
+    mp_u16 shown_item;       /* the item the puppet holds now (PUPPET_ITEM_NONE: nothing) */
 } puppet_slot;
 
 static int puppet_enabled;
@@ -297,6 +301,108 @@ static int puppet_is_orphan(u32 actor) {
     return 1;
 }
 
+/* The remote player's puppet ship and whether that player rides it, and that ship's matrix this
+ * step (ship_puppet.h). */
+static u32 ship_puppet_of(mp_u32 uid, int* riding);
+static int ship_puppet_matrix(mp_u32 uid, f32* m);
+
+/* A riding Link stands where daPy_lk_c::setShipRidePos (023E287C, d_a_player_main_02.cpp) puts
+ * him: the ship body's base matrix * l_ship_offset (10034F84, {0, 15, -35}), l_ship_offset3
+ * (10034F9C, {0, 15, -96}) in proc 0xD7, facing the ship's heading. The puppet takes that place
+ * from its puppet ship (the function itself also sets the R button status of player 0 and reads
+ * the wind, so it is not called): it sails with its ship instead of following the ActorBaseSync
+ * places, which arrive at a different time than the ship's. */
+#define PUPPET_SHIP_OFFSET 0x10034F84
+#define PUPPET_SHIP_OFFSET3 0x10034F9C
+#define PUPPET_PROC_SHIP_OFFSET3 0xD7
+static f32 puppet_ship_mtx[12] __attribute__((aligned(16)));
+
+/* The visual tail of execute reads the ship of player 0 (dComIfGp ship actor, play + 0x5B3C) and
+ * its SHIP_RIDE status (play + 0x5CD8, 0x10000): daPy_lk_c::jointAfterCB 023D7564 and
+ * setShipRideArmAngle 023D7198 put a riding Link's hand on that ship's tiller top (+0x720,
+ * d_a_player_main_01.cpp). Around a puppet's tail they are the puppet's own: its player's puppet
+ * ship and riding flag (without them a puppet's hand went to the local ship's tiller whenever the
+ * local Link rode). */
+#define PUPPET_PLAY_SHIP 0x5B3C
+#define PUPPET_PLAY_STATUS0 0x5CD8
+#define PUPPET_STATUS0_RIDE 0x10000u
+
+/* ---- what the owner holds ----
+ * daPy_lk_c::makeItemType (023DF600, d_a_player_main_01.cpp) makes the held item's model from
+ * mEquipItem, in that Link's own item heap: telescope 0x20, Tingle Tuner 0x21, Wind Waker 0x22,
+ * Picto Boxes 0x23 / 0x26, bows 0x27 / 0x35 / 0x36, Skull Hammer 0x33, empty bottle 0x50. The
+ * grappling hook 0x25, boomerang 0x2D, hookshot 0x2F and bombs 0x31 are actors of their own that
+ * act for player 0 (fopAcM create in makeItemType): not made on a puppet. The sword in hand is
+ * mEquipItem 0x103: its blade is made by setSwordModel(1) (023DE0B4, what the game calls when Link
+ * draws it: blade, glow, tip models in the item heap; 0.2.18 set only the number and no blade
+ * showed). The Deku Leaf in
+ * flight is mEquipItem 0x102 with setParachuteFanModel (0241A204), as procFanGlide_init does; the
+ * proc itself is not run (it uses magic and sets player 0's status). deleteEquipItem (023DC7AC,
+ * argument 0: no sound) drops a made model, with mEquipItem set to none first: its sword case
+ * stops the sword music. The iron boots are mNoResetFlg0 (+0x3B8) 0x2000000 (draw and
+ * setItemModel).
+ *
+ * Item heaps (d_a_player_main.cpp setItemHeap 023DDF64, setAnimeHeap 023DDEA8): a Link makes an
+ * item model in one of its two item heaps, after freeAll on it; it changes heap at most once per
+ * frame (mResetFlg0 +0x3C0, daPyRFlg0_UNK4000 0x4000), so the heap freed is never the one whose
+ * model the last frame entered in the draw lists. The game's execute clears mResetFlg0 every frame
+ * (d_a_player_main_04.cpp): the puppet's execute did not, so every model was made in the same heap
+ * over the last one's packets (0.2.18: "J3DPacket.cpp mEntryPtr == (0)" halt after a few item
+ * changes). The puppet now clears it every execute too. */
+#define PUPPET_RESET_FLG0 0x3C0
+#define PUPPET_ITEM_NONE 0x100
+#define PUPPET_ITEM_SWORD 0x103
+#define PUPPET_ITEM_FAN_FLY 0x102
+#define PUPPET_NO_RESET_FLG0 0x3B8
+#define PUPPET_HEAVY_BOOTS 0x2000000u
+
+static int puppet_item_has_model(mp_u16 item) {
+    switch (item) {
+    case 0x20: case 0x21: case 0x22: case 0x23: case 0x26: case 0x27: case 0x35: case 0x36: case 0x33: case 0x50:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void puppet_apply_item(void* link, puppet_slot* s) {
+    mp_u16 want = s->remote_item;
+    if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY) want = PUPPET_ITEM_NONE;
+    if (want != s->shown_item) {
+        daPy_lk_c* l = (daPy_lk_c*)link;
+        if (s->shown_item != PUPPET_ITEM_NONE) {
+            l->mEquipItem = PUPPET_ITEM_NONE; /* never the sword case (it stops the sword music) */
+            wwhd_daPy_lk_c__deleteEquipItem(link, 0);
+        }
+        l->mEquipItem = want;
+        if (puppet_item_has_model(want)) wwhd_daPy_lk_c__makeItemType(link);
+        else if (want == PUPPET_ITEM_SWORD) wwhd_daPy_lk_c__setSwordModel(link, 1);
+        else if (want == PUPPET_ITEM_FAN_FLY) wwhd_daPy_lk_c__setParachuteFanModel(link, 1.0f);
+        s->shown_item = want;
+    }
+    volatile u32* flags = (volatile u32*)((u8*)link + PUPPET_NO_RESET_FLG0);
+    if (s->remote_extras & MP_EXTRA_HEAVY_BOOTS) *flags |= PUPPET_HEAVY_BOOTS;
+    else *flags &= ~PUPPET_HEAVY_BOOTS;
+}
+
+/* setItemModel (in the visual tail) sets Link's footstep, sword and shield sound types, one
+ * global audio state (LinkItemApi::setBootsSoundType 025E1E04, setSwordSoundType 025E1E14,
+ * setShieldSoundType 025E1E2C, d_a_player_main_04.cpp): a puppet's would replace the local
+ * Link's (its iron boots sounding like normal boots), so they do nothing during a puppet's tail. */
+static int puppet_in_tail;
+WWHD_GAME_ORIGINAL(0x025E1E04, u32, puppet_boots_sound_original, (u32 type));
+WWHD_GAME_ORIGINAL(0x025E1E14, u32, puppet_sword_sound_original, (u32 a, u32 b));
+WWHD_GAME_ORIGINAL(0x025E1E2C, u32, puppet_shield_sound_original, (u32 a, u32 b));
+WWHD_REPLACE(0x025E1E04, u32, puppet_boots_sound, (u32 type)) {
+    return puppet_in_tail ? 0 : puppet_boots_sound_original(type);
+}
+WWHD_REPLACE(0x025E1E14, u32, puppet_sword_sound, (u32 a, u32 b)) {
+    return puppet_in_tail ? 0 : puppet_sword_sound_original(a, b);
+}
+WWHD_REPLACE(0x025E1E2C, u32, puppet_shield_sound, (u32 a, u32 b)) {
+    return puppet_in_tail ? 0 : puppet_shield_sound_original(a, b);
+}
+
 /* Replaces daPy_lk_c::execute for a puppet: network pose, then the visual tail only. */
 static s32 puppet_execute(void* i_this) {
     fopAc_ac_c* actor = (fopAc_ac_c*)i_this;
@@ -307,10 +413,15 @@ static s32 puppet_execute(void* i_this) {
         return 1;
     }
     if (!link->mpCLModel || !link->mpCLModelData) return 1;
+    *(volatile u32*)((u8*)i_this + PUPPET_RESET_FLG0) = 0; /* as the game's execute, every frame */
 
+    mp_u32 owner = 0xFFFFFFFFu, owner_proc = PUPPET_NO_PROC;
     for (int i = 0; i != PUPPET_MAX; ++i) {
         puppet_slot* s = &puppet_slots[i];
         if (!s->used || s->actor != (u32)i_this) continue;
+        owner = s->uid;
+        owner_proc = s->remote_proc;
+        puppet_apply_item(i_this, s);
         /* the owner's animation calls, before animeUpdate advances the frames */
         anim_apply(i_this, &s->pending);
         mp_anim_events_clear(&s->pending);
@@ -325,6 +436,31 @@ static s32 puppet_execute(void* i_this) {
         actor->current.angle.y = s->target.rot[1];
     }
 
+    u8* play = wwhd_play_get();
+    volatile u32* play_ship = play ? (volatile u32*)(play + PUPPET_PLAY_SHIP) : 0;
+    volatile u32* play_status = play ? (volatile u32*)(play + PUPPET_PLAY_STATUS0) : 0;
+    u32 saved_ship = play_ship ? *play_ship : 0, saved_status = play_status ? *play_status : 0;
+    if (play) {
+        int riding = 0;
+        u32 own = owner != 0xFFFFFFFFu ? ship_puppet_of(owner, &riding) : 0;
+        if (riding && own) {
+            *play_ship = own;
+            *play_status = saved_status | PUPPET_STATUS0_RIDE;
+            if (ship_puppet_matrix(owner, puppet_ship_mtx)) {
+                const volatile f32* o = owner_proc == PUPPET_PROC_SHIP_OFFSET3 ? &WWHD_GAME_DATA(PUPPET_SHIP_OFFSET3, f32)
+                                                                              : &WWHD_GAME_DATA(PUPPET_SHIP_OFFSET, f32);
+                const f32* m = puppet_ship_mtx;
+                actor->current.pos.x = m[0] * o[0] + m[1] * o[1] + m[2] * o[2] + m[3];
+                actor->current.pos.y = m[4] * o[0] + m[5] * o[1] + m[6] * o[2] + m[7];
+                actor->current.pos.z = m[8] * o[0] + m[9] * o[1] + m[10] * o[2] + m[11];
+                actor->shape_angle.y = ((const fopAc_ac_c*)own)->shape_angle.y;
+                actor->current.angle.y = actor->shape_angle.y;
+            }
+        } else {
+            *play_status = saved_status & ~PUPPET_STATUS0_RIDE;
+        }
+    }
+    ++puppet_in_tail;
     wwhd_daPy_lk_c__animeUpdate(i_this);
     wwhd_daPy_lk_c__setWorldMatrix(i_this);
     wwhd_daPy_lk_c__setWaistAngle(i_this);
@@ -348,6 +484,11 @@ static s32 puppet_execute(void* i_this) {
         actor->eyePos.z = eye[11];
     }
     wwhd_daPy_lk_c__setAttentionPos(i_this);
+    --puppet_in_tail;
+    if (play) {
+        *play_ship = saved_ship;
+        *play_status = saved_status;
+    }
     *(volatile u32*)((u8*)i_this + ACTOR_ATTENTION_FLAGS) = 0;
     return 1;
 }
@@ -369,6 +510,10 @@ static puppet_slot* puppet_slot_for(mp_u32 uid, int create) {
     free_slot->waiting = 0;
     free_slot->has_target = 0;
     free_slot->look = tunic_look_make(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
+    free_slot->remote_proc = PUPPET_NO_PROC;
+    free_slot->remote_item = PUPPET_ITEM_NONE;
+    free_slot->remote_extras = 0;
+    free_slot->shown_item = PUPPET_ITEM_NONE;
     mp_anim_events_clear(&free_slot->pending);
     return free_slot;
 }
@@ -400,10 +545,14 @@ static void puppet_set_target(mp_u32 uid, const mp_transform* t) {
     s->has_target = 1;
 }
 
-/* Remote tunic colours (from ActorPlayerSync), drawn on that player's puppet. */
-static void puppet_set_look(mp_u32 uid, mp_u16 primary, mp_u16 secondary) {
+/* Remote tunic colours and proc (from ActorPlayerSync), for that player's puppet. */
+static void puppet_set_look(mp_u32 uid, mp_u16 primary, mp_u16 secondary, mp_u32 proc, mp_u16 item, mp_u8 extras) {
     puppet_slot* s = puppet_slot_for(uid, 0);
-    if (s) s->look = tunic_look_make(primary, secondary);
+    if (!s) return;
+    s->look = tunic_look_make(primary, secondary);
+    s->remote_proc = proc;
+    s->remote_item = item;
+    s->remote_extras = extras;
 }
 
 /* Animation calls received for a player; kept only while its puppet exists (a puppet created

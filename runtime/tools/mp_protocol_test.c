@@ -173,6 +173,8 @@ static void test_client_packets(void) {
         0xFF, 0xFF, 0x4D, 0xFF,                   /* cursor */
         0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, /* 8 empty event lists */
         0x00,                                     /* WWHD extension: empty name */
+        0x00,                                     /* WWHD extension: no ship */
+        0x00,                                     /* WWHD extension: no extras */
     };
     expect_bytes(&payload, create, sizeof(create));
 
@@ -199,6 +201,8 @@ static void test_client_packets(void) {
         0xFF, 0xFF, 0x4D, 0xFF,
         0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
         0x00,                                     /* empty name */
+        0x00,                                     /* no ship */
+        0x00,                                     /* no extras */
     };
     expect_bytes(&payload, look_update, sizeof(look_update));
 
@@ -207,7 +211,8 @@ static void test_client_packets(void) {
     payload = mp_writer_make(buffer, sizeof(buffer));
     mp_write_look_update(&payload, &s, 300, 5, &red);
     assert(payload.ok && payload.size == sizeof(look_update) + 5);
-    assert(memcmp(payload.data + sizeof(look_update) - 1, "Tetra", 6) == 0);
+    assert(memcmp(payload.data + sizeof(look_update) - 3, "Tetra", 6) == 0);
+    assert(payload.data[payload.size - 2] == 0x00 && payload.data[payload.size - 1] == 0x00); /* no ship, no extras */
 
     /* without an ActorBaseSync in the factory an update cannot be encoded */
     mp_session no_base = s;
@@ -218,7 +223,7 @@ static void test_client_packets(void) {
 }
 
 /* SERVER_ACTOR_SYNC_CREATE of a remote PlayerPuppet with a non-empty player component. */
-static mp_u32 build_server_create(mp_u8* out, mp_u32 capacity, const char* properties) {
+static mp_u32 build_server_create_ship(mp_u8* out, mp_u32 capacity, const char* properties, int ship) {
     mp_writer w = mp_writer_make(out, capacity);
     mp_write_vlq(&w, 42);            /* uid */
     mp_write_u8(&w, 1);              /* has game UID */
@@ -254,10 +259,18 @@ static mp_u32 build_server_create(mp_u8* out, mp_u32 capacity, const char* prope
     mp_write_vlq(&w, 1);             /* hit */
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 2); mp_write_vlq(&w, 3);
     mp_write_string(&w, "Medli	of the Rito, the sage"); /* name: tab replaced, cut at 16 */
+    if (ship) {                      /* ship block, then the next component's index */
+        mp_ship_state st = {.flags = MP_SHIP_PRESENT | MP_SHIP_SAIL, .pos = {10.0f, 20.0f, 30.0f}, .rot = {1, -2, 3}};
+        mp_write_ship(&w, &st);
+    }
     mp_write_vlq(&w, 0);             /* ActorBaseSync */
     mp_write_base(&w, &kTransform);
     assert(w.ok);
     return w.size;
+}
+
+static mp_u32 build_server_create(mp_u8* out, mp_u32 capacity, const char* properties) {
+    return build_server_create_ship(out, capacity, properties, 0);
 }
 
 static void test_server_packets(void) {
@@ -274,6 +287,15 @@ static void test_server_packets(void) {
     assert(a.look.item == 0x0101 && a.look.proc == 12 && a.look.colors[4] == 0x1004);
     assert(a.look.cursor[3] == 4);
     assert(strcmp(a.look.name, "Medli?of the Rit") == 0);
+    assert(a.look.ship.flags == 0); /* the next component's index (0x80) is not a ship block */
+    {
+        mp_u8 with_ship[1024];
+        mp_actor_state b;
+        mp_u32 n = build_server_create_ship(with_ship, sizeof(with_ship), "PlayerPuppet", 1);
+        assert(mp_read_actor_create(with_ship, n, &s, &b) && b.has_transform && b.has_look);
+        assert(b.look.ship.flags == (MP_SHIP_PRESENT | MP_SHIP_SAIL) && b.look.ship.pos[2] == 30.0f && b.look.ship.rot[1] == -2);
+        assert(b.transform.pos[0] == kTransform.pos[0]);
+    }
     for (mp_u32 cut = 0; cut != size; ++cut) assert(!mp_read_actor_create(packet, cut, &s, &a));
 
     /* other actor kinds: header accepted, body left to the caller */
@@ -390,6 +412,8 @@ static void write_player_by_hand(mp_writer* w, const mp_player_look* l) {
     mp_write_vlq(w, 1);                                   /* AnimeUnequipPacket */
     mp_write_vlq(w, 0);                                   /* HitPacket */
     mp_write_string(w, l->name);                          /* WWHD extension: name */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no ship */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no extras */
 }
 
 static void sample_events(mp_anim_events* e) {
@@ -440,11 +464,88 @@ static void test_player_events(void) {
     assert(a.events.reset_count == 1 && a.events.reset[0].upper == 2 && a.events.reset[0].morf == (float)2.4f);
     assert(a.events.sword_count == 1 && a.events.sword[0] == 1);
     assert(a.events.equip_item_count == 2 && a.events.unequip_count == 1 && a.events.dropped == 0);
-    /* every truncation fails, except the one that drops only the (empty) name: a GameCube
-     * client or an older mod ends the component after the hit list */
-    for (mp_u32 cut = 0; cut != w.size - 1; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
-    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.look.name[0] == 0);
-    assert(a.events.move_count == 1);
+    /* every truncation fails, except the ones that drop only the ship (a mod before the ship
+     * extension) or the name and the ship (a GameCube client or an older mod ends the component
+     * after the hit list) */
+    for (mp_u32 cut = 0; cut != w.size - 3; ++cut) assert(!mp_read_actor_update(w.data, cut, &s, &a));
+    assert(mp_read_actor_update(w.data, w.size - 3, &s, &a) && a.has_look && a.look.name[0] == 0);
+    assert(a.events.move_count == 1 && a.look.ship.flags == 0);
+    assert(mp_read_actor_update(w.data, w.size - 2, &s, &a) && a.has_look && a.look.ship.flags == 0);
+    assert(mp_read_actor_update(w.data, w.size - 1, &s, &a) && a.has_look && a.look.extras == 0);
+
+    /* the extras: iron boots */
+    {
+        mp_player_look booted = look;
+        booted.extras = MP_EXTRA_HEAVY_BOOTS;
+        mp_writer bw = mp_writer_make(buffer, sizeof(buffer));
+        mp_write_vlq(&bw, 77); mp_write_u8(&bw, 3); mp_write_vlq(&bw, 77);
+        mp_write_vlq(&bw, 1); mp_write_vlq(&bw, 1);
+        mp_write_player_events(&bw, &booted, 0);
+        assert(bw.ok && bw.data[bw.size - 1] == MP_EXTRA_HEAVY_BOOTS);
+        assert(mp_read_actor_update(bw.data, bw.size, &s, &a) && a.look.extras == MP_EXTRA_HEAVY_BOOTS);
+    }
+
+    /* the ship block: flags, then place and angles when present */
+    {
+        mp_player_look sailing = look;
+        sailing.ship.flags = (mp_u8)(MP_SHIP_PRESENT | MP_SHIP_RIDING | MP_SHIP_SAIL | MP_SHIP_COLOR |
+                                     (2 << MP_SHIP_PART_SHIFT)); /* cannon deployed */
+        sailing.ship.color[0] = 0x12; sailing.ship.color[1] = 0x34; sailing.ship.color[2] = 0x56;
+        sailing.ship.pos[0] = 1500.5f; sailing.ship.pos[1] = -2.0f; sailing.ship.pos[2] = -200000.0f;
+        sailing.ship.rot[0] = 12; sailing.ship.rot[1] = -16384; sailing.ship.rot[2] = -3;
+        mp_writer sw = mp_writer_make(buffer, sizeof(buffer));
+        mp_write_vlq(&sw, 77); mp_write_u8(&sw, 3); mp_write_vlq(&sw, 77);
+        mp_write_vlq(&sw, 1); mp_write_vlq(&sw, 1);
+        mp_write_player_events(&sw, &sailing, 0);
+        static const mp_u8 ship_bytes[] = {0x2F, 0x44, 0xBB, 0x90, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                                           0xC8, 0x43, 0x50, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0xFF, 0xFD,
+                                           0x12, 0x34, 0x56};
+        assert(sw.ok && sw.size > sizeof(ship_bytes) + 1 && sw.data[sw.size - 1] == 0x00); /* then no extras */
+        assert(memcmp(sw.data + sw.size - 1 - sizeof(ship_bytes), ship_bytes, sizeof(ship_bytes)) == 0);
+        assert(mp_read_actor_update(sw.data, sw.size, &s, &a) && a.has_look);
+        assert(mp_same_ship(&a.look.ship, &sailing.ship));
+        for (mp_u32 cut = sw.size - 1 - sizeof(ship_bytes) + 1; cut != sw.size - 1; ++cut)
+            assert(!mp_read_actor_update(sw.data, cut, &s, &a)); /* a cut ship block is malformed */
+        mp_ship_state moved = sailing.ship;
+        moved.pos[2] += 1.0f;
+        assert(!mp_same_ship(&moved, &sailing.ship));
+        mp_ship_state recoloured = sailing.ship;
+        recoloured.color[2] = 0x57;
+        assert(!mp_same_ship(&recoloured, &sailing.ship));
+        assert(mp_read_actor_update(sw.data, sw.size, &s, &a));
+        assert(((a.look.ship.flags & MP_SHIP_PART_MASK) >> MP_SHIP_PART_SHIFT) == 2 && a.look.ship.color[1] == 0x34);
+        mp_ship_state none = {.flags = 0, .pos = {1.0f, 2.0f, 3.0f}, .rot = {1, 2, 3}}, none2 = {.flags = 0};
+        assert(mp_same_ship(&none, &none2)); /* without a ship the place does not matter */
+        /* a colour without a ship: flags then the three bytes */
+        mp_ship_state painted = {.flags = MP_SHIP_COLOR, .color = {1, 2, 3}};
+        mp_u8 painted_buffer[16];
+        mp_writer pw = mp_writer_make(painted_buffer, sizeof(painted_buffer));
+        mp_write_ship(&pw, &painted);
+        static const mp_u8 painted_bytes[] = {0x08, 0x01, 0x02, 0x03};
+        expect_bytes(&pw, painted_bytes, sizeof(painted_bytes));
+        /* the detail: six s16 (tiller, sail, cannon pitch, yaw, crane, rope) and the hook */
+        mp_ship_state detail = {.flags = MP_SHIP_DETAIL, .tiller = -2, .sail = 0x1000, .cannon_pitch = 3,
+                                .cannon_yaw = -4, .crane = 0x2000, .rope = 40, .neck_pitch = 0x100,
+                                .neck_turn = -0x100, .hook = {1.0f, -2.0f, 0.5f}};
+        mp_u8 detail_buffer[32];
+        mp_writer dw = mp_writer_make(detail_buffer, sizeof(detail_buffer));
+        mp_write_ship(&dw, &detail);
+        static const mp_u8 detail_bytes[] = {0x40, 0xFF, 0xFE, 0x10, 0x00, 0x00, 0x03, 0xFF, 0xFC, 0x20, 0x00,
+                                             0x00, 0x28, 0x01, 0x00, 0xFF, 0x00, /* neck pitch 0x100, turn -0x100 */
+                                             0x3F, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                                             0x3F, 0x00, 0x00, 0x00};
+        expect_bytes(&dw, detail_bytes, sizeof(detail_bytes));
+        mp_reader dr = {detail_buffer, dw.size, 0, 1};
+        mp_ship_state back;
+        mp_read_ship(&dr, &back);
+        assert(dr.ok && dr.pos == dw.size && mp_same_ship(&back, &detail) && back.rope == 40 && back.hook[1] == -2.0f);
+        mp_ship_state turned = detail;
+        turned.cannon_yaw = 5;
+        assert(!mp_same_ship(&turned, &detail));
+        mp_reader cut = {detail_buffer, dw.size - 1, 0, 1};
+        mp_read_ship(&cut, &back);
+        assert(!cut.ok && back.flags == 0); /* a cut detail is malformed */
+    }
 
     /* the client update: uid, ticket, one component (ActorPlayerSync, index 1) */
     mp_writer update = mp_writer_make(buffer, sizeof(buffer));

@@ -37,6 +37,8 @@
 #include "boat_paint.h"
 #include "ship_material.h"
 #include "sea_chart.h"
+#include "ship_puppet.h"
+#include "puppet_sense.h"
 
 #define MAX_REMOTES 8
 #define CFG_PERIOD 1.0      /* launcher.cfg re-read interval, seconds */
@@ -100,6 +102,7 @@ static int area_settle;
 static mp_player_look local_look; /* colours and cursor from the launcher/options */
 static mp_player_look sent_look;  /* last ActorPlayerSync sent, with item and proc */
 static double player_clock;
+static double ship_clock;  /* a moving ship is sent at most every UPDATE_PERIOD */
 static marker markers[MAX_REMOTES];
 /* Projection arguments are passed to game code by guest address, so they live in mod memory. */
 static cXyz project_in;
@@ -155,6 +158,7 @@ static remote_player* find_remote(mp_u32 uid, int create) {
 static void clear_area_state(void) {
     for (int i = 0; i != MAX_REMOTES; ++i) remotes[i].active = markers[i].visible = 0;
     puppet_clear_all();
+    ship_puppet_clear_all();
     mp_anim_events_clear(&anim_local);
     pending_solver = MP_NO_ID;
     local_uid = MP_NO_ID;
@@ -213,6 +217,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
         if (actor.has_look) {
             remote->look = actor.look;
             remote->has_look = 1;
+            ship_puppet_set(actor.uid, &actor.look.ship);
         }
         wwhd_log_int("multiplayer: remote player joined, uid", (int)actor.uid);
         /* the events of a create are history (the moment the player entered): not replayed */
@@ -233,6 +238,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
                 remote->look = actor.look;
                 remote->has_look = 1;
                 puppet_queue_events(uid, &actor.events);
+                ship_puppet_set(uid, &actor.look.ship);
             }
         }
     } else if (id == session.server_remove) {
@@ -240,6 +246,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
         if (remote) {
             remote->active = 0;
             puppet_remove(remote->uid);
+            ship_puppet_remove(remote->uid);
             wwhd_log_int("multiplayer: remote player left, uid", (int)remote->uid);
         }
     }
@@ -252,6 +259,8 @@ static mp_player_look current_look(const daPy_lk_c* link) {
     mp_player_look look = local_look;
     look.item = link->mEquipItem;
     look.proc = (mp_u32)link->mCurProc;
+    look.ship = ship_local_state();
+    look.extras = (*(const volatile u32*)((const u8*)link + PUPPET_NO_RESET_FLG0) & PUPPET_HEAVY_BOOTS) ? MP_EXTRA_HEAVY_BOOTS : 0;
     return look;
 }
 
@@ -340,7 +349,8 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
             for (int k = 0; k != 3; ++k) r->display.rot[k] = r->transform.rot[k];
         }
         puppet_set_target(r->uid, &r->display);
-        if (r->has_look) puppet_set_look(r->uid, (mp_u16)r->look.colors[0], (mp_u16)r->look.colors[1]);
+        if (r->has_look) puppet_set_look(r->uid, (mp_u16)r->look.colors[0], (mp_u16)r->look.colors[1], r->look.proc,
+                                         r->look.item, r->look.extras);
         if (!view || screen_w <= 0.0f || screen_h <= 0.0f) continue;
 
         f32 dx = r->display.pos[0] - local->current.pos.x;
@@ -386,6 +396,19 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
 }
 
 /* ------------------------------------------------------------------ sea chart */
+
+/* The menus pause the game: the local Link's execute, which reads the network every step, stops
+ * while the MAP screen is open. The sea chart's update (sea_chart.h) reads it instead, so the
+ * remote players' arrows keep moving; it only takes what the server sent (positions, looks). */
+static void multiplayer_pump(void) {
+    if (state != READY || wwhd_net_status() != 2) return;
+    for (;;) {
+        int received = wwhd_net_receive(incoming, sizeof(incoming));
+        if (received <= 0) break;
+        handle_frame(incoming, (u32)received);
+        if (state != READY) return;
+    }
+}
 
 #define CHART_ARROW_SCALE 1.0f    /* remote icon size / the game's Link icon */
 #define CHART_FACE_ARROW 0.5f     /* heading arrow beside the icon / icon size */
@@ -460,8 +483,10 @@ static void draw_chart_players(u32 list, f32 k) {
     f32 size = v.icon * CHART_ARROW_SCALE * k;
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const remote_player* r = &remotes[i];
-        if (!r->active || !r->has_display) continue;
-        f32 wx = r->display.pos[0], wz = r->display.pos[2];
+        /* the last received place and heading: the menu pauses the game, so the smoothed place
+         * (update_markers, in the local Link's execute) does not move while the chart is open */
+        if (!r->active || !r->has_transform) continue;
+        f32 wx = r->transform.pos[0], wz = r->transform.pos[2];
         if (!(wx > -CHART_SEA_HALF && wx < CHART_SEA_HALF && wz > -CHART_SEA_HALF && wz < CHART_SEA_HALF)) continue;
         f32 x = (v.ox + wx * v.kx) * k, y = (v.oy + wz * v.ky) * k;
         if (!chart_finite(x) || !chart_finite(y)) continue;
@@ -474,7 +499,7 @@ static void draw_chart_players(u32 list, f32 k) {
             /* the arrow points up at rotation 0; heading 0 faces +z (south, down on the chart) and
              * the HUD turns clockwise on the y-down screen: rotation = pi - heading. With the icon
              * it sits beside it, towards the heading (screen direction (sin h, cos h)). */
-            f32 heading = (f32)r->display.rot[1] * (6.28318531f / 65536.0f);
+            f32 heading = (f32)r->transform.rot[1] * (6.28318531f / 65536.0f);
             f32 arrow = face ? size * CHART_FACE_ARROW : size;
             f32 ax = x, ay = y;
             if (face) {
@@ -601,14 +626,17 @@ static int same_look(const mp_player_look* a, const mp_player_look* b) {
     for (int i = 0; i != 5; ++i) if (a->colors[i] != b->colors[i]) return 0;
     for (int i = 0; i != 4; ++i) if (a->cursor[i] != b->cursor[i]) return 0;
     for (int i = 0; i != MP_NAME_MAX; ++i) if (a->name[i] != b->name[i]) return 0;
-    return a->item == b->item && a->proc == b->proc;
+    return a->item == b->item && a->proc == b->proc && a->extras == b->extras;
 }
 
 static void apply_puppet_setting(void) {
     int wanted = cfg.has_puppet ? cfg.puppet : wwhd_config_bool("puppet", 0);
     if (wanted == puppet_enabled) return;
     puppet_enabled = wanted;
-    if (!wanted) puppet_clear_all();
+    if (!wanted) {
+        puppet_clear_all();
+        ship_puppet_clear_all();
+    }
     wwhd_log_int("multiplayer: remote Link puppets", wanted);
 }
 
@@ -621,6 +649,7 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
     read_launcher_cfg();
     apply_puppet_setting();
     names_hidden = cfg.has_hide_names ? cfg.hide_names : wwhd_config_bool("hide_names", 0);
+    sense_enabled = wwhd_config_bool("actors_see_puppets", 1);
     refresh_ship_color_setting();
     mp_player_look look = wanted_look();
     if (!same_look(&look, &local_look)) {
@@ -651,7 +680,13 @@ static void send_player_state(const daPy_lk_c* link, double dt) {
     if (player_clock > 0) return;
     player_clock = PLAYER_PERIOD;
     mp_player_look look = current_look(link);
-    if (mp_anim_events_empty(&anim_local) && same_look(&look, &sent_look)) return;
+    ship_clock -= PLAYER_PERIOD;
+    /* a ship that only moved waits for its period; a change of its flags goes at once */
+    int ship_due = !mp_same_ship(&look.ship, &sent_look.ship) &&
+                   (ship_clock <= 0 || look.ship.flags != sent_look.ship.flags);
+    if (!ship_due) look.ship = sent_look.ship;
+    if (mp_anim_events_empty(&anim_local) && same_look(&look, &sent_look) && !ship_due) return;
+    if (ship_due) ship_clock = UPDATE_PERIOD;
     mp_writer body = mp_writer_make(payload, sizeof(payload));
     mp_write_player_update(&body, &session, local_uid, local_ticket, &look, &anim_local);
     int colours = 0;
@@ -687,6 +722,7 @@ static void start(void) {
 static void stop_remote_views(void) {
     hide_markers();
     puppet_clear_all();
+    ship_puppet_clear_all();
 }
 
 static void multiplayer_connection_step(void* link) {
@@ -745,6 +781,7 @@ static void multiplayer_connection_step(void* link) {
 
     update_markers(dt, (const fopAc_ac_c*)link);
     puppet_step((const fopAc_ac_c*)link);
+    ship_puppet_step();
     update_clock -= dt;
     if (local_uid != MP_NO_ID && update_clock <= 0) {
         update_clock += UPDATE_PERIOD;

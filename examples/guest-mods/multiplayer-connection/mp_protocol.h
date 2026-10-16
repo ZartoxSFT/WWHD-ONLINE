@@ -341,12 +341,45 @@ static inline void mp_read_base(mp_reader* r, mp_transform* t) {
  * since this extension. The GameCube client does not know it. */
 #define MP_NAME_MAX 16 /* printable ASCII; longer names are cut on reading */
 
+/* Protocol extension (WWHD, after the name, optional the same way): the player's King of Red
+ * Lions. u8 flags; when MP_SHIP_PRESENT, then f32 x, y, z and u16 rotation x, y, z (ActorBaseSync
+ * order); when MP_SHIP_COLOR, then u8 r, g, b (its custom paint). Bits 4-5: the part deployed
+ * (daShip_c::mPart: 0 none, 1 sail, 2 cannon, 3 crane); when MP_SHIP_DETAIL, then s16 tiller
+ * (m0366), sail angle (mSailAngle), cannon pitch (m0394), cannon yaw (m0396), crane angle
+ * (m0398 + m039C), rope segments (mRopeCnt), neck pitch (m03A0) and neck turn (m03A2), and f32
+ * x, y, z of the crane's hook (mpLinkModel's base matrix). The Java server keeps and forwards it
+ * (ActorPlayerSync.java ship*).
+ *
+ * Then the player's extras (WWHD, optional the same way, after the ship block): u8, bit 7 clear,
+ * MP_EXTRA_HEAVY_BOOTS when the iron boots are on (daPy_lk_c::mNoResetFlg0 0x2000000). */
+#define MP_EXTRA_HEAVY_BOOTS 0x01
+#define MP_EXTRAS 0x7F
+#define MP_SHIP_PRESENT 0x01 /* the player's stage has its ship */
+#define MP_SHIP_RIDING 0x02  /* Link is on it */
+#define MP_SHIP_SAIL 0x04    /* its sail is up */
+#define MP_SHIP_COLOR 0x08   /* custom paint follows */
+#define MP_SHIP_PART_SHIFT 4
+#define MP_SHIP_PART_MASK 0x30
+#define MP_SHIP_DETAIL 0x40  /* tiller, sail, cannon, crane, rope and hook follow */
+#define MP_SHIP_FLAGS 0x7F   /* bit 7 always clear: see mp_read_ship */
+
+typedef struct mp_ship_state {
+    mp_u8 flags;
+    float pos[3];
+    mp_s16 rot[3];
+    mp_u8 color[3];  /* with MP_SHIP_COLOR */
+    mp_s16 tiller, sail, cannon_pitch, cannon_yaw, crane, rope, neck_pitch, neck_turn; /* with MP_SHIP_DETAIL */
+    float hook[3];
+} mp_ship_state;
+
 typedef struct mp_player_look {
     mp_u16 item;
     mp_u32 proc;
     mp_u32 colors[5]; /* RGB565 in u32 slots */
     mp_u8 cursor[4];  /* GXColor r, g, b, a */
     char name[MP_NAME_MAX + 1];
+    mp_ship_state ship;
+    mp_u8 extras; /* MP_EXTRA_* */
 } mp_player_look;
 
 static inline mp_player_look mp_player_look_default(void) {
@@ -363,6 +396,16 @@ static inline mp_player_look mp_player_look_default(void) {
     l.cursor[2] = 0x4D;
     l.cursor[3] = 0xFF;
     for (int i = 0; i != MP_NAME_MAX + 1; ++i) l.name[i] = 0;
+    l.ship.flags = 0;
+    for (int i = 0; i != 3; ++i) {
+        l.ship.pos[i] = 0.0f;
+        l.ship.rot[i] = 0;
+        l.ship.color[i] = 0;
+        l.ship.hook[i] = 0.0f;
+    }
+    l.ship.tiller = l.ship.sail = l.ship.cannon_pitch = l.ship.cannon_yaw = l.ship.crane = l.ship.rope = 0;
+    l.ship.neck_pitch = l.ship.neck_turn = 0;
+    l.extras = 0;
     return l;
 }
 
@@ -482,6 +525,82 @@ static inline void mp_anim_events_append(mp_anim_events* dst, const mp_anim_even
     dst->dropped += src->dropped;
 }
 
+static inline void mp_write_ship(mp_writer* w, const mp_ship_state* s) {
+    mp_write_u8(w, (mp_u8)(s->flags & MP_SHIP_FLAGS));
+    if (s->flags & MP_SHIP_PRESENT) {
+        for (int i = 0; i != 3; ++i) mp_write_f32(w, s->pos[i]);
+        for (int i = 0; i != 3; ++i) mp_write_u16(w, (mp_u16)s->rot[i]);
+    }
+    if (s->flags & MP_SHIP_COLOR)
+        for (int i = 0; i != 3; ++i) mp_write_u8(w, s->color[i]);
+    if (s->flags & MP_SHIP_DETAIL) {
+        mp_write_u16(w, (mp_u16)s->tiller);
+        mp_write_u16(w, (mp_u16)s->sail);
+        mp_write_u16(w, (mp_u16)s->cannon_pitch);
+        mp_write_u16(w, (mp_u16)s->cannon_yaw);
+        mp_write_u16(w, (mp_u16)s->crane);
+        mp_write_u16(w, (mp_u16)s->rope);
+        mp_write_u16(w, (mp_u16)s->neck_pitch);
+        mp_write_u16(w, (mp_u16)s->neck_turn);
+        for (int i = 0; i != 3; ++i) mp_write_f32(w, s->hook[i]);
+    }
+}
+
+/* The ship block when it is there. ActorPlayerSync is not always the last component (a server
+ * create may write ActorBaseSync after it): what follows the name may be the next component's
+ * index, one VLQ byte with bit 7 set (at most MP_MAX_COMPONENTS). The ship flags (0..7) have bit 7
+ * clear, so a byte with bit 7 set, or no byte, means no ship block (a sender before it). */
+static inline void mp_read_ship(mp_reader* r, mp_ship_state* s) {
+    s->flags = 0;
+    for (int i = 0; i != 3; ++i) {
+        s->pos[i] = 0.0f;
+        s->rot[i] = 0;
+        s->color[i] = 0;
+        s->hook[i] = 0.0f;
+    }
+    s->tiller = s->sail = s->cannon_pitch = s->cannon_yaw = s->crane = s->rope = 0;
+    s->neck_pitch = s->neck_turn = 0;
+    if (!r->ok || r->pos >= r->size || (r->data[r->pos] & 0x80)) return;
+    mp_u8 flags = mp_read_u8(r);
+    if (flags & MP_SHIP_PRESENT) {
+        for (int i = 0; i != 3; ++i) s->pos[i] = mp_read_f32(r);
+        for (int i = 0; i != 3; ++i) s->rot[i] = (mp_s16)mp_read_u16(r);
+    }
+    if (flags & MP_SHIP_COLOR)
+        for (int i = 0; i != 3; ++i) s->color[i] = mp_read_u8(r);
+    if (flags & MP_SHIP_DETAIL) {
+        s->tiller = (mp_s16)mp_read_u16(r);
+        s->sail = (mp_s16)mp_read_u16(r);
+        s->cannon_pitch = (mp_s16)mp_read_u16(r);
+        s->cannon_yaw = (mp_s16)mp_read_u16(r);
+        s->crane = (mp_s16)mp_read_u16(r);
+        s->rope = (mp_s16)mp_read_u16(r);
+        s->neck_pitch = (mp_s16)mp_read_u16(r);
+        s->neck_turn = (mp_s16)mp_read_u16(r);
+        for (int i = 0; i != 3; ++i) s->hook[i] = mp_read_f32(r);
+    }
+    if (r->ok) s->flags = flags;
+}
+
+static inline int mp_same_ship(const mp_ship_state* a, const mp_ship_state* b) {
+    if (a->flags != b->flags) return 0;
+    if (a->flags & MP_SHIP_COLOR)
+        for (int i = 0; i != 3; ++i)
+            if (a->color[i] != b->color[i]) return 0;
+    if (a->flags & MP_SHIP_DETAIL) {
+        if (a->tiller != b->tiller || a->sail != b->sail || a->cannon_pitch != b->cannon_pitch ||
+            a->cannon_yaw != b->cannon_yaw || a->crane != b->crane || a->rope != b->rope ||
+            a->neck_pitch != b->neck_pitch || a->neck_turn != b->neck_turn)
+            return 0;
+        for (int i = 0; i != 3; ++i)
+            if (a->hook[i] != b->hook[i]) return 0;
+    }
+    if (!(a->flags & MP_SHIP_PRESENT)) return 1;
+    for (int i = 0; i != 3; ++i)
+        if (a->pos[i] != b->pos[i] || a->rot[i] != b->rot[i]) return 0;
+    return 1;
+}
+
 /* ActorPlayerSync::write; events may be null (all eight lists empty). */
 static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l, const mp_anim_events* e) {
     mp_write_u16(w, l->item);
@@ -491,6 +610,8 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     if (!e) {
         for (int i = 0; i != 8; ++i) mp_write_vlq(w, 0);
         mp_write_string(w, l->name);
+        mp_write_ship(w, &l->ship);
+        mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
         return;
     }
     mp_write_vlq(w, e->move_count);
@@ -524,6 +645,8 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     mp_write_vlq(w, e->unequip_count);
     mp_write_vlq(w, 0); /* hits are not sent yet */
     mp_write_string(w, l->name);
+    mp_write_ship(w, &l->ship);
+    mp_write_u8(w, (mp_u8)(l->extras & MP_EXTRAS));
 }
 
 static inline void mp_write_player(mp_writer* w, const mp_player_look* l) {
@@ -590,6 +713,9 @@ static inline void mp_read_player_events(mp_reader* r, mp_player_look* l, mp_ani
     mp_u32 name_length = 0;
     const char* name = r->ok && r->pos < r->size ? mp_read_string(r, &name_length) : "";
     mp_set_name(l, name, name_length);
+    mp_read_ship(r, &l->ship);
+    /* the extras, the same way: a byte with bit 7 clear, else none (a sender before them) */
+    l->extras = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? (mp_u8)(mp_read_u8(r) & MP_EXTRAS) : 0;
     if (!r->ok) mp_anim_events_clear(e);
 }
 
