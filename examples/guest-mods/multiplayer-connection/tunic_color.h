@@ -142,6 +142,26 @@ static inline int tc_in_band(const tc_palette* p, tc_hsb px) {
     return hue && px.s >= p->saturation_min && px.b >= p->brightness_min;
 }
 
+/* The boat's paint made grey at the same brightness: for a lighting ramp in the paint colour (the
+ * head's toonEX, pure red), which multiplies the painted texture; recoloured, the head would get
+ * the chosen colour twice (darker than the body, whose ramp is neutral). */
+static inline tc_palette tc_palette_make_boat_neutral(void) {
+    tc_palette p = tc_palette_make_boat(TC_BOAT_RED);
+    p.primary.h = p.secondary.h = 0.0f;
+    p.primary.s = p.secondary.s = 0.0f;
+    p.primary.b = p.secondary.b = p.primary_ref.b;
+    return p;
+}
+
+/* A lighting ramp in the paint colour: most of its paint is full saturation and brightness
+ * (toonEX: median 1.00 / 1.00; the painted textures stay at or under 0.88 / 0.97). */
+#define TC_RAMP_LEVEL 0.95f
+static inline int tc_ramp_endpoint(const tc_palette* p, tc_u32 rgb, int* paint) {
+    tc_hsb px = tc_rgb_to_hsb(rgb);
+    *paint = tc_in_band(p, px);
+    return *paint && px.s >= TC_RAMP_LEVEL && px.b >= TC_RAMP_LEVEL;
+}
+
 /* 1 and *out set when rgb is in the palette's band (tunic green, boat red); 0 (out untouched)
  * otherwise. */
 static inline int tc_recolor_rgb(const tc_palette* p, tc_u32 rgb, tc_u32* out) {

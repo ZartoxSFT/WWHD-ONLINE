@@ -1,0 +1,6 @@
+[Definition]
+titleIds = 0005000010143400,0005000010143600,0005000010143500
+name = Linkle Pack v1, by silentnoir_
+path = "The Legend of Zelda: The Wind Waker HD/Mods/Linkle Pack"
+description = Check out the GameBanana page for credits.
+version = 4

@@ -40,6 +40,7 @@ WWHD_GAME_FUNC(0x027ED1F0, u32, boat_texture_name, (u32 names, u32 index));
 typedef struct boat_texture {
     tunic_texture t;     /* surface, pristine copy, live hash */
     int seen;            /* found by the last scan: the ship uses it, it may be written */
+    int ramp;            /* a lighting ramp in the paint colour: made grey, not recoloured */
 } boat_texture;
 
 static boat_texture boat_textures[BOAT_MAX_TEXTURES];
@@ -51,22 +52,32 @@ static int boat_scan_clock;
 static int boat_budget_logged;
 static int boat_remote_wanted; /* a remote ship wants another paint: the textures are copied too */
 
-/* Per mille of the colour blocks / pixels of the live image that are red/orange paint. */
-static u32 boat_paint_share(const tunic_texture* t, const tc_palette* p) {
+/* Per mille of the colour blocks / pixels of the live image that are red/orange paint; *ramp set
+ * when most of that paint is at full saturation and brightness (tunic_color.h tc_ramp_endpoint). */
+static u32 boat_paint_share(const tunic_texture* t, const tc_palette* p, int* ramp) {
     tc_u32 hw = t->format & 0x3Fu, step = hw == TC_FMT_BC1 ? 8u : hw == TC_FMT_8_8_8_8 ? 4u : 16u;
     tc_u32 offset = hw == TC_FMT_BC2 || hw == TC_FMT_BC3 ? 8u : 0u, out;
     const volatile u8* data = (const volatile u8*)t->image;
-    u32 total = 0, paint = 0;
+    u32 total = 0, paint = 0, endpoints = 0, full = 0;
+    int in;
+    (void)out;
     for (u32 i = 0; i + step <= t->image_size; i += step) {
         const volatile u8* b = data + i + offset;
         ++total;
         if (hw == TC_FMT_8_8_8_8) {
-            paint += (u32)tc_recolor_rgb(p, ((tc_u32)b[0] << 16) | ((tc_u32)b[1] << 8) | b[2], &out);
+            full += (u32)tc_ramp_endpoint(p, ((tc_u32)b[0] << 16) | ((tc_u32)b[1] << 8) | b[2], &in);
+            paint += (u32)in;
+            endpoints += (u32)in;
         } else {
             tc_u16 c0 = (tc_u16)(b[0] | (b[1] << 8)), c1 = (tc_u16)(b[2] | (b[3] << 8));
-            paint += (u32)(tc_recolor_rgb(p, tc_565_to_888(c0), &out) || tc_recolor_rgb(p, tc_565_to_888(c1), &out));
+            int in1;
+            full += (u32)tc_ramp_endpoint(p, tc_565_to_888(c0), &in);
+            full += (u32)tc_ramp_endpoint(p, tc_565_to_888(c1), &in1);
+            paint += (u32)(in || in1);
+            endpoints += (u32)in + (u32)in1;
         }
     }
+    *ramp = endpoints && full * 2 > endpoints;
     return total ? paint * 1000u / total : 0; /* at most 2 MiB / 8 blocks: no overflow */
 }
 
@@ -168,7 +179,8 @@ static int boat_scan_model(u32 model, const tc_palette* reference) {
             known->seen = 1;
             continue;
         }
-        u32 share = boat_paint_share(&t, reference);
+        int ramp = 0;
+        u32 share = boat_paint_share(&t, reference, &ramp);
         boat_log_texture(gx2, name, 1, share);
         if (share < BOAT_PAINT_MIN_SHARE) continue;
         while ((boat_texture_count == BOAT_MAX_TEXTURES ||
@@ -187,8 +199,9 @@ static int boat_scan_model(u32 model, const tc_palette* reference) {
         boat_budget_used += t.image_size + t.mip_size;
         boat_textures[boat_texture_count].t = t;
         boat_textures[boat_texture_count].seen = 1;
+        boat_textures[boat_texture_count].ramp = ramp;
         ++boat_texture_count;
-        wwhd_log_hex("multiplayer: boat painted texture", gx2);
+        wwhd_log_hex(ramp ? "multiplayer: boat lighting ramp, made grey under a custom paint" : "multiplayer: boat painted texture", gx2);
         wwhd_log_hex("multiplayer: boat   format", t.format);
         wwhd_log_int("multiplayer: boat   width", (int)tunic_ld32(gx2 + GX2_SURFACE_WIDTH));
         added = 1;
@@ -203,15 +216,16 @@ static u32 boat_morf_model(u32 ship, u32 offset) {
 
 /* Writes the wanted paint into every texture the ship uses now. */
 static void boat_write_all(void) {
-    tc_palette p = tc_palette_make_boat(boat_wanted_rgb);
+    tc_palette paint = tc_palette_make_boat(boat_wanted_rgb), grey = tc_palette_make_boat_neutral();
     for (u32 i = 0; i != boat_texture_count; ++i) {
         if (!boat_textures[i].seen) continue;
         tunic_texture* t = &boat_textures[i].t;
+        const tc_palette* p = boat_textures[i].ramp ? &grey : &paint;
         memcpy((void*)t->image, t->pristine, t->image_size);
         if (t->mip_size) memcpy((void*)t->mip, t->pristine + t->image_size, t->mip_size);
         if (boat_wanted_custom) {
-            tc_recolor_surface(&p, t->format, (u8*)t->image, t->image_size);
-            if (t->mip_size) tc_recolor_surface(&p, t->format, (u8*)t->mip, t->mip_size);
+            tc_recolor_surface(p, t->format, (u8*)t->image, t->image_size);
+            if (t->mip_size) tc_recolor_surface(p, t->format, (u8*)t->mip, t->mip_size);
         }
         t->live_hash = tunic_hash(t->image, t->image_size);
     }
@@ -332,10 +346,11 @@ static void boat_prepare_slot(int slot, int custom, u32 rgb) {
         for (u32 i = 0; i != boat_texture_count; ++i) used |= boat_textures[i].seen && boat_textures[i].t.gx2 == c->source_gx2;
         if (!used) boat_free_clone(c);
     }
-    tc_palette p = tc_palette_make_boat(rgb);
+    tc_palette paint = tc_palette_make_boat(rgb), grey = tc_palette_make_boat_neutral();
     for (u32 i = 0; i != boat_texture_count; ++i) {
         if (!boat_textures[i].seen) continue;
         const tunic_texture* t = &boat_textures[i].t;
+        const tc_palette* p = boat_textures[i].ramp ? &grey : &paint;
         boat_clone* c = boat_clone_for(slot, t->gx2, 1);
         if (!c) return;
         if (c->ready && c->custom == custom && c->rgb == rgb) continue;
@@ -354,8 +369,8 @@ static void boat_prepare_slot(int slot, int custom, u32 rgb) {
         memcpy((void*)c->image, t->pristine, t->image_size);
         if (t->mip_size) memcpy((void*)c->mip, t->pristine + t->image_size, t->mip_size);
         if (custom) {
-            tc_recolor_surface(&p, t->format, (u8*)c->image, t->image_size);
-            if (t->mip_size) tc_recolor_surface(&p, t->format, (u8*)c->mip, t->mip_size);
+            tc_recolor_surface(p, t->format, (u8*)c->image, t->image_size);
+            if (t->mip_size) tc_recolor_surface(p, t->format, (u8*)c->mip, t->mip_size);
         }
         memcpy(c->gx2, (const void*)t->gx2, HD_TEXTURE_BYTES);
         tunic_st32((u32)c->gx2 + GX2_SURFACE_IMAGE, c->image);

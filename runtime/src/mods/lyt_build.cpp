@@ -2,6 +2,7 @@
 // the reference generator tools/story_mods/lyt; the module and function names below are the Python ones,
 // so a change there is easy to follow here. Format notes live in the Python modules.
 #include "lyt_build.h"
+#include "../gfx/vulkan/bc_reference.h"  // CPU BC decoding (read_texture)
 
 #include <algorithm>
 #include <array>
@@ -1268,6 +1269,45 @@ Bytes build(const std::string& description_json, const std::filesystem::path& ar
 Bytes texture(const Bytes& rgba, uint32_t w, uint32_t h, const std::string& format, const std::string& tile, uint32_t swizzle) {
     if (rgba.size() != size_t(w) * h * 4) fail("texture: expected " + std::to_string(size_t(w) * h * 4) + " RGBA bytes");
     return bflim(rgba, w, h, format, tile, swizzle);
+}
+bool read_texture(const Bytes& file, uint32_t& w, uint32_t& h, Bytes& rgba, std::string& why) {
+    // the footer bflim() writes: FLIM header (0x14 bytes), then imag (0x14): w, h, alignment, format,
+    // tile mode | swizzle << 5, image size; big-endian, the image first
+    if (file.size() < 0x28) return why = "too short", false;
+    const uint8_t* f = file.data() + file.size() - 0x28;
+    auto be16 = [](const uint8_t* p) { return uint32_t(p[0]) << 8 | p[1]; };
+    auto be32 = [](const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; };
+    if (memcmp(f, "FLIM", 4) != 0 || memcmp(f + 0x14, "imag", 4) != 0) return why = "not a FLIM", false;
+    w = be16(f + 0x1C), h = be16(f + 0x1E);
+    const uint32_t code = f[0x22], mode = f[0x23] & 0x1F, swizzle = f[0x23] >> 5, size = be32(f + 0x24);
+    const TexFormat* fmt = nullptr;
+    for (const TexFormat& t : kFormats)
+        if (t.code == code && (code == 0x14 || code == 0x15 || code == 0x17)) fmt = &t;
+    if (!fmt) return why = "format " + std::to_string(code) + " not read", false;
+    if (mode != 1 && mode != 2 && mode != 4) return why = "tile mode " + std::to_string(mode) + " not read", false;
+    if (!w || !h || w > 4096 || h > 4096) return why = "bad size", false;
+    const uint32_t ew = fmt->bc ? (w + 3) / 4 : w, eh = fmt->bc ? (h + 3) / 4 : h, eb = fmt->bpp / 8;
+    const Surface s = surface_size(ew, eh, fmt->bpp, int(mode));
+    if (size > file.size() - 0x28 || s.size > size) return why = "short image", false;
+    rgba.assign(size_t(w) * h * 4, 0);
+    for (uint32_t y = 0; y < eh; y++)
+        for (uint32_t x = 0; x < ew; x++) {
+            const uint32_t at = address(x, y, s.pitch, int(mode), swizzle << 8, fmt->bpp);
+            if (at + eb > size) return why = "texel past the image", false;
+            const uint8_t* e = file.data() + at;
+            if (!fmt->bc) {
+                memcpy(&rgba[(size_t(y) * w + x) * 4], e, 4);
+                continue;
+            }
+            const unsigned type = code == 0x15 ? 1 : 3;
+            for (uint32_t p = 0; p < 16; p++) {
+                const uint32_t px = x * 4 + p % 4, py = y * 4 + p / 4;
+                if (px >= w || py >= h) continue;
+                const std::array<uint8_t, 4> c = gfxvk::bc::pixel(e, type, false, p);
+                memcpy(&rgba[(size_t(py) * w + px) * 4], c.data(), 4);
+            }
+        }
+    return true;
 }
 Bytes sarc_of(const std::map<std::string, Bytes>& files, uint32_t align) { return sarc(files, align); }
 Bytes yaz0_store(const Bytes& data) { return yaz0_stored(data); }

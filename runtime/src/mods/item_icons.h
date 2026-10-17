@@ -50,5 +50,9 @@ void set_items(const std::vector<Item>& items, const std::filesystem::path& cach
 std::string pack_for(const std::string& guest, const std::string& host_path);
 // The icon frame of an item in the served pack, or -1 (not served: the caller falls back).
 int frame(uint16_t key);
+// The game's own icon of a frame (0-54: Icon128_nn of BtnItemIcon_00 in the player's own 2D pack, the
+// one the game opened; read from that file when asked, never stored): RGBA 128 x 128. False before
+// the game opened its 2D pack, for a frame it has not, or a picture that can't be read (logged once).
+bool game_icon(int frame, Bytes& rgba, uint32_t& w, uint32_t& h);
 
 }  // namespace item_icons

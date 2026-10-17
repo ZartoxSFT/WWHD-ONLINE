@@ -16,7 +16,11 @@
  *    the flag toggle are kept (playerDelete then restores the table as usual);
  *  - a puppet whose player wears the other clothes: the local Link's swap is done only while the
  *    puppet draws (puppet.h puppet_draw, like the tunic copies), and the puppet's own flag says
- *    its clothes (its hat). The worn clothes go in ActorPlayerSync extras bit MP_EXTRA_CASUAL. */
+ *    its clothes (its hat). The worn clothes go in ActorPlayerSync extras bit MP_EXTRA_CASUAL.
+ *
+ * The hero's clothes are worn only once they are the player's (playerInit's own rule: save event
+ * 0x2A80, read with the game's dSv_event_c::isEventBit 025B8B94 on *(0x101F84DC) + 0x644): until
+ * then a player who chose "hero" stays in the casual clothes. */
 #pragma once
 #include "wwhd_guest.h"
 #include "wwhd/link.h"
@@ -35,6 +39,16 @@ enum { OUTFIT_AUTO = -1, OUTFIT_HERO = 0, OUTFIT_CASUAL_WANTED = 1 };
 static int outfit_wanted = OUTFIT_AUTO;
 static u32 outfit_local;    /* the local Link, from its step */
 static u32 outfit_logged;
+
+#define OUTFIT_EVENT 0x644          /* dSv_event_c from the save pointer (playerInit) */
+#define OUTFIT_HERO_EVENT 0x2A80u   /* the hero's clothes received */
+
+WWHD_GAME_FUNC(0x025B8B94, u32, outfit_is_event_bit, (u32 self, u32 flag));
+
+static int outfit_hero_unlocked(void) {
+    u32 save = WWHD_GAME_DATA(0x101F84DC, u32);
+    return save && outfit_is_event_bit(save + OUTFIT_EVENT, OUTFIT_HERO_EVENT) != 0;
+}
 
 static u32 outfit_ld32(u32 a) { return *(const volatile u32*)a; }
 static void outfit_st32(u32 a, u32 v) { *(volatile u32*)a = v; }
@@ -73,9 +87,11 @@ static int outfit_swap(u32 link) {
 /* The local Link's step: the chosen clothes. */
 static void outfit_local_step(u32 link) {
     outfit_local = link;
-    if (!link || outfit_wanted == OUTFIT_AUTO) return;
+    int wanted = outfit_wanted;
+    if (wanted == OUTFIT_HERO && !outfit_hero_unlocked()) wanted = OUTFIT_CASUAL_WANTED; /* not unlocked yet */
+    if (!link || wanted == OUTFIT_AUTO) return;
     int casual = outfit_is_casual(link);
-    if (casual == (outfit_wanted == OUTFIT_CASUAL_WANTED)) return;
+    if (casual == (wanted == OUTFIT_CASUAL_WANTED)) return;
     if (!outfit_swap(link)) return;
     volatile u32* flags = (volatile u32*)(link + OUTFIT_FLG1);
     *flags ^= OUTFIT_CASUAL;

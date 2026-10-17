@@ -45,6 +45,7 @@
 #include "actor_sync.h"
 #include "particle_sync.h"
 #include "sword_swing.h"
+#include "dungeon_map.h"
 
 #define MAX_REMOTES 8
 #define CFG_PERIOD 1.0      /* launcher.cfg re-read interval, seconds */
@@ -117,6 +118,21 @@ static mp_launcher_cfg cfg;
 static char cfg_text[MP_CFG_MAX_BYTES];
 static double cfg_clock;
 static int names_hidden;  /* launcher "hide player names" (hide_names), else the option */
+static int hud_hidden;    /* launcher "hide the HUD" (hide_hud), else the option */
+
+/* hdIngameUi_c::drawHudScreens (02715CA0, this and the draw info; runtime/src/mods/
+ * story_lyt_screen.cpp names it): the HD HUD's layouts on the TV (hearts, magic, rupees, the
+ * buttons, the mini map). While the HUD is hidden it is not called, except with a Start menu open
+ * (with the Pro Controller the item menu is one of those screens) or during an event (the message
+ * windows). 0.2.47 skipped dMeter_Draw (02593630), the GameCube meter's draw: it changed nothing
+ * on screen. The port's own hook on it (story notebook) stays outside the mods' layer. */
+static int chart_menu_open(void);
+WWHD_GAME_ORIGINAL(0x02715CA0, void, hud_screens_draw_original, (u32 self, u32 info));
+WWHD_REPLACE(0x02715CA0, void, hud_screens_draw, (u32 self, u32 info)) {
+    const u8* play = wwhd_play_get();
+    if (hud_hidden && play && !play[WWHD_PLAY_EVENT_RUNNING_OFFSET] && !chart_menu_open()) return;
+    hud_screens_draw_original(self, info);
+}
 
 static void fail(const char* message) {
     wwhd_log(message);
@@ -145,6 +161,11 @@ static int send_payload(mp_u32 id, const mp_writer* body) {
     mp_write_frame(&w, id, body->data, body->size);
     return w.ok && wwhd_net_send(w.data, w.size);
 }
+
+#include "save_sync.h"  /* the shared progression (SaveServer) */
+#include "world_sync.h" /* the world's clock and weather */
+#include "elite.h"      /* dynamic scaling and elite enemies */
+static void wd_roster_retry(void) { as_roster_retry(); }
 
 static void read_transform(const fopAc_ac_c* actor, mp_transform* t) {
     t->pos[0] = actor->current.pos.x;
@@ -215,9 +236,20 @@ static void handle_init(const unsigned char* item, u32 size) {
     as_mutators_changed(); /* the area loaded before the connection takes the server's values */
     wwhd_log_int("multiplayer: actor names to synchronise", (int)session.filter_count);
     wwhd_log_int("multiplayer: server enemy multiplier", (int)session.enemy_multiplier);
+    wwhd_log_int("multiplayer: server dynamic scaling", session.dynamic_scaling);
+    wwhd_log_int("multiplayer: server elite chance (percent)", (int)session.elite_chance);
     if (!session.factories_complete) wwhd_log("multiplayer: too many ActorSync factories, placed actors stay local");
     state = READY;
+    sv_open(&session); /* the SaveServer map came with the init */
 }
+
+static void directory_received(const mp_u8* body, mp_u32 length); /* the launcher map section */
+static void shop_received(const mp_u8* body, mp_u32 length);      /* the launcher shop section */
+static char shop_notice[64];  /* "X sent you a Moblin!" (shop section), drawn by draw_markers */
+static u32 shop_notice_bytes;
+static int shop_notice_steps;
+static mp_directory directory; /* the server's player directory (launcher map section) */
+static int directory_valid;
 
 static void handle_frame(const unsigned char* item, u32 size) {
     mp_u32 id, length;
@@ -276,7 +308,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
                 puppet_queue_events(uid, &actor.events);
                 swing_queue(uid, &actor.events);
                 as_queue_strikes(uid, &actor.events); /* sword hits on placed actors */
-                ps_queue_particles(&actor.events);    /* its Link's particle effects */
+                ps_queue_particles(uid, &actor.events); /* its Link's particle effects */
                 ship_puppet_set(uid, &actor.look.ship);
             }
         }
@@ -291,15 +323,27 @@ static void handle_frame(const unsigned char* item, u32 size) {
             swing_remove(remote->uid);
             wwhd_log_int("multiplayer: remote player left, uid", (int)remote->uid);
         }
+    } else if (id == session.server_player_directory) {
+        directory_received(body, length);
+    } else if (id == session.server_player_summon) {
+        shop_received(body, length);
+    } else if (id == session.server_save_from) {
+        sv_from_received(body, length);
+    } else if (id == session.server_save_update) {
+        sv_update_received(body, length);
+    } else if (id == session.server_world) {
+        wd_received(body, length);
     } else if (id == session.server_mutators) {
-        mp_u32 multiplier;
-        int randomizer;
-        if (!mp_read_mutators(body, length, &multiplier, &randomizer)) {
+        mp_u32 multiplier, elite;
+        int randomizer, scaling;
+        if (!mp_read_mutators_ex(body, length, &multiplier, &randomizer, &scaling, &elite)) {
             drop_frame("multiplayer: malformed mutators skipped", body, length);
             return;
         }
         session.enemy_multiplier = multiplier;
         session.enemy_randomizer = randomizer;
+        session.dynamic_scaling = scaling; /* elite.h: the actors follow at their next execute */
+        session.elite_chance = elite;      /* for the enemies made from now on */
         as_mutators_changed(); /* the loaded area follows at the next step */
         wwhd_log_int("multiplayer: server mutators changed, enemy multiplier", (int)multiplier);
     }
@@ -315,6 +359,15 @@ static mp_player_look current_look(const daPy_lk_c* link) {
     look.ship = ship_local_state();
     look.extras = (*(const volatile u32*)((const u8*)link + PUPPET_NO_RESET_FLG0) & PUPPET_HEAVY_BOOTS) ? MP_EXTRA_HEAVY_BOOTS : 0;
     if (outfit_is_casual((u32)link)) look.extras |= MP_EXTRA_CASUAL;
+    /* the skin the local Link wears (bound at its creation, skin.h): a new choice shows at the
+     * next area, for everybody at once */
+    int skin = skin_of((u32)link);
+    if (skin >= 0) {
+        const char* id = skin_archives[skin].id;
+        mp_u32 n = 0;
+        while (n != MP_SKIN_MAX && id[n]) ++n;
+        mp_set_skin(&look, id, n);
+    }
     return look;
 }
 
@@ -404,7 +457,7 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         }
         puppet_set_target(r->uid, &r->display);
         if (r->has_look) puppet_set_look(r->uid, (mp_u16)r->look.colors[0], (mp_u16)r->look.colors[1], r->look.proc,
-                                         r->look.item, r->look.extras);
+                                         r->look.item, r->look.extras, r->look.skin);
         if (!view || screen_w <= 0.0f || screen_h <= 0.0f) continue;
 
         f32 dx = r->display.pos[0] - local->current.pos.x;
@@ -492,13 +545,12 @@ typedef struct chart_face_image {
     u32 generation;
     unsigned long long epoch;
 } chart_face_image;
-static chart_face_image chart_faces[MAX_REMOTES];
+static chart_face_image chart_faces[MP_DIR_MAX];
 static u8* chart_face_work;
 
-static u32 chart_face_for(int slot, const remote_player* r, unsigned long long epoch) {
-    if (!chart_face_w || !chart_face_rgba) return 0;
-    tunic_look look = tunic_look_make(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
-    if (r->has_look) look = tunic_look_make((u16)r->look.colors[0], (u16)r->look.colors[1]);
+static u32 chart_face_for(int slot, const tunic_look* wanted, unsigned long long epoch) {
+    if (!chart_face_w || !chart_face_rgba || slot < 0 || slot >= MP_DIR_MAX) return 0;
+    tunic_look look = *wanted;
     chart_face_image* f = &chart_faces[slot];
     if (f->image && f->epoch == epoch && f->generation == chart_face_generation && tunic_same_look(&f->look, &look))
         return f->image;
@@ -532,99 +584,231 @@ static int sea_stage(void) {
     return area[0] == 's' && area[1] == 'e' && area[2] == 'a' && area[3] == 0;
 }
 
-/* The remote players on the sea chart of the MAP screen, as the GameCube client drew their cursor
- * on the map (ActorPlayerSync mPlayerCursor): the game's Link icon in their tunic colours at their
- * place, an arrow in their cursor colour beside it towards their heading, and their name under it. Only on the Great Sea ("sea"), where their
- * positions are sea coordinates. k: screen units per layout unit (the GamePad: 854 / 1280). */
-static void draw_chart_players(u32 list, f32 k) {
-    chart_view v;
-    if (state != READY || !sea_stage() || !chart_on_screen(&v)) return;
-    unsigned long long epoch = wwhd_hud_epoch();
-    if (epoch != chart_arrow_epoch) {
-        chart_arrow_epoch = epoch;
-        chart_arrow_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/map_player.png");
-        if (!chart_arrow_texture) wwhd_log("multiplayer: sea chart arrow not loaded, dots used");
+/* The other players on the sea chart, as the GameCube client drew their cursor on the map
+ * (ActorPlayerSync mPlayerCursor): the game's Link icon in their tunic colours at their place, an
+ * arrow beside it towards their heading, and their name under it. With the server's player
+ * directory every player of the server: on the Great Sea at their place, elsewhere at their last
+ * place at sea, faded; without it the players of one's own area on the Great Sea. The chart is
+ * the MAP screen's (sea_chart.h chart_on_screen) or another screen's sea chart grid (the Ballad of
+ * Gales' warp map, chart_grid_on_screen). k: screen units per layout unit (the GamePad: 854 / 1280). */
+typedef struct chart_point {
+    f32 x, z;
+    s16 heading;
+    tunic_look look;
+    u32 rgb;      /* arrow and name colour */
+    f32 fade;     /* 1 at sea, less elsewhere */
+    char name[MP_NAME_MAX + 1];
+    mp_u32 id;
+} chart_point;
+static chart_point chart_points[MP_DIR_MAX];
+
+/* A remote player of one's own area, as a map point: in the menu the last received place (the
+ * menu pauses the game, so the smoothed place, moved in the local Link's execute, stands still);
+ * during play the smoothed one. */
+static void chart_point_remote(chart_point* c, const remote_player* r, int paused) {
+    const mp_transform* place = paused || !r->has_display ? &r->transform : &r->display;
+    c->x = place->pos[0];
+    c->z = place->pos[2];
+    c->heading = place->rot[1];
+    c->look = tunic_look_make(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
+    c->rgb = CHART_DEFAULT_CURSOR;
+    if (r->has_look) {
+        c->look = tunic_look_make((u16)r->look.colors[0], (u16)r->look.colors[1]);
+        c->rgb = ((u32)r->look.cursor[0] << 16) | ((u32)r->look.cursor[1] << 8) | r->look.cursor[2];
     }
-    f32 size = v.icon * CHART_ARROW_SCALE * k;
+    c->fade = 1.0f;
+    for (int k = 0; k != MP_NAME_MAX + 1; ++k) c->name[k] = r->has_look ? r->look.name[k] : 0;
+    c->id = r->uid;
+}
+
+/* A directory entry of one's own area that is one of the remote players drawn live (same name). */
+static int chart_entry_is_live(const mp_dir_entry* e) {
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const remote_player* r = &remotes[i];
-        /* the last received place and heading: the menu pauses the game, so the smoothed place
-         * (update_markers, in the local Link's execute) does not move while the chart is open */
-        if (!r->active || !r->has_transform) continue;
-        f32 wx = r->transform.pos[0], wz = r->transform.pos[2];
-        if (!(wx > -CHART_SEA_HALF && wx < CHART_SEA_HALF && wz > -CHART_SEA_HALF && wz < CHART_SEA_HALF)) continue;
-        f32 x = (v.ox + wx * v.kx) * k, y = (v.oy + wz * v.ky) * k;
-        if (!chart_finite(x) || !chart_finite(y)) continue;
-        u32 rgb = CHART_DEFAULT_CURSOR;
-        if (r->has_look) rgb = ((u32)r->look.cursor[0] << 16) | ((u32)r->look.cursor[1] << 8) | r->look.cursor[2];
-        u32 alpha = (u32)(v.alpha * 255.0f + 0.5f);
-        if (alpha > 255) alpha = 255;
-        u32 face = chart_face_for(i, r, epoch);
-        if (chart_arrow_texture) {
-            /* the arrow points up at rotation 0; heading 0 faces +z (south, down on the chart) and
-             * the HUD turns clockwise on the y-down screen: rotation = pi - heading. With the icon
-             * it sits beside it, towards the heading (screen direction (sin h, cos h)). */
-            f32 heading = (f32)r->transform.rot[1] * (6.28318531f / 65536.0f);
-            f32 arrow = face ? size * CHART_FACE_ARROW : size;
-            f32 ax = x, ay = y;
-            if (face) {
-                f32 h = heading, s2 = h * h; /* sin, cos by Taylor on [-pi, pi]: no libm */
-                while (h > 3.14159265f) h -= 6.28318531f;
-                while (h < -3.14159265f) h += 6.28318531f;
-                s2 = h * h;
-                f32 sn = h * (1.0f - s2 / 6.0f * (1.0f - s2 / 20.0f * (1.0f - s2 / 42.0f * (1.0f - s2 / 72.0f))));
-                f32 cs = 1.0f - s2 / 2.0f * (1.0f - s2 / 12.0f * (1.0f - s2 / 30.0f * (1.0f - s2 / 56.0f * (1.0f - s2 / 90.0f))));
-                ax += sn * size * 0.55f;
-                ay += cs * size * 0.55f;
-            }
-            chart_element = (wwhd_hud_element){
-                .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
-                .x = ax - arrow * 0.5f, .y = ay - arrow * 0.5f, .w = arrow, .h = arrow, .thickness = 1,
-                .rotation = 3.14159265f - heading, .u1 = 1, .v1 = 1,
-                .rgba = (rgb << 8) | alpha, .image = chart_arrow_texture};
-        } else {
-            chart_element = (wwhd_hud_element){
-                .kind = WWHD_HUD_CIRCLE, .anchor = WWHD_HUD_CENTER, .x = x, .y = y,
-                .size = size * 0.3f, .thickness = 1, .u1 = 1, .v1 = 1, .rgba = (rgb << 8) | alpha};
+        if (!r->active || !r->has_transform || !r->has_look) continue;
+        int same = 1;
+        for (int k = 0; k != MP_NAME_MAX && same; ++k) {
+            if (r->look.name[k] != e->name[k]) same = 0;
+            if (!e->name[k]) break;
         }
-        wwhd_hud_emit(list, &chart_element);
-        if (face) {
-            chart_element = (wwhd_hud_element){
-                .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
-                .x = x - size * 0.5f, .y = y - size * 0.5f, .w = size, .h = size, .thickness = 1,
-                .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | alpha, .image = face};
-            wwhd_hud_emit(list, &chart_element);
-        }
-        if (names_hidden) continue;
-        char label[MP_NAME_MAX + 1];
-        u32 bytes = 0;
-        if (r->has_look)
-            while (bytes != MP_NAME_MAX && r->look.name[bytes]) {
-                label[bytes] = r->look.name[bytes];
-                ++bytes;
-            }
-        if (!bytes) bytes = format_label(label, r->uid);
-        f32 scale = CHART_NAME_SCALE * k * (v.icon / 32.0f);
-        if (scale < 0.18f * k) scale = 0.18f * k;
-        if (scale > 0.4f * k) scale = 0.4f * k;
-        name_draw(list, x, y + size * 0.5f + (f32)NAME_FONT_CAP * scale + 2.0f * k, label, bytes, rgb, scale, v.alpha);
+        if (same) return 1;
     }
+    return 0;
+}
+
+/* The players of one's own area at their live place (the directory only comes once a second and
+ * not while the game is paused), the others from the directory. */
+static int chart_collect(int paused) {
+    int n = 0;
+    if (sea_stage()) {
+        for (int i = 0; i != MAX_REMOTES && n != MP_DIR_MAX; ++i) {
+            const remote_player* r = &remotes[i];
+            if (r->active && r->has_transform) chart_point_remote(&chart_points[n++], r, paused);
+        }
+    }
+    if (!directory_valid) return n;
+    for (mp_u32 i = 0; i != directory.count && n != MP_DIR_MAX; ++i) {
+        const mp_dir_entry* e = &directory.entry[i];
+        if (e->id == directory.self) continue;
+        int here = 1;
+        for (int k = 0; k != STAGE_NAME_BYTES && here; ++k) {
+            if (e->stage[k] != area[k]) here = 0;
+            if (!area[k]) break;
+        }
+        if (here && sea_stage() && chart_entry_is_live(e)) continue;
+        int on_sea = e->stage[0] == 's' && e->stage[1] == 'e' && e->stage[2] == 'a' && !e->stage[3];
+        if (!on_sea && !(e->flags & MP_DIR_SEA)) continue;
+        chart_point* c = &chart_points[n++];
+        c->x = on_sea ? e->pos[0] : e->sea[0];
+        c->z = on_sea ? e->pos[2] : e->sea[1];
+        c->heading = e->heading;
+        c->look = tunic_look_make(e->color, e->color);
+        c->rgb = mp_rgb565_to_888(e->color);
+        c->fade = on_sea ? 1.0f : 0.6f;
+        for (int k = 0; k != MP_NAME_MAX + 1; ++k) c->name[k] = e->name[k];
+        c->id = e->id;
+    }
+    return n;
+}
+
+static void chart_arrow_load(unsigned long long epoch) {
+    if (epoch == chart_arrow_epoch) return;
+    chart_arrow_epoch = epoch;
+    chart_arrow_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/map_player.png");
+    if (!chart_arrow_texture) wwhd_log("multiplayer: sea chart arrow not loaded, dots used");
+}
+
+/* One player on a map at screen place (x, y): icon, heading arrow, name. size: the icon's size;
+ * icon_scale: the name's size follows it; base_alpha: the map's fade. */
+static void chart_draw_point(u32 list, f32 k, f32 x, f32 y, f32 size, f32 icon_scale, f32 base_alpha,
+                             const chart_point* c, int slot, unsigned long long epoch) {
+    if (!chart_finite(x) || !chart_finite(y)) return;
+    u32 rgb = c->rgb;
+    u32 alpha = (u32)(base_alpha * c->fade * 255.0f + 0.5f);
+    if (alpha > 255) alpha = 255;
+    u32 face = chart_face_for(slot, &c->look, epoch);
+    if (chart_arrow_texture) {
+        /* the arrow points up at rotation 0; heading 0 faces +z (south, down on the chart) and
+         * the HUD turns clockwise on the y-down screen: rotation = pi - heading. With the icon
+         * it sits beside it, towards the heading (screen direction (sin h, cos h)). */
+        f32 heading = (f32)c->heading * (6.28318531f / 65536.0f);
+        f32 arrow = face ? size * CHART_FACE_ARROW : size;
+        f32 ax = x, ay = y;
+        if (face) {
+            f32 h = heading, s2 = h * h; /* sin, cos by Taylor on [-pi, pi]: no libm */
+            while (h > 3.14159265f) h -= 6.28318531f;
+            while (h < -3.14159265f) h += 6.28318531f;
+            s2 = h * h;
+            f32 sn = h * (1.0f - s2 / 6.0f * (1.0f - s2 / 20.0f * (1.0f - s2 / 42.0f * (1.0f - s2 / 72.0f))));
+            f32 cs = 1.0f - s2 / 2.0f * (1.0f - s2 / 12.0f * (1.0f - s2 / 30.0f * (1.0f - s2 / 56.0f * (1.0f - s2 / 90.0f))));
+            ax += sn * size * 0.55f;
+            ay += cs * size * 0.55f;
+        }
+        chart_element = (wwhd_hud_element){
+            .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
+            .x = ax - arrow * 0.5f, .y = ay - arrow * 0.5f, .w = arrow, .h = arrow, .thickness = 1,
+            .rotation = 3.14159265f - heading, .u1 = 1, .v1 = 1,
+            .rgba = (rgb << 8) | alpha, .image = chart_arrow_texture};
+    } else {
+        chart_element = (wwhd_hud_element){
+            .kind = WWHD_HUD_CIRCLE, .anchor = WWHD_HUD_CENTER, .x = x, .y = y,
+            .size = size * 0.3f, .thickness = 1, .u1 = 1, .v1 = 1, .rgba = (rgb << 8) | alpha};
+    }
+    wwhd_hud_emit(list, &chart_element);
+    if (face) {
+        chart_element = (wwhd_hud_element){
+            .kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
+            .x = x - size * 0.5f, .y = y - size * 0.5f, .w = size, .h = size, .thickness = 1,
+            .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | alpha, .image = face};
+        wwhd_hud_emit(list, &chart_element);
+    }
+    if (names_hidden) return;
+    char label[MP_NAME_MAX + 1];
+    u32 bytes = 0;
+    while (bytes != MP_NAME_MAX && c->name[bytes]) {
+        label[bytes] = c->name[bytes];
+        ++bytes;
+    }
+    if (!bytes) bytes = format_label(label, c->id);
+    f32 scale = CHART_NAME_SCALE * k * (icon_scale / 32.0f);
+    if (scale < 0.18f * k) scale = 0.18f * k;
+    if (scale > 0.4f * k) scale = 0.4f * k;
+    name_draw(list, x, y + size * 0.5f + (f32)NAME_FONT_CAP * scale + 2.0f * k, label, bytes, rgb, scale,
+              base_alpha * c->fade);
+}
+
+static void draw_chart_players(u32 list, f32 k, int in_menu) {
+    chart_view v;
+    if (state != READY) return;
+    if (!chart_on_screen(&v, in_menu) && !chart_grid_on_screen(&v, in_menu)) return;
+    int count = chart_collect(chart_menu_open());
+    if (!count) return;
+    unsigned long long epoch = wwhd_hud_epoch();
+    chart_arrow_load(epoch);
+    f32 size = v.icon * CHART_ARROW_SCALE * k;
+    for (int i = 0; i != count; ++i) {
+        const chart_point* c = &chart_points[i];
+        if (!(c->x > -CHART_SEA_HALF && c->x < CHART_SEA_HALF && c->z > -CHART_SEA_HALF && c->z < CHART_SEA_HALF)) continue;
+        chart_draw_point(list, k, (v.ox + c->x * v.kx) * k, (v.oy + c->z * v.ky) * k, size, v.icon, v.alpha, c, i, epoch);
+    }
+}
+
+/* The other players of the same dungeon on its map (dungeon_map.h): placed as the game places Link's
+ * icon, on the floor shown only. Computed while the map updates (game calls), drawn from here. */
+static chart_point dmap_points[MAX_REMOTES];
+static f32 dmap_xy[MAX_REMOTES][2];
+static int dmap_count;
+
+static void dmap_players_update(void) {
+    int n = 0, paused = chart_menu_open();
+    if (state == READY) {
+        for (int i = 0; i != MAX_REMOTES; ++i) {
+            const remote_player* r = &remotes[i];
+            if (!r->active || !r->has_transform) continue;
+            chart_point* c = &dmap_points[n];
+            chart_point_remote(c, r, paused);
+            const mp_transform* place = paused || !r->has_display ? &r->transform : &r->display;
+            if (!dmap_on_floor(place->pos[1])) continue;
+            if (!dmap_place(c->x, c->z, &dmap_xy[n][0], &dmap_xy[n][1])) continue;
+            ++n;
+        }
+    }
+    dmap_count = n;
+}
+
+static void draw_dungeon_players(u32 list, f32 k) {
+    if (state != READY || !dmap_shown()) return;
+    unsigned long long epoch = wwhd_hud_epoch();
+    chart_arrow_load(epoch);
+    f32 size = dmap_v.icon * CHART_ARROW_SCALE * k;
+    for (int i = 0; i != dmap_count; ++i)
+        chart_draw_point(list, k, dmap_xy[i][0] * k, dmap_xy[i][1] * k, size, dmap_v.icon, 1.0f, &dmap_points[i], i, epoch);
 }
 
 /* The GamePad's own list (wwhd_hud_register_drc): the sea chart, when the menus are on the GamePad. */
 static void draw_gamepad(u32 list) {
-    if (!chart_menus_to_tv()) draw_chart_players(list, CHART_DRC_SCALE);
+    if (chart_menus_to_tv()) return;
+    draw_chart_players(list, CHART_DRC_SCALE, 0); /* also during play */
+    draw_dungeon_players(list, CHART_DRC_SCALE);
 }
 
 /* Names above the remote players' heads (name_tag.h), baseline at the projected head point. With
  * the Pro Controller the MAP screen is on the TV: its sea chart instead (the game is in its menu). */
 static void draw_markers(u32 list) {
     chart_view v;
-    if (chart_menus_to_tv() && chart_on_screen(&v)) {
-        draw_chart_players(list, 1.0f);
+    sv_draw(list); /* what the other players got, bottom left */
+    if (!chart_menu_open()) el_draw_crowns(list); /* the elites' crowns, not over the Start menu */
+    if (chart_menus_to_tv() && chart_menu_open() && dmap_shown()) draw_dungeon_players(list, 1.0f);
+    if (chart_menus_to_tv() && (chart_on_screen(&v, 1) || chart_grid_on_screen(&v, 1))) {
+        draw_chart_players(list, 1.0f, 1);
         return;
     }
-    if (names_hidden) return;
+    /* the names float over the game picture: not over the Start menu (sea_chart.h chart_menu_open:
+     * items, collection, map and bag, on the TV or the GamePad) */
+    if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
+        name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
+                  shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
+    if (names_hidden || chart_menu_open()) return;
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const marker* m = &markers[i];
         if (!m->visible) continue;
@@ -691,6 +875,7 @@ static int same_look(const mp_player_look* a, const mp_player_look* b) {
     for (int i = 0; i != 5; ++i) if (a->colors[i] != b->colors[i]) return 0;
     for (int i = 0; i != 4; ++i) if (a->cursor[i] != b->cursor[i]) return 0;
     for (int i = 0; i != MP_NAME_MAX; ++i) if (a->name[i] != b->name[i]) return 0;
+    if (!skin_same_id(a->skin, b->skin)) return 0;
     return a->item == b->item && a->proc == b->proc && a->extras == b->extras;
 }
 
@@ -705,6 +890,25 @@ static void apply_puppet_setting(void) {
     wwhd_log_int("multiplayer: remote Link puppets", wanted);
 }
 
+/* The local player's skin: launcher.cfg, else the option (skin.h). */
+static void skin_choose_local(void) {
+    if (cfg.has_skin) {
+        skin_copy_id(skin_local, cfg.skin);
+    } else {
+        char skin[MP_SKIN_MAX + 1] = {0};
+        wwhd_config_string("skin", skin, sizeof(skin));
+        mp_u32 n = 0;
+        while (n != MP_SKIN_MAX && skin[n]) ++n;
+        skin_copy_id(skin_local, mp_skin_valid(skin, n) ? skin : "");
+    }
+}
+
+/* At a scene load (skin.h skin_scene_load): launcher.cfg read again for the skin. */
+static void skin_read_local(void) {
+    read_launcher_cfg();
+    skin_choose_local();
+}
+
 /* Re-reads launcher.cfg every second and keeps the local tunic texture in its colours, with or
  * without a server. Colour changes reach the server through send_player_state. */
 static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
@@ -714,6 +918,9 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
     read_launcher_cfg();
     apply_puppet_setting();
     names_hidden = cfg.has_hide_names ? cfg.hide_names : wwhd_config_bool("hide_names", 0);
+    int hud = cfg.has_hide_hud ? cfg.hide_hud : wwhd_config_bool("hide_hud", 0);
+    if (hud != hud_hidden) wwhd_log(hud ? "multiplayer: HUD hidden" : "multiplayer: HUD shown");
+    hud_hidden = hud;
     sense_enabled = wwhd_config_bool("actors_see_puppets", 1);
     as_enabled = wwhd_config_bool("sync_actors", 1);
     as_hit_stop = wwhd_config_bool("hit_stop", 0);
@@ -730,8 +937,10 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
         local_look = look;
         wwhd_log("multiplayer: launcher colours changed");
     }
+    skin_choose_local();
     tunic_set_local((u16)local_look.colors[0], (u16)local_look.colors[1]);
-    tunic_refresh((u32)link);
+    /* a skinned Link keeps the skin's own textures */
+    if (skin_of((u32)link) < 0) tunic_refresh((u32)link);
 }
 
 WWHD_HOOK_RETURN(WWHD_ADDR_daShip_c__execute, after_ship_execute, (void* ship)) {
@@ -793,7 +1002,603 @@ static void start(void) {
     state = WAIT_INIT;
 }
 
+/* ------------------------------------------------------------------ launcher map and teleport */
+
+/* The launcher's World Map (LauncherUI createMapPage) shows the players on the Great Sea and lets
+ * the player teleport to one of them for TELEPORT_COST rupees. Files in this mod's Data folder,
+ * next to launcher.cfg (wwhd_file_*, flat names):
+ *  - players.txt, written every MAP_PERIOD: "stage=", "rupees=", "step=", "directory=" (1: the
+ *    server sends the player directory), "me=" then one "player=" per other player, each
+ *    "id|x|z|heading|RRGGBB|name|stage|sea x|sea z|sea known" (x, z in that stage; the last place
+ *    on the Great Sea for the chart; heading the s16 shape angle; the primary tunic colour; '|' and
+ *    control characters of names as '?'). With the directory every player of the server is listed
+ *    and the ids are the directory's; without it, the remote players of the area by actor uid. Then
+ *    "teleport=id|result" for the last request (ok, loading, arrived, no_target, rupees, riding,
+ *    busy, offline);
+ *  - teleport.cfg, written by the launcher: "id=<number>" and "target=<uid>"; a new id is one
+ *    request. The id found at the first read is not acted on (a request older than the game).
+ * Teleport to another stage (0.2.37): the target's stage is loaded with the start point, room and
+ * layer the target entered it with (dComIfGp_setNextStage 0252012C, decomp d_com_inf_game.cpp;
+ * dStage_startStage_c at play + 0x5134: name, s16 point +8, s8 room +0xA, s8 layer +0xB), then
+ * Link hops to the target's latest place TELEPORT_SETTLE steps after arriving. Deduced, not
+ * verified in game: a target in another room than its start room may stand in a room not loaded.
+ *
+ * Rupees (decomp, verified): the save's dSv_player_status_a_c::mRupee is at *(101F84DC) + 0x20 +
+ * 4 (d/d_save.h); a payment is added to dComIfG_play_c::mItemRupeeCount, play + 0x12A0 + 0x48A8
+ * from dComIfGp_get(), which the rupee meter applies with its count-down and clears
+ * (d_meter_02.cpp), as shops do (dComIfGp_setItemRupeeCount).
+ *
+ * The teleport moves Link (current and old place) next to the target's last received place and
+ * holds him there TELEPORT_HOLD steps without speed, while the sea rooms around load (deduced, not
+ * verified in game: the sea loads rooms around Link as he sails). Not while he rides his ship
+ * (play + 0x5CD8 SHIP_RIDE, puppet.h) or during an event. */
+#define MAP_PERIOD 0.5
+#define TELEPORT_COST 35
+#define TELEPORT_HOLD 45
+#define TELEPORT_ABOVE 100.0f
+#define PLAY_ITEM_RUPEE_COUNT (0x12A0 + 0x48A8)
+#define SAVE_POINTER 0x101F84DC
+#define SAVE_RUPEE (0x20 + 0x04)
+
+static double map_clock;
+static char map_text[4096];
+static char teleport_text[256];
+static int teleport_read_once;
+static u32 teleport_last_id;
+static u32 teleport_result_id;
+static const char* teleport_result = "";
+static int teleport_hold;
+static f32 teleport_to[3];
+
+typedef struct map_out {
+    char* data;
+    u32 size, capacity;
+} map_out;
+
+static void map_put(map_out* o, const char* s) {
+    while (*s && o->size + 1 < o->capacity) o->data[o->size++] = *s++;
+}
+
+static void map_put_name(map_out* o, const char* s, u32 n) {
+    for (u32 i = 0; i != n && s[i] && o->size + 1 < o->capacity; ++i)
+        o->data[o->size++] = (s[i] < 0x20 || s[i] > 0x7E || s[i] == '|') ? '?' : s[i];
+}
+
+/* 32-bit only: 64-bit arithmetic calls compiler helpers (__fixsfdi, __udivdi3) that are no host
+ * services, and a module importing one does not load ("module ABI does not match"). */
+static void map_put_digits(map_out* o, u32 u, int negative) {
+    char digits[12];
+    int n = 0;
+    do { digits[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (negative) digits[n++] = '-';
+    while (n && o->size + 1 < o->capacity) o->data[o->size++] = digits[--n];
+}
+
+static void map_put_int(map_out* o, s32 v) { map_put_digits(o, v < 0 ? 0u - (u32)v : (u32)v, v < 0); }
+static void map_put_uint(map_out* o, u32 v) { map_put_digits(o, v, 0); }
+
+static void map_put_rgb(map_out* o, mp_u32 rgb565) {
+    static const char hex[] = "0123456789ABCDEF";
+    mp_u32 rgb = mp_rgb565_to_888((mp_u16)rgb565);
+    for (int shift = 20; shift >= 0; shift -= 4)
+        if (o->size + 1 < o->capacity) o->data[o->size++] = hex[(rgb >> shift) & 0xF];
+}
+
+static u32 map_rupees(void) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    return save ? *(const volatile u16*)(save + SAVE_RUPEE) : 0;
+}
+
+static int map_on_sea(const u8* play) {
+    const u8* stage = play + WWHD_PLAY_START_STAGE_NAME_OFFSET;
+    return stage[0] == 's' && stage[1] == 'e' && stage[2] == 'a' && stage[3] == 0;
+}
+
+/* "key=number" in teleport.cfg; 0 when missing or malformed. */
+static u32 map_cfg_number(const char* text, u32 size, const char* key) {
+    u32 klen = 0;
+    while (key[klen]) ++klen;
+    for (u32 pos = 0; pos < size;) {
+        u32 end = pos;
+        while (end < size && text[end] != '\n') ++end;
+        if (end - pos > klen && text[pos + klen] == '=') {
+            u32 k = 0;
+            while (k != klen && text[pos + k] == key[k]) ++k;
+            if (k == klen) {
+                u32 value = 0;
+                for (u32 i = pos + klen + 1; i < end && text[i] >= '0' && text[i] <= '9'; ++i)
+                    value = value * 10 + (u32)(text[i] - '0');
+                return value;
+            }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+/* ---- the player directory (mp_protocol.h): every player, whatever their area ----
+ * Sent every DIR_PERIOD while connected (a server without it ignores nothing: the packet name is
+ * not in its init list, nothing is sent); the answer replaces the list. Without it (an older
+ * server) the map shows the remote players of the area, as before. */
+#define DIR_PERIOD 1.0
+#define TELEPORT_STAGE_TIMEOUT (30 * 60) /* steps to reach the target's stage */
+#define TELEPORT_SETTLE 20               /* steps in the new stage before the last hop */
+#define PLAY_START_POINT (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0x8)  /* dStage_startStage_c::mPoint */
+#define PLAY_START_ROOM (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0xA)   /* mRoomNo */
+#define PLAY_START_LAYER (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0xB)  /* mLayer */
+
+static double dir_clock;
+static f32 local_sea[2];
+static int local_sea_known;
+/* a teleport to another stage: the stage asked for, then the hop to the target */
+static mp_u32 teleport_target;
+static char teleport_stage[STAGE_NAME_BYTES + 1];
+static unsigned long long teleport_stage_since;
+static int teleport_stage_wait;
+static int teleport_settle;
+
+static void map_stage(const u8* play, char* out) {
+    for (int i = 0; i != STAGE_NAME_BYTES; ++i) out[i] = (char)play[WWHD_PLAY_START_STAGE_NAME_OFFSET + i];
+    out[STAGE_NAME_BYTES] = 0;
+}
+
+static int map_same_stage(const char* a, const char* b);
+
+/* elite.h: the players in the local player's area, itself included: the directory's players in
+ * the same stage and, on the Great Sea (one stage, a room per square), in the same room or within
+ * 5000 units; without the directory the remote players of the area. At most 8. */
+static int el_players_here(void) {
+    const u8* play = wwhd_play_get();
+    const fopAc_ac_c* link = (const fopAc_ac_c*)as_link;
+    if (!play || !link) return 1;
+    int n = 1;
+    if (directory_valid) {
+        char stage[STAGE_NAME_BYTES + 1];
+        map_stage(play, stage);
+        int sea = stage[0] == 's' && stage[1] == 'e' && stage[2] == 'a' && !stage[3];
+        for (mp_u32 i = 0; i != directory.count; ++i) {
+            const mp_dir_entry* e = &directory.entry[i];
+            if (e->id == directory.self || !map_same_stage(e->stage, stage)) continue;
+            if (sea && e->room != link->current.roomNo) {
+                f32 dx = e->pos[0] - link->current.pos.x, dz = e->pos[2] - link->current.pos.z;
+                if (dx * dx + dz * dz > 5000.0f * 5000.0f) continue;
+            }
+            ++n;
+        }
+    } else {
+        for (int i = 0; i != MAX_REMOTES; ++i) n += remotes[i].active != 0;
+    }
+    return n > 8 ? 8 : n;
+}
+
+static int map_same_stage(const char* a, const char* b) {
+    for (int i = 0; i != STAGE_NAME_BYTES; ++i) {
+        if (a[i] != b[i]) return 0;
+        if (!a[i]) return 1;
+    }
+    return 1;
+}
+
+static void directory_send(const fopAc_ac_c* link, const u8* play) {
+    if (state != READY || session.client_player_directory == MP_NO_ID) return;
+    mp_dir_entry e;
+    mp_copy_text(e.name, sizeof(e.name), local_look.name, MP_NAME_MAX);
+    e.color = (mp_u16)local_look.colors[0];
+    map_stage(play, e.stage);
+    e.point = *(const volatile s16*)(play + PLAY_START_POINT);
+    e.start_room = *(const volatile s8*)(play + PLAY_START_ROOM);
+    e.layer = *(const volatile s8*)(play + PLAY_START_LAYER);
+    e.room = link->current.roomNo;
+    e.pos[0] = link->current.pos.x;
+    e.pos[1] = link->current.pos.y;
+    e.pos[2] = link->current.pos.z;
+    e.heading = link->shape_angle.y;
+    e.flags = local_sea_known ? MP_DIR_SEA : 0;
+    e.sea[0] = local_sea[0];
+    e.sea[1] = local_sea[1];
+    mp_writer body = mp_writer_make(payload, sizeof(payload));
+    mp_write_dir_entry(&body, &e);
+    send_payload(session.client_player_directory, &body);
+}
+
+static void directory_received(const mp_u8* body, mp_u32 length) {
+    static mp_directory incoming_directory;
+    if (!mp_read_directory(body, length, &incoming_directory)) {
+        drop_frame("multiplayer: malformed player directory skipped", body, length);
+        return;
+    }
+    directory = incoming_directory;
+    if (!directory_valid) wwhd_log_int("multiplayer: player directory received, players", (int)directory.count);
+    directory_valid = 1;
+}
+
+static const mp_dir_entry* directory_find(mp_u32 id) {
+    if (!directory_valid) return 0;
+    for (mp_u32 i = 0; i != directory.count; ++i)
+        if (directory.entry[i].id == id) return &directory.entry[i];
+    return 0;
+}
+
+static void teleport_hop(const f32* pos) {
+    teleport_to[0] = pos[0];
+    teleport_to[1] = pos[1] + TELEPORT_ABOVE;
+    teleport_to[2] = pos[2];
+    teleport_hold = TELEPORT_HOLD;
+}
+
+static int teleport_pay(u8* play) {
+    s32 pending = *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    if ((s32)map_rupees() + pending < TELEPORT_COST) return 0;
+    *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) = pending - TELEPORT_COST;
+    return 1;
+}
+
+/* target: a directory id (the server has the directory), else a remote player's uid. In the
+ * same stage Link hops to the target; in another one the target's stage is loaded the way the
+ * target entered it (its start point, room and layer: they exist), then Link hops to the target
+ * once there (teleport_stage_step). */
+static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
+    (void)link;
+    if (state != READY) return "offline";
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_hold || teleport_stage_wait) return "busy";
+    if (*(const volatile u32*)(play + PUPPET_PLAY_STATUS0) & PUPPET_STATUS0_RIDE) return "riding";
+    char here[STAGE_NAME_BYTES + 1];
+    map_stage(play, here);
+    const mp_dir_entry* e = directory_find(target);
+    if (e) {
+        if (e->id == directory.self) return "no_target";
+        if (map_same_stage(e->stage, here)) {
+            if (!teleport_pay(play)) return "rupees";
+            teleport_hop(e->pos);
+            wwhd_log_int("multiplayer: teleport to the player, id", (int)target);
+            return "ok";
+        }
+        if (!e->stage[0]) return "no_target";
+        if (!teleport_pay(play)) return "rupees";
+        for (int i = 0; i != STAGE_NAME_BYTES + 1; ++i) teleport_stage[i] = e->stage[i];
+        teleport_target = target;
+        teleport_stage_wait = 1;
+        teleport_settle = 0;
+        teleport_stage_since = wwhd_logic_step();
+        wwhd_dComIfGp_setNextStage((u32)teleport_stage, (u32)(s32)e->point, (u32)(s32)e->start_room,
+                                   (u32)(s32)e->layer, 0.0f, 0, 0, 0);
+        wwhd_log("multiplayer: teleport: loading the player's stage");
+        wwhd_log(teleport_stage);
+        return "loading";
+    }
+    const remote_player* r = 0;
+    for (int i = 0; i != MAX_REMOTES; ++i)
+        if (remotes[i].active && remotes[i].has_transform && remotes[i].uid == target) r = &remotes[i];
+    if (!r) return "no_target";
+    if (!teleport_pay(play)) return "rupees";
+    teleport_hop(r->transform.pos);
+    wwhd_log_int("multiplayer: teleport to the player, uid", (int)target);
+    return "ok";
+}
+
+/* After the stage change asked by teleport_try: once Link stands in the target's stage, the hop
+ * to the target's latest place (if the target is still there). */
+static void teleport_stage_step(const u8* play) {
+    if (!teleport_stage_wait) return;
+    char here[STAGE_NAME_BYTES + 1];
+    map_stage(play, here);
+    if (wwhd_logic_step() - teleport_stage_since > TELEPORT_STAGE_TIMEOUT) {
+        teleport_stage_wait = 0;
+        teleport_result = "no_target";
+        wwhd_log("multiplayer: teleport: the player's stage was not reached");
+        return;
+    }
+    if (!map_same_stage(here, teleport_stage) || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) {
+        teleport_settle = 0;
+        return;
+    }
+    if (++teleport_settle < TELEPORT_SETTLE) return;
+    teleport_stage_wait = 0;
+    const mp_dir_entry* e = directory_find(teleport_target);
+    if (e && map_same_stage(e->stage, here)) {
+        teleport_hop(e->pos);
+        teleport_result = "ok";
+        wwhd_log("multiplayer: teleport: arrived, hop to the player");
+    } else {
+        teleport_result = "arrived"; /* in the stage, the player went elsewhere */
+    }
+}
+
+/* Holds the teleported Link in place while the rooms around him load (after his execute). */
+static void teleport_apply(fopAc_ac_c* link) {
+    if (!teleport_hold) return;
+    --teleport_hold;
+    link->current.pos.x = link->old.pos.x = teleport_to[0];
+    link->current.pos.y = link->old.pos.y = teleport_to[1];
+    link->current.pos.z = link->old.pos.z = teleport_to[2];
+    link->speed.x = link->speed.y = link->speed.z = 0.0f;
+    link->speedF = 0.0f;
+}
+
+/* ------------------------------------------------------------------ the launcher's shop
+ *
+ * The launcher's 5th tab (LauncherUI createShopPage) buys a creature for oneself or for another
+ * player of the directory: shop.cfg (id, item, target: a directory id, 0 for oneself), answered in
+ * players.txt ("shop=id|result"), which also lists the spoils ("spoils=" eight counts).
+ * The price is rupees and spoils, paid the way the game's shops pay, through the counters the HUD
+ * applies (play + 0x5B48 mItemRupeeCount, play + 0x5B70 + 2i mItemBeastNumCounts[i], s16: decomp
+ * d_a_npc_ds1_event.cpp, d_a_npc_bms1_talk.cpp). The spoils counts are dSv_player_c
+ * mBagItemRecord.mBeastNum[i] (save + 0x20 + 0x9C + i, d_save.h), fixed indices (d_a_npc_bs1.cpp,
+ * d_a_npc_bm1_b.h, d_a_npc_bms1_talk.cpp): 0 Skull Necklace, 1 Boko Baba Seed, 2 Golden Feather,
+ * 3 Knight's Crest, 4 Red, 5 Green, 6 Blue Chu Jelly, 7 Joy Pendant.
+ * The creatures: stage names of the name table (dStage_searchName, read in the binary: Bk 0xBD,
+ * mo2 0xBC, Tn 0xBF, c_red/c_green/c_blue 0xCE, bbaba 0xD6, Bb 0xB5) with parameters and angles
+ * of the game's own stages (ACTR entries read in the game's stage files: a common one each, no path
+ * nor switch; the ChuChu colour is its parameters' byte 1, d_a_cc.cpp). For oneself the creature
+ * is made next to Link (actor_sync.h as_summon); for another player the request goes through the
+ * server (CLIENT_PLAYER_SUMMON) and that player's game makes it next to its own Link
+ * (SERVER_PLAYER_SUMMON, shop_received). The launcher's catalogue (LauncherUI SHOP_ITEMS) shows
+ * the same numbers, prices and icons: keep both in step. */
+#define SHOP_SPOILS 8
+#define PLAY_ITEM_BEAST_COUNTS 0x5B70
+#define SAVE_BEAST_NUM (0x20 + 0x9C)
+#define SHOP_DISTANCE 250.0f
+#define SHOP_QUEUE 4
+#define SHOP_NOTICE_STEPS 120
+
+typedef struct shop_creature {
+    const char* name;  /* stage name */
+    u32 params;
+    s16 angle_x, angle_z;
+    u8 spoil, spoils;  /* spoil index, count */
+    u16 rupees;
+    const char* label;
+    u8 randomized;     /* given the randomizer's variants (actor_sync.h as_variants) */
+} shop_creature;
+
+static const shop_creature shop_creatures[] = {
+    {"c_red", 0xFFFF01FFu, 0, 0xFF, 4, 1, 5, "a Red ChuChu", 0},
+    {"c_green", 0xFFFF00FFu, 0, 0xFF, 5, 1, 5, "a Green ChuChu", 0},
+    {"c_blue", 0xFFFF02FFu, 0, 0xFF, 6, 1, 10, "a Blue ChuChu", 0},
+    {"Bk", 0xFFFFFF00u, 0x1F, 0xFF, 7, 1, 10, "a Bokoblin", 1},
+    {"mo2", 0xFFFFFF00u, 0x1F, 0xFF, 0, 1, 15, "a Moblin", 1},
+    {"Tn", 0xFFFFFF00u, 0x1F, 0xFF, 3, 1, 20, "a Darknut", 1},
+    {"bbaba", 0xFFFFFFFFu, 0, 0, 1, 1, 10, "a Boko Baba", 0},
+    {"Bb", 0xFFFF0F04u, 0x1F, 0xFF, 2, 1, 5, "a Kargaroc", 0},
+};
+#define SHOP_CREATURES (sizeof(shop_creatures) / sizeof(shop_creatures[0]))
+
+static char shop_text[256];
+static int shop_read_once;
+static u32 shop_last_id, shop_result_id;
+static const char* shop_result = "";
+typedef struct shop_gift {
+    u8 creature;
+    char buyer[MP_NAME_MAX + 1];
+} shop_gift;
+static shop_gift shop_gifts[SHOP_QUEUE];
+static u32 shop_gift_count;
+
+/* Spoils of index i one has, with what the HUD has not taken yet. */
+static s32 shop_spoils(const u8* play, u32 i) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    if (!save || i >= SHOP_SPOILS) return 0;
+    s32 have = *(const volatile u8*)(save + SAVE_BEAST_NUM + i);
+    return have + *(const volatile s16*)(play + PLAY_ITEM_BEAST_COUNTS + 2 * i);
+}
+
+static int shop_affordable(const u8* play, const shop_creature* c) {
+    s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    return rupees >= (s32)c->rupees && shop_spoils(play, c->spoil) >= (s32)c->spoils;
+}
+
+static void shop_pay(u8* play, const shop_creature* c) {
+    volatile s32* rupees = (volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    volatile s16* spoils = (volatile s16*)(play + PLAY_ITEM_BEAST_COUNTS + 2 * c->spoil);
+    *rupees = *rupees - (s32)c->rupees;
+    *spoils = (s16)(*spoils - (s16)c->spoils);
+}
+
+/* The creature next to the local Link, in front of him, facing him. */
+static int shop_summon_here(const fopAc_ac_c* link, u32 item) {
+    const shop_creature* c = &shop_creatures[item];
+    f32 sn, cs;
+    dmap_sincos((f32)link->shape_angle.y * (360.0f / 65536.0f), &sn, &cs);
+    f32 pos[3] = {link->current.pos.x + sn * SHOP_DISTANCE, link->current.pos.y, link->current.pos.z + cs * SHOP_DISTANCE};
+    return as_summon(c->name, c->params, c->angle_x, c->angle_z, pos, (s16)(link->shape_angle.y + 0x8000),
+                     (s8)link->current.roomNo, c->randomized);
+}
+
+static const char* shop_try(const fopAc_ac_c* link, u8* play, u32 item, u32 target) {
+    if (item >= SHOP_CREATURES) return "unknown";
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return "busy";
+    const shop_creature* c = &shop_creatures[item];
+    if (!shop_affordable(play, c)) return "price";
+    if (!target || (directory_valid && target == directory.self)) {
+        if (!shop_summon_here(link, item)) return "failed";
+        shop_pay(play, c);
+        return "ok";
+    }
+    if (state != READY) return "offline";
+    if (session.client_player_summon == MP_NO_ID) return "server";
+    const mp_dir_entry* e = directory_find(target);
+    if (!e) return "no_target";
+    mp_writer body = mp_writer_make(payload, sizeof(payload));
+    mp_write_summon_request(&body, target, (mp_u8)item, local_look.name);
+    if (!send_payload(session.client_player_summon, &body)) return "failed";
+    shop_pay(play, c);
+    wwhd_log("multiplayer: shop: creature sent to");
+    wwhd_log(e->name);
+    return "sent";
+}
+
+/* SERVER_PLAYER_SUMMON: made at the next steps, when the game allows it. */
+static void shop_received(const mp_u8* body, mp_u32 length) {
+    shop_gift g;
+    if (!mp_read_summon(body, length, &g.creature, g.buyer)) {
+        drop_frame("multiplayer: malformed summon skipped", body, length);
+        return;
+    }
+    if (g.creature >= SHOP_CREATURES || shop_gift_count == SHOP_QUEUE) return;
+    shop_gifts[shop_gift_count++] = g;
+}
+
+static void shop_notice_set(const char* buyer, const char* what) {
+    map_out o = {shop_notice, 0, sizeof(shop_notice)};
+    map_put_name(&o, buyer[0] ? buyer : "A player", MP_NAME_MAX);
+    map_put(&o, " sent you ");
+    map_put(&o, what);
+    map_put(&o, "!");
+    shop_notice_bytes = o.size;
+    shop_notice_steps = SHOP_NOTICE_STEPS;
+}
+
+/* Every step of the local Link: the creatures others bought for this player. */
+static void shop_step(const fopAc_ac_c* link, const u8* play) {
+    if (shop_notice_steps > 0) --shop_notice_steps;
+    if (!shop_gift_count || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
+    shop_gift g = shop_gifts[0];
+    for (u32 i = 1; i != shop_gift_count; ++i) shop_gifts[i - 1] = shop_gifts[i];
+    --shop_gift_count;
+    if (!shop_summon_here(link, g.creature)) return;
+    shop_notice_set(g.buyer, shop_creatures[g.creature].label);
+}
+
+/* A players.txt line: uid|x|z|heading|RRGGBB|name|stage|sea x|sea z|sea known */
+static void map_put_entry(map_out* o, const char* key, const mp_dir_entry* e) {
+    map_put(o, key);
+    map_put_uint(o, e->id);
+    map_put(o, "|");
+    map_put_int(o, (s32)e->pos[0]);
+    map_put(o, "|");
+    map_put_int(o, (s32)e->pos[2]);
+    map_put(o, "|");
+    map_put_int(o, e->heading);
+    map_put(o, "|");
+    map_put_rgb(o, e->color);
+    map_put(o, "|");
+    map_put_name(o, e->name, MP_NAME_MAX);
+    map_put(o, "|");
+    map_put_name(o, e->stage, STAGE_NAME_BYTES);
+    map_put(o, "|");
+    map_put_int(o, (s32)e->sea[0]);
+    map_put(o, "|");
+    map_put_int(o, (s32)e->sea[1]);
+    map_put(o, (e->flags & MP_DIR_SEA) ? "|1\n" : "|0\n");
+}
+
+static void map_step(void* link_actor, double dt) {
+    fopAc_ac_c* link = (fopAc_ac_c*)link_actor;
+    teleport_apply(link);
+    u8* play = wwhd_play_get();
+    if (!play) return;
+    if (map_on_sea(play)) {
+        local_sea[0] = link->current.pos.x;
+        local_sea[1] = link->current.pos.z;
+        local_sea_known = 1;
+    }
+    teleport_stage_step(play);
+    shop_step(link, play);
+    dir_clock -= dt;
+    if (dir_clock <= 0) {
+        dir_clock = DIR_PERIOD;
+        directory_send(link, play);
+    }
+    map_clock -= dt;
+    if (map_clock > 0) return;
+    map_clock = MAP_PERIOD;
+
+    s32 got = wwhd_file_read("teleport.cfg", teleport_text, sizeof(teleport_text));
+    if (got >= 0) {
+        u32 id = map_cfg_number(teleport_text, (u32)got, "id");
+        if (!teleport_read_once) {
+            teleport_last_id = id; /* older than this game: not acted on */
+        } else if (id && id != teleport_last_id) {
+            teleport_last_id = id;
+            teleport_result_id = id;
+            teleport_result = teleport_try(link, play, map_cfg_number(teleport_text, (u32)got, "target"));
+        }
+    }
+    teleport_read_once = 1;
+
+    got = wwhd_file_read("shop.cfg", shop_text, sizeof(shop_text));
+    if (got >= 0) {
+        u32 id = map_cfg_number(shop_text, (u32)got, "id");
+        if (!shop_read_once) {
+            shop_last_id = id; /* older than this game: not acted on */
+        } else if (id && id != shop_last_id) {
+            shop_last_id = id;
+            shop_result_id = id;
+            shop_result = shop_try(link, play, map_cfg_number(shop_text, (u32)got, "item"),
+                                   map_cfg_number(shop_text, (u32)got, "target"));
+        }
+    }
+    shop_read_once = 1;
+
+    map_out o = {map_text, 0, sizeof(map_text)};
+    mp_dir_entry me;
+    me.id = directory_valid ? directory.self : (local_uid == MP_NO_ID ? 0 : local_uid);
+    mp_copy_text(me.name, sizeof(me.name), local_look.name, MP_NAME_MAX);
+    me.color = (mp_u16)local_look.colors[0];
+    map_stage(play, me.stage);
+    me.pos[0] = link->current.pos.x;
+    me.pos[1] = link->current.pos.y;
+    me.pos[2] = link->current.pos.z;
+    me.heading = link->shape_angle.y;
+    me.flags = local_sea_known ? MP_DIR_SEA : 0;
+    me.sea[0] = local_sea[0];
+    me.sea[1] = local_sea[1];
+    map_put(&o, "stage=");
+    map_put_name(&o, me.stage, STAGE_NAME_BYTES);
+    map_put(&o, "\nrupees=");
+    map_put_uint(&o, map_rupees());
+    map_put(&o, "\nstep=");
+    map_put_uint(&o, (u32)wwhd_logic_step());
+    map_put(&o, directory_valid ? "\ndirectory=1\n" : "\ndirectory=0\n");
+    map_put_entry(&o, "me=", &me);
+    if (state == READY && directory_valid) {
+        for (mp_u32 i = 0; i != directory.count; ++i)
+            if (directory.entry[i].id != directory.self) map_put_entry(&o, "player=", &directory.entry[i]);
+    } else if (state == READY) {
+        for (int i = 0; i != MAX_REMOTES; ++i) {
+            const remote_player* r = &remotes[i];
+            if (!r->active || !r->has_transform) continue;
+            mp_player_look look = r->has_look ? r->look : mp_player_look_default();
+            mp_dir_entry e;
+            e.id = r->uid;
+            mp_copy_text(e.name, sizeof(e.name), look.name, MP_NAME_MAX);
+            e.color = (mp_u16)look.colors[0];
+            for (int k = 0; k != STAGE_NAME_BYTES + 1; ++k) e.stage[k] = me.stage[k];
+            e.pos[0] = r->transform.pos[0];
+            e.pos[1] = r->transform.pos[1];
+            e.pos[2] = r->transform.pos[2];
+            e.heading = r->transform.rot[1];
+            e.flags = 0;
+            e.sea[0] = e.sea[1] = 0.0f;
+            map_put_entry(&o, "player=", &e);
+        }
+    }
+    if (teleport_result_id) {
+        map_put(&o, "teleport=");
+        map_put_uint(&o, teleport_result_id);
+        map_put(&o, "|");
+        map_put(&o, teleport_result);
+        map_put(&o, "\n");
+    }
+    map_put(&o, "spoils=");
+    for (u32 i = 0; i != SHOP_SPOILS; ++i) {
+        s32 n = shop_spoils(play, i);
+        map_put_int(&o, n < 0 ? 0 : n);
+        map_put(&o, i + 1 == SHOP_SPOILS ? "\n" : ",");
+    }
+    if (shop_result_id) {
+        map_put(&o, "shop=");
+        map_put_uint(&o, shop_result_id);
+        map_put(&o, "|");
+        map_put(&o, shop_result);
+        map_put(&o, "\n");
+    }
+    wwhd_file_write("players.txt", map_text, o.size);
+}
+
 static void stop_remote_views(void) {
+    sv_close();
+    el_reset();
     as_session = 0;
     as_reset_network();
     hide_markers();
@@ -810,6 +1615,7 @@ static void multiplayer_connection_step(void* link) {
     }
     double dt = wwhd_logic_dt();
     refresh_launcher_settings((const daPy_lk_c*)link, dt);
+    map_step(link, dt); /* the launcher's map and its teleport requests */
     outfit_local_step((u32)link); /* the chosen clothes, with or without a server */
     anim_capture = state == READY && local_uid != MP_NO_ID;
     if (!anim_capture) mp_anim_events_clear(&anim_local);
@@ -835,6 +1641,9 @@ static void multiplayer_connection_step(void* link) {
         if (state == FAILED) return;
     }
     if (state != READY) return;
+    sv_step(wwhd_play_get());
+    wd_step(wwhd_play_get());
+    el_update_crowns(wwhd_play_get());
 
     mp_transform now;
     read_transform((const fopAc_ac_c*)link, &now);
@@ -889,8 +1698,15 @@ WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_
 /* daPy_Execute (0240EBB0): a puppet only runs its visual update; any other Link runs the game's
  * execute, then the multiplayer step (an entry hook before puppets existed). */
 WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_this)) {
-    if (puppet_is(i_this)) return puppet_execute(i_this);
+    int skin = skin_enter((u32)i_this); /* its models from its skin (skin.h) */
+    if (puppet_is(i_this)) {
+        s32 result = puppet_execute(i_this);
+        skin_leave(skin);
+        return result;
+    }
+    el_link_step(i_this); /* an electric elite's shock, given in Link's own execute (elite.h) */
     s32 result = daPy_Execute_original(i_this);
+    skin_leave(skin);
     multiplayer_connection_step(i_this);
     return result;
 }

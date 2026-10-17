@@ -187,10 +187,13 @@ static mp_u32 build_actor_init(mp_u8* out, mp_u32 capacity) {
     mp_write_string(&w, "ActorBaseSync");
     mp_write_string(&w, "ActorPlayerSync");
     mp_write_string(&w, "ActorFilter");
-    mp_write_vlq(&w, 6);
+    mp_write_vlq(&w, 9);
     mp_write_string(&w, "Bk");
     mp_write_string(&w, "#enemy_multiplier=4");
     mp_write_string(&w, "#enemy_randomizer=1");
+    mp_write_string(&w, "#dynamic_scaling=1");
+    mp_write_string(&w, "#elite_chance=12");
+    mp_write_string(&w, "#elite_chance=x"); /* malformed: 0, then the next one wins again below */
     mp_write_string(&w, "Fmastr1");
     mp_write_string(&w, "NotAnActorName");
     mp_write_string(&w, "kotubo");
@@ -212,9 +215,24 @@ static void test_placed_actors(void) {
         assert(mp_read_mutators(mutators, sizeof(mutators), &m, &random) && m == 6 && random == 1);
         assert(mp_read_mutators(too_many, sizeof(too_many), &m, &random) && m == MP_MULTIPLIER_MAX && !random);
         assert(!mp_read_mutators(cut, sizeof(cut), &m, &random));
+        /* 0.2.47: scaling and elite chance after the randomizer; an older body leaves them 0 */
+        static const mp_u8 ext[] = {0x83, 0x00, 0x01, 0x0A}, big[] = {0x81, 0x01, 0x00, 0xFF},
+                           half[] = {0x81, 0x01, 0x01};
+        int scaling = 7;
+        mp_u32 elite = 7;
+        assert(mp_read_mutators_ex(mutators, sizeof(mutators), &m, &random, &scaling, &elite) && m == 6 &&
+               random == 1 && scaling == 0 && elite == 0);
+        assert(mp_read_mutators_ex(ext, sizeof(ext), &m, &random, &scaling, &elite) && m == 3 && !random &&
+               scaling == 1 && elite == 10);
+        assert(mp_read_mutators_ex(big, sizeof(big), &m, &random, &scaling, &elite) && elite == MP_ELITE_CHANCE_MAX &&
+               scaling == 0);
+        assert(!mp_read_mutators_ex(half, sizeof(half), &m, &random, &scaling, &elite));
+        assert(mp_read_mutators(ext, sizeof(ext), &m, &random) && m == 3);
     }
     assert(s.factories_complete && s.factory_count == 4); /* Default, Bk, Spawned, Pl */
     assert(s.enemy_multiplier == 4 && s.enemy_randomizer == 1 && s.filter_count == 3);
+    assert(s.dynamic_scaling == 1 && s.elite_chance == 0); /* the malformed last entry reset it */
+    assert(!mp_filter_contains(&s, "#dynamic") && !mp_filter_contains(&s, "#elite_c"));
     assert(mp_filter_contains(&s, "Bk") && mp_filter_contains(&s, "Fmastr1") && mp_filter_contains(&s, "kotubo"));
     assert(!mp_filter_contains(&s, "B") && !mp_filter_contains(&s, "Bkk") && !mp_filter_contains(&s, "#enemy_m"));
     mp_u32 bk = mp_find_factory(&s, "Bk"), def = mp_find_factory(&s, "Default"), pl = mp_find_factory(&s, "Pl");
@@ -266,6 +284,27 @@ static void test_placed_actors(void) {
     mp_write_actor_update(&w, &s.factories[bk], 7, 3, &hurt);
     static const mp_u8 update[] = {0x87, 0x03, 0x81, 0x81, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00};
     expect_bytes(&w, update, sizeof(update));
+
+    /* WWHD: the owner's elite draw in the health short's high byte (mp_health_word) */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_actor_values tagged = {.has_health = 1, .health = 12, .tag = 0x4D, .status = 0};
+    mp_write_actor_update(&w, &s.factories[bk], 7, 3, &tagged);
+    static const mp_u8 tagged_update[] = {0x87, 0x03, 0x81, 0x81, 0x4D, 0x0C, 0x00, 0x00, 0x00, 0x00};
+    expect_bytes(&w, tagged_update, sizeof(tagged_update));
+    {
+        mp_s16 h;
+        mp_u8 t;
+        mp_health_split(0x4D0C, &h, &t);
+        assert(h == 12 && t == 0x4D);
+        mp_health_split(0x40FE, &h, &t); /* dying, tagged: -2 */
+        assert(h == -2 && t == 0x40);
+        mp_health_split(0xFFFF, &h, &t); /* an untagged -1 (older clients, the GameCube one) */
+        assert(h == -1 && t == 0);
+        mp_health_split(0x0007, &h, &t);
+        assert(h == 7 && t == 0);
+        assert(mp_health_word(-1, 0) == 0xFFFF && mp_health_word(-3, 0x41) == 0x41FD);
+        assert(mp_health_word(5, 0xFF) == 0x0005); /* never a tag that reads as a sign */
+    }
 
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_actor_create(&w, &s.factories[pl], 0, uid, 1, "Pl", &v);
@@ -597,6 +636,7 @@ static void test_launcher_cfg(void) {
         "puppet=1\n"
         "name = Captain Tetra \n"
         "hide_names=1\n"
+        "hide_hud=1\n"
         "outfit=casual\n"
         "skin=miku_2\n"
         "unknown=whatever\n"
@@ -613,6 +653,7 @@ static void test_launcher_cfg(void) {
     assert(cfg.has_puppet && cfg.puppet == 1);
     assert(cfg.has_name && strcmp(cfg.name, "Captain Tetra") == 0);
     assert(cfg.has_hide_names && cfg.hide_names == 1);
+    assert(cfg.has_hide_hud && cfg.hide_hud == 1);
     assert(cfg.has_outfit && cfg.outfit == 1);
     assert(mp_parse_launcher_cfg("outfit=hero", 11, &cfg) && cfg.has_outfit && cfg.outfit == 0);
     assert(mp_parse_launcher_cfg("outfit=auto\n", 12, &cfg) && cfg.has_outfit && cfg.outfit == -1);
@@ -625,10 +666,10 @@ static void test_launcher_cfg(void) {
     /* malformed values are dropped one by one, the rest still applies */
     static const char bad[] =
         "uid=short\nport=70000\ncolor=12345G\ncolor2=#ABCDEF\npuppet=yes\nhost=\nport=abc\n"
-        "name=SeventeenLetters!\nhide_names=yes\noutfit=pyjama\n";
+        "name=SeventeenLetters!\nhide_names=yes\noutfit=pyjama\nhide_hud=2\n";
     assert(mp_parse_launcher_cfg(bad, sizeof(bad) - 1, &cfg));
     assert(!cfg.has_uid && !cfg.has_port && !cfg.has_color && !cfg.has_puppet && !cfg.has_host);
-    assert(!cfg.has_name && !cfg.has_hide_names && !cfg.has_outfit);
+    assert(!cfg.has_name && !cfg.has_hide_names && !cfg.has_outfit && !cfg.has_hide_hud);
     assert(cfg.has_color2 && cfg.color2 == 0xABCDEF);
 
     /* a last line without newline, an empty file, an oversized file */
@@ -1010,6 +1051,204 @@ static void test_swings(void) {
     assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.events.swing_count == 0);
 }
 
+/* The player directory (WWHD extension): a client's entry, the server's list. */
+static void test_directory(void) {
+    mp_dir_entry a = {.id = 0, .color = 0xF800, .point = 2, .start_room = 44, .layer = -1, .room = 44,
+                      .pos = {1.5f, -2.0f, 300000.0f}, .heading = -16384, .flags = MP_DIR_SEA, .sea = {10.0f, -20.0f}};
+    mp_copy_text(a.name, sizeof(a.name), "Tetra", 5);
+    mp_copy_text(a.stage, sizeof(a.stage), "sea", 3);
+    char shortened[MP_NAME_MAX + 1];
+    mp_copy_text(shortened, sizeof(shortened), "Tet\0ra", 6); /* stops at a NUL */
+    assert(strcmp(shortened, "Tet") == 0 && shortened[MP_NAME_MAX] == 0);
+    mp_dir_entry b = a;
+    b.flags = 0;
+    mp_copy_text(b.name, sizeof(b.name), "Medli", 5);
+    mp_copy_text(b.stage, sizeof(b.stage), "M_Dra09", 7);
+    b.point = 0; b.start_room = 0; b.layer = 3; b.room = 9;
+
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_dir_entry(&w, &a);
+    static const mp_u8 entry_bytes[] = {
+        'T', 'e', 't', 'r', 'a', 0, 0xF8, 0x00, 's', 'e', 'a', 0, 0x00, 0x02, 44, 0xFF, 44,
+        0x3F, 0xC0, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x48, 0x92, 0x7C, 0x00, 0xC0, 0x00, 0x01,
+        0x41, 0x20, 0x00, 0x00, 0xC1, 0xA0, 0x00, 0x00};
+    expect_bytes(&w, entry_bytes, sizeof(entry_bytes));
+
+    /* the server's answer: receiver id 7, two players */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 7);
+    mp_write_vlq(&w, 2);
+    mp_write_vlq(&w, 7);
+    mp_write_dir_entry(&w, &a);
+    mp_write_vlq(&w, 300);
+    mp_write_dir_entry(&w, &b);
+    static mp_directory d;
+    assert(mp_read_directory(w.data, w.size, &d));
+    assert(d.self == 7 && d.count == 2 && d.entry[0].id == 7 && d.entry[1].id == 300);
+    assert(strcmp(d.entry[0].name, "Tetra") == 0 && strcmp(d.entry[0].stage, "sea") == 0);
+    assert(d.entry[0].point == 2 && d.entry[0].start_room == 44 && d.entry[0].layer == -1);
+    assert(d.entry[0].pos[2] == 300000.0f && d.entry[0].heading == -16384 && d.entry[0].sea[1] == -20.0f);
+    assert(strcmp(d.entry[1].stage, "M_Dra09") == 0 && d.entry[1].flags == 0 && d.entry[1].sea[0] == 0.0f);
+    assert(d.entry[1].room == 9 && d.entry[1].layer == 3);
+    /* any cut, trailing bytes or an unknown flag is refused */
+    for (mp_u32 cut = 0; cut != w.size; ++cut) assert(!mp_read_directory(w.data, cut, &d));
+    mp_u8 longer[512];
+    memcpy(longer, w.data, w.size);
+    longer[w.size] = 0;
+    assert(!mp_read_directory(longer, w.size + 1, &d));
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_dir_entry bad = b;
+    mp_write_dir_entry(&w, &bad);
+    w.data[w.size - 1] = 0x02; /* the flags byte (no sea place follows) */
+    assert(!mp_read_directory(w.data, w.size, &d));
+    /* more players than kept: read through, the first MP_DIR_MAX kept */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, MP_DIR_MAX + 2);
+    for (mp_u32 i = 0; i != MP_DIR_MAX + 2; ++i) { mp_write_vlq(&w, i); mp_write_dir_entry(&w, &b); }
+    assert(w.ok && mp_read_directory(w.data, w.size, &d) && d.count == MP_DIR_MAX && d.entry[MP_DIR_MAX - 1].id == MP_DIR_MAX - 1);
+    /* the names map by name from the init list */
+    mp_session s = parsed_session();
+    assert(s.server_player_directory == MP_NO_ID && s.client_player_directory == MP_NO_ID);
+}
+
+/* The save sync (SaveServer): the map of the server's WWSave (captured from the Java server, 120
+ * runs), its elements, the update codecs and the world packet. */
+static const mp_u8 k_save_map[] = {1, 8, 0, 16, 3, 8, 4, 8, 1, 8, 6, 8, 6, 0, 0, 25, 7, 21, 1, 2, 0, 40, 2, 4, 0, 48, 2, 64, 0, 84, 1, 4, 6, 17, 6, 0, 6, 17, 6, 0, 6, 17, 6, 0, 6, 17, 6, 0, 0, 12, 5, 12, 1, 2, 0, 2, 1, 8, 0, 104, 1, 8, 0, 104, 1, 8, 0, 104, 1, 8, 0, 108, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 2, 4, 7, 16, 2, 4, 7, 8, 0, 4, 1, 100, 7, 255, 7, 1, 0, 84};
+
+static void test_save_sync(void) {
+    mp_session s;
+    memset(&s, 0, sizeof(s));
+    /* the initializer as SaveServer.writeClientInit writes it */
+    mp_u8 init[600];
+    mp_writer w = mp_writer_make(init, sizeof(init));
+    mp_write_vlq(&w, (mp_u32)(sizeof(k_save_map) / 2));
+    for (mp_u32 i = 0; i != sizeof(k_save_map); ++i) mp_write_u8(&w, k_save_map[i]);
+    mp_reader r = mp_reader_make(init, w.size);
+    assert(mp_skip_initializer(&r, "SaveServer", 10, &s) && r.pos == w.size && s.save_map_count == 120);
+    static mp_save_element e[2048];
+    mp_u32 n = mp_save_elements(&s, e, 2048);
+    assert(n);
+    /* the whole dSv_save_c, in order, without gaps */
+    mp_u32 at = 0;
+    for (mp_u32 i = 0; i != n; ++i) { assert(e[i].offset == at); at += e[i].size; }
+    assert(at == MP_SAVE_BYTES);
+    /* landmarks of d_save.h: maxLife a short at 0, the return place's name (string, 8) at 0x30,
+     * the items (bytes) at 0x3C, the item flags (bits) at 0x51, the player name at 0x15C,
+     * the first stage memory's tbox (int) at 0x380, the events (bits) at 0x624 */
+    mp_u32 i = 0;
+    while (e[i].offset != 0x30) ++i;
+    assert(e[i].type == MP_SAVE_STRING && e[i].size == 8 && e[i + 1].offset == 0x38);
+    while (e[i].offset != 0x3C) ++i;
+    assert(e[i].type == 0 && e[i].size == 1);
+    while (e[i].offset != 0x51) ++i;
+    assert(e[i].type == 7);
+    while (e[i].offset != 0x15C) ++i;
+    assert(e[i].type == MP_SAVE_STRING && e[i].size == 17);
+    while (e[i].offset != 0x380) ++i;
+    assert(e[i].type == 2 && e[i].size == 4);
+    while (e[i].offset != 0x624) ++i;
+    assert(e[i].type == 7 && e[n - 1].offset == MP_SAVE_BYTES - 1);
+    assert(e[0].type == 1 && e[0].size == 2);
+    /* a map too long for the buffer, or with an unknown type, is refused */
+    assert(mp_save_elements(&s, e, 10) == 0);
+    mp_session bad = s;
+    bad.save_map_type[0] = 9;
+    assert(mp_save_elements(&bad, e, 2048) == 0);
+    bad = s;
+    bad.save_map_length[0] = 7; /* not whole shorts */
+    assert(mp_save_elements(&bad, e, 2048) == 0);
+
+    /* CLIENT_SAVE_UPDATE: maxLife 12 (a short), a string "sea" in its 8 bytes, VLQ offsets */
+    mp_u8 save[MP_SAVE_BYTES];
+    memset(save, 0, sizeof(save));
+    save[0] = 0x00; save[1] = 0x0C;
+    memcpy(save + 0x30, "sea", 4);
+    n = mp_save_elements(&s, e, 2048);
+    mp_u32 name_index = 0;
+    while (e[name_index].offset != 0x30) ++name_index;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 2);
+    mp_write_save_element(&w, &e[0], save + e[0].offset);
+    mp_write_save_element(&w, &e[name_index], save + 0x30);
+    static const mp_u8 update[] = {0x82, 0x80, 0x00, 0x0C, 0xB0, 's', 'e', 'a', 0x00};
+    expect_bytes(&w, update, sizeof(update));
+    /* a string without its NUL in its room is cut to room - 1 */
+    memcpy(save + 0x30, "ABCDEFGH", 8);
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_save_element(&w, &e[name_index], save + 0x30);
+    assert(w.size == 1 + 8 && w.data[8] == 0 && w.data[7] == 'G');
+
+    /* SERVER_SAVE_UPDATE: offset 0x624 (VLQ 0x8C 0x24... in the protocol's order), length 1 */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 2);
+    mp_write_vlq(&w, 0x624); mp_write_vlq(&w, 1); mp_write_u8(&w, 0x40);
+    mp_write_vlq(&w, 0); mp_write_vlq(&w, 2); mp_write_u8(&w, 0x00); mp_write_u8(&w, 0x10);
+    r = mp_reader_make(w.data, w.size);
+    assert(mp_read_save_count(&r) == 2);
+    mp_u32 off, len;
+    const mp_u8* bytes;
+    assert(mp_read_save_entry(&r, &off, &len, &bytes) && off == 0x624 && len == 1 && bytes[0] == 0x40);
+    assert(mp_read_save_entry(&r, &off, &len, &bytes) && off == 0 && len == 2 && bytes[1] == 0x10);
+    assert(r.ok && r.pos == r.size);
+    /* past the save, or past the packet, is refused */
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, MP_SAVE_BYTES - 1); mp_write_vlq(&w, 2); mp_write_u8(&w, 1); mp_write_u8(&w, 2);
+    r = mp_reader_make(w.data, w.size);
+    mp_read_save_count(&r);
+    assert(!mp_read_save_entry(&r, &off, &len, &bytes) && !r.ok);
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 4); mp_write_vlq(&w, 3); mp_write_u8(&w, 1);
+    r = mp_reader_make(w.data, w.size);
+    mp_read_save_count(&r);
+    assert(!mp_read_save_entry(&r, &off, &len, &bytes));
+
+    /* SERVER_SAVE_FROM */
+    static const mp_u8 from[] = {'M', 'e', 'd', 'l', 'i', 0};
+    char who[MP_NAME_MAX + 1];
+    assert(mp_read_save_from(from, sizeof(from), who) && strcmp(who, "Medli") == 0);
+    assert(!mp_read_save_from(from, sizeof(from) - 1, who));
+
+    /* SERVER_WORLD: time and weather, explicit; 90 degrees (6 h), day 3, rain */
+    static const mp_u8 world[] = {0x07, 0x42, 0xB4, 0x00, 0x00, 0x00, 0x03, 0x03};
+    mp_world wd;
+    assert(mp_read_world(world, sizeof(world), &wd) && wd.flags == 7 && wd.time == 90.0f && wd.day == 3 && wd.weather == 3);
+    for (mp_u32 cut = 0; cut != sizeof(world); ++cut) assert(!mp_read_world(world, cut, &wd));
+    mp_u8 storm[sizeof(world)];
+    memcpy(storm, world, sizeof(world));
+    storm[7] = 6;
+    assert(!mp_read_world(storm, sizeof(storm), &wd)); /* no weather 6 */
+    memcpy(storm, world, sizeof(world));
+    storm[1] = 0x43; storm[2] = 0xB4; /* 360 degrees */
+    assert(!mp_read_world(storm, sizeof(storm), &wd));
+
+    /* the names map by name from the init list; an init without them leaves them unset */
+    mp_session p = parsed_session();
+    assert(p.server_save_update == MP_NO_ID && p.client_save_merge == MP_NO_ID && p.server_world == MP_NO_ID);
+}
+
+/* The launcher's shop: a creature bought for another player (CLIENT_PLAYER_SUMMON) and the one
+ * received (SERVER_PLAYER_SUMMON, WWClient.receiveSummon). */
+static void test_summon(void) {
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_summon_request(&w, 300, 4, "Tetra");
+    static const mp_u8 request[] = {0x02, 0xAC, 0x04, /* VLQ 300: the protocol's order */ 'T', 'e', 't', 'r', 'a', 0};
+    expect_bytes(&w, request, sizeof(request));
+    static const mp_u8 answer[] = {0x05, 'M', 'e', 'd', 'l', 'i', 0};
+    mp_u8 creature = 0xFF;
+    char buyer[MP_NAME_MAX + 1];
+    assert(mp_read_summon(answer, sizeof(answer), &creature, buyer) && creature == 5 && strcmp(buyer, "Medli") == 0);
+    for (mp_u32 cut = 0; cut != sizeof(answer); ++cut) assert(!mp_read_summon(answer, cut, &creature, buyer));
+    mp_u8 longer[sizeof(answer) + 1];
+    memcpy(longer, answer, sizeof(answer));
+    longer[sizeof(answer)] = 0;
+    assert(!mp_read_summon(longer, sizeof(longer), &creature, buyer)); /* trailing byte */
+    mp_u8 unknown[] = {MP_SUMMON_CREATURES, 'A', 0};
+    assert(!mp_read_summon(unknown, sizeof(unknown), &creature, buyer)); /* no such creature */
+    mp_session s = parsed_session(); /* an init without them: not available */
+    assert(s.server_player_summon == MP_NO_ID && s.client_player_summon == MP_NO_ID);
+}
+
 /* The skin (WWHD extension after the particles): a string, kept only when it is a valid id. */
 static void test_skin(void) {
     mp_session s = parsed_session();
@@ -1178,10 +1417,46 @@ static void test_strikes(void) {
     mp_read_particles(&plain, &back);
     assert(plain.ok && back.particle[1].matrix[0] == 1.0f && back.particle[1].matrix[1] == 0.0f &&
            back.particle[1].matrix[4] == 1.0f); /* identity without the flag */
-    mp_u8 bad[] = {0x01, 0x00, 0x00, 0x10, 0x08};
+    mp_u8 bad[] = {0x01, 0x00, 0x00, 0x10, 0x40};
     mp_reader br = mp_reader_make(bad, sizeof(bad));
     mp_read_particles(&br, &back);
     assert(!br.ok); /* an unknown flag is malformed */
+
+    /* a followed emitter (0.2.41): key after the alpha, then the colours; a stop needs the key */
+    mp_particle charge = {.group = 1, .id = 0x0219, .flags = MP_PARTICLE_FOLLOW | MP_PARTICLE_COLOR,
+                          .pos = {1, 2, 3}, .alpha = 0xFF, .key = 7,
+                          .prm = {0xDC, 0xB4, 0x50, 0xFF}, .env = {0x78, 0x78, 0x00, 0xFF}};
+    mp_anim_events pf;
+    mp_anim_events_clear(&pf);
+    pf.particle[mp_particle_slot(&pf)] = charge;
+    mp_particle stop = charge;
+    stop.flags = MP_PARTICLE_FOLLOW | MP_PARTICLE_STOP;
+    pf.particle[mp_particle_slot(&pf)] = stop;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_particles(&w, &pf);
+    static const mp_u8 follow_bytes[] = {
+        0x02,
+        0x01, 0x02, 0x19, 0x28, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+        0xFF, 0x07, 0xDC, 0xB4, 0x50, 0xFF, 0x78, 0x78, 0x00, 0xFF,
+        0x01, 0x02, 0x19, 0x18, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00,
+        0xFF, 0x07,
+    };
+    expect_bytes(&w, follow_bytes, sizeof(follow_bytes));
+    mp_reader fr = mp_reader_make(w.data, w.size);
+    mp_read_particles(&fr, &back);
+    assert(fr.ok && fr.pos == w.size && back.particle_count == 2);
+    assert(back.particle[0].key == 7 && back.particle[0].prm[0] == 0xDC && back.particle[0].env[2] == 0x00);
+    assert(back.particle[1].flags == (MP_PARTICLE_FOLLOW | MP_PARTICLE_STOP) && back.particle[1].key == 7);
+    assert(back.particle[1].prm[0] == 0xFF); /* no colours: white */
+    for (mp_u32 cut = 1; cut != w.size; ++cut) {
+        mp_reader tr = mp_reader_make(w.data, cut);
+        mp_read_particles(&tr, &back);
+        assert(!tr.ok);
+    }
+    mp_u8 lone_stop[] = {0x01, 0x00, 0x00, 0x10, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF};
+    mp_reader sr = mp_reader_make(lone_stop, sizeof(lone_stop));
+    mp_read_particles(&sr, &back);
+    assert(!sr.ok); /* a stop without a key */
 
     /* bounded: the newest survives in the last slot; append keeps them */
     mp_anim_events many;
@@ -1253,6 +1528,17 @@ static void test_tunic_colors(void) {
     assert(!tc_recolor_rgb(&red_blue, TC_BOAT_RED, &out)); /* and the tunic rule ignores the boat */
     assert(!tc_recolor_rgb(&red_blue, 0x2040C0, &out) && out == 0x123456);
 
+    /* the head's lighting ramp (toonEX) goes grey at the same brightness, never to the paint */
+    tc_palette boat_grey = tc_palette_make_boat_neutral();
+    assert(tc_recolor_rgb(&boat_grey, 0xFF0000, &out) && out == 0xFFFFFF);
+    assert(tc_recolor_rgb(&boat_grey, 0x800000, &out) && out == 0x808080);
+    assert(tc_recolor_rgb(&boat_grey, 0xC87828, &out) && out == 0xC8C8C8);
+    assert(!tc_recolor_rgb(&boat_grey, TC_LINK_GREEN, &out));
+    int in = 0;
+    assert(tc_ramp_endpoint(&boat_blue, 0xFF0000, &in) && in);         /* full red: ramp */
+    assert(!tc_ramp_endpoint(&boat_blue, TC_BOAT_RED, &in) && in);     /* painted texture */
+    assert(!tc_ramp_endpoint(&boat_blue, 0x808080, &in) && !in);       /* not paint */
+
     /* RGB565 rounding: 0x0DBD2F -> r 2, g 47, b 6 */
     assert(tc_888_to_565(TC_LINK_GREEN) == 0x15E6 && tc_888_to_565(0xFFFFFF) == 0xFFFF);
     assert(tc_565_to_888(0xF800) == 0xFF0000);
@@ -1320,6 +1606,9 @@ int main(void) {
     test_swings();
     test_strikes();
     test_skin();
+    test_directory();
+    test_summon();
+    test_save_sync();
     test_tunic_colors();
     test_placed_actors();
     puts("mp_protocol_test: ok");

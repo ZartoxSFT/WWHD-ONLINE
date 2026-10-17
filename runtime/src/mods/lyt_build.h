@@ -34,6 +34,10 @@ Bytes tile_rgba8(const Bytes& rgba, uint32_t w, uint32_t h, int tile_mode, uint3
 // tile "linear", "1d" or "tiled", swizzle 0-7 (tiled only); as the generator writes it. Throws
 // std::runtime_error on bad input.
 Bytes texture(const Bytes& rgba, uint32_t w, uint32_t h, const std::string& format, const std::string& tile, uint32_t swizzle);
+// The texels of a .bflim (the game's or ours) as RGBA8, w x h: formats rgba8, bc1 and bc3, tile modes
+// linear, 1d and tiled with their swizzle, as texture() writes them (the inverse of its addressing).
+// False (and why) for another format or a short image.
+bool read_texture(const Bytes& bflim, uint32_t& w, uint32_t& h, Bytes& rgba, std::string& why);
 // A SARC of the files (names sorted by their hash, data aligned), as the archives above.
 Bytes sarc_of(const std::map<std::string, Bytes>& files, uint32_t align = 0x2000);
 // Data as a Yaz0 stream of literal bytes only (no compression), as the archives above.

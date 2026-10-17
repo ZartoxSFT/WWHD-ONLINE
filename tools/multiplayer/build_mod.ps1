@@ -94,6 +94,18 @@ if (-not $NoCheck) {
         if ($LASTEXITCODE -ne 0) { throw "the game would refuse mod.elf (translation failed, see above)" }
         $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
         Write-Host ("check  : translated, {0} functions, {1} hooks" -f $r.functions, $r.hooks.Count)
+        # every import must be a host service of the runtime (guest_mods.cpp): the module's init
+        # returns null otherwise and the game says "module ABI does not match" (0.2.33: __fixsfdi,
+        # the compiler's helper for a float to 64-bit integer conversion)
+        $hostSource = Get-Content -LiteralPath (Join-Path $repo "runtime\src\mods\guest_mods.cpp") -Raw
+        $hostServices = [regex]::Matches($hostSource, '\{"([A-Za-z_0-9]+)",\s*svc_') | ForEach-Object { $_.Groups[1].Value }
+        $imports = [regex]::Match((Get-Content -LiteralPath $out -Raw), 'k_services\[\] = \{([^}]*)\}')
+        if ($imports.Success) {
+            $missing = [regex]::Matches($imports.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } |
+                Where-Object { $hostServices -notcontains $_ }
+            if ($missing) { throw ("mod.elf imports what the game does not provide: " + ($missing -join ", ")) }
+            Write-Host "check  : every import is a host service"
+        }
     } else {
         Write-Host "check  : skipped (no Python)"
     }

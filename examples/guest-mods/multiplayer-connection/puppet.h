@@ -45,6 +45,7 @@
 #include "outfit.h"
 #include "anim_sync.h"
 #include "tunic.h"
+#include "skin.h"
 
 #define PUPPET_MAX 4
 #define PUPPET_RETRIES 3
@@ -121,6 +122,7 @@ typedef struct puppet_slot {
     mp_u16 remote_item;      /* the owner's mEquipItem (ActorPlayerSync item) */
     mp_u8 remote_extras;     /* MP_EXTRA_* */
     mp_u16 shown_item;       /* the item the puppet holds now (PUPPET_ITEM_NONE: nothing) */
+    char skin[MP_SKIN_MAX + 1]; /* the owner's skin (skin.h), "" for Link */
 } puppet_slot;
 
 static int puppet_enabled;
@@ -160,25 +162,55 @@ static u32 puppet_shared_model_data(void) {
 
 /* ------------------------------------------------------------------ creation phases */
 
+/* A puppet's skin: the one of the slot that requested it (fopAcM_create gave the slot the id
+ * the actor carries), when it is loaded; else Link (it loads at the next scene load). Returns 0. */
+static int puppet_skin_create(void* i_this) {
+    if (skin_bound((u32)i_this)) return 0;
+    u32 id = *(const volatile u32*)((const u8*)i_this + SKIN_PROC_ID);
+    const char* skin = "";
+    for (int i = 0; i != PUPPET_MAX; ++i)
+        if (puppet_slots[i].used && puppet_slots[i].proc == id) skin = puppet_slots[i].skin;
+    skin_bind((u32)i_this, skin_want(skin));
+    return 0;
+}
+
 WWHD_REPLACE(0x0240EE2C, s32, puppet_phase_1, (void* i_this)) {
-    if (!puppet_is(i_this)) return puppet_phase_1_original(i_this);
+    if (!puppet_is(i_this)) {
+        if (skin_local_create((u32)i_this)) return cPhs_INIT; /* its skin is loading */
+        int skin = skin_enter((u32)i_this);
+        s32 result = puppet_phase_1_original(i_this);
+        skin_leave(skin);
+        return result;
+    }
     u8* play = wwhd_play_get();
     if (!play) return cPhs_INIT;
+    if (puppet_skin_create(i_this)) return cPhs_INIT;
     u8 registry[PUPPET_REGISTRY_BYTES];
     memcpy(registry, play + WWHD_PLAY_PLAYER_OFFSET, sizeof(registry));
+    int skin = skin_enter((u32)i_this);
     s32 result = puppet_phase_1_original(i_this);
+    skin_leave(skin);
     memcpy(play + WWHD_PLAY_PLAYER_OFFSET, registry, sizeof(registry));
     *(volatile u32*)((u8*)i_this + ACTOR_ATTENTION_FLAGS) = 0;
     return result;
 }
 
 WWHD_REPLACE(0x02412884, s32, puppet_phase_2, (void* i_this)) {
-    if (!puppet_is(i_this)) return puppet_phase_2_original(i_this);
+    int skin = skin_enter((u32)i_this); /* its model from its skin (skin.h) */
+    if (!puppet_is(i_this)) {
+        s32 result = puppet_phase_2_original(i_this);
+        skin_leave(skin);
+        return result;
+    }
     u32 shared = puppet_shared_model_data();
-    if (!puppet_texture_table(shared, 1)) return cPhs_INIT; /* wait for the local Link */
+    if (!puppet_texture_table(shared, 1)) { /* wait for the local Link */
+        skin_leave(skin);
+        return cPhs_INIT;
+    }
     ++puppet_init_depth;
     s32 result = puppet_phase_2_original(i_this);
     --puppet_init_depth;
+    skin_leave(skin);
     puppet_texture_table(shared, 0);
     *(volatile u32*)((u8*)i_this + ACTOR_ATTENTION_FLAGS) = 0;
     return result;
@@ -190,17 +222,31 @@ WWHD_REPLACE(0x02543534, s32, puppet_set_start_demo, (u32 self, s32 index)) {
 }
 
 WWHD_REPLACE(0x02413E68, s32, puppet_phase_3, (void* i_this)) {
-    if (!puppet_is(i_this)) return puppet_phase_3_original(i_this);
+    int skin = skin_enter((u32)i_this);
+    if (!puppet_is(i_this)) {
+        s32 result = puppet_phase_3_original(i_this);
+        skin_leave(skin);
+        return result;
+    }
     wwhd_daPy_lk_c__procWait_init(i_this);
+    skin_leave(skin);
     return cPhs_NEXT;
 }
 
 WWHD_REPLACE(0x0240EE28, s32, puppet_delete, (void* i_this)) {
-    if (!puppet_is(i_this)) return puppet_delete_original(i_this);
+    int skin = skin_enter((u32)i_this);
+    if (!puppet_is(i_this)) {
+        s32 result = puppet_delete_original(i_this);
+        skin_leave(skin);
+        skin_unbind((u32)i_this); /* its skin may be unloaded once no Link uses it */
+        return result;
+    }
     u32 shared = ((const daPy_lk_c*)i_this)->mpCLModelData;
     int saved = puppet_texture_table(shared, 1);
     s32 result = puppet_delete_original(i_this);
     if (saved) puppet_texture_table(shared, 0);
+    skin_leave(skin);
+    skin_unbind((u32)i_this);
     for (int i = 0; i != PUPPET_MAX; ++i)
         if (puppet_slots[i].actor == (u32)i_this) {
             puppet_slots[i].actor = 0;
@@ -252,7 +298,12 @@ WWHD_REPLACE(0x027F0E04, u32, puppet_entry_imm, (u32 buffer, u32 packet, u32 ind
 }
 
 WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
-    if (!puppet_is(i_this)) return puppet_draw_original(i_this);
+    if (!puppet_is(i_this)) {
+        int skin = skin_enter((u32)i_this);
+        s32 result = puppet_draw_original(i_this);
+        skin_leave(skin);
+        return result;
+    }
     int slot = puppet_slot_of_actor((u32)i_this);
     if (slot < 0) return 1; /* not followed yet, or an orphan about to delete itself: not drawn */
     u8* play = wwhd_play_get();
@@ -261,14 +312,18 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     volatile u32* list_p1 = (volatile u32*)(play + PLAY_XLU_LIST_P1);
     u32 saved_p0 = *list_p0, saved_p1 = *list_p1;
     puppet_build_packets(slot);
-    /* its clothes first (the local Link's other clothes while it wears them), then its colours */
-    int outfit_swapped = outfit_puppet_begin((puppet_slots[slot].remote_extras & MP_EXTRA_CASUAL) != 0);
-    tunic_swap_begin(slot, ((const daPy_lk_c*)i_this)->mpCLModelData);
+    /* its clothes first (the local Link's other clothes while it wears them), then its colours;
+     * a skinned puppet has its own model data and textures: neither applies */
+    int skinned = skin_of((u32)i_this) >= 0;
+    int outfit_swapped = skinned ? 0 : outfit_puppet_begin((puppet_slots[slot].remote_extras & MP_EXTRA_CASUAL) != 0);
+    if (!skinned) tunic_swap_begin(slot, ((const daPy_lk_c*)i_this)->mpCLModelData);
+    int skin = skin_enter((u32)i_this);
     *list_p0 = *(const volatile u32*)(play + PLAY_OPA_LIST_ZELDA0);
     *list_p1 = *(const volatile u32*)(play + PLAY_XLU_LIST_ZELDA1);
     puppet_drawing = slot;
     s32 result = puppet_draw_original(i_this);
     puppet_drawing = -1;
+    skin_leave(skin);
     *list_p0 = saved_p0;
     *list_p1 = saved_p1;
     tunic_swap_end();
@@ -366,6 +421,27 @@ static f32 puppet_ship_mtx[12] __attribute__((aligned(16)));
 #define PUPPET_NO_RESET_FLG0 0x3B8
 #define PUPPET_HEAVY_BOOTS 0x2000000u
 
+/* Where the others' boomerang is caught and their hookshot's chain starts, as execute computes them
+ * after jointCB1 (d_a_player_main_04.cpp): mBoomerangCatchPos = joint 0 times
+ * l_execute_boomerang_catch (10035B18), mHookshotRootPos = joint 8 (left hand) times
+ * l_execute_hookshot_root (10035B24). The puppet's execute did not: a boomerang copy flew to a
+ * stale point and spun there, a hookshot copy's chain started from nowhere. */
+#define PUPPET_ITEM_HOOKSHOT 0x2F
+#define PUPPET_HOOKSHOT_ROOT 0x72F0 /* daPy_lk_c::mHookshotRootPos (SDK link.h) */
+#define PUPPET_BOOMERANG_CATCH 0x72FC /* daPy_lk_c::mBoomerangCatchPos */
+static void puppet_point(const f32* m, const volatile f32* v, volatile f32* out) {
+    out[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3];
+    out[1] = m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7];
+    out[2] = m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11];
+}
+
+static void puppet_item_points(daPy_lk_c* link) {
+    const f32* root = puppet_anm_mtx(link->mpCLModel, 0);
+    const f32* hand = puppet_anm_mtx(link->mpCLModel, 8);
+    if (root) puppet_point(root, &WWHD_GAME_DATA(0x10035B18, f32), (volatile f32*)((u32)link + PUPPET_BOOMERANG_CATCH));
+    if (hand) puppet_point(hand, &WWHD_GAME_DATA(0x10035B24, f32), (volatile f32*)((u32)link + PUPPET_HOOKSHOT_ROOT));
+}
+
 static int puppet_item_has_model(mp_u16 item) {
     switch (item) {
     case 0x20: case 0x21: case 0x22: case 0x23: case 0x26: case 0x27: case 0x35: case 0x36: case 0x33: case 0x50:
@@ -378,7 +454,8 @@ static int puppet_item_has_model(mp_u16 item) {
 static void puppet_apply_item(void* link, puppet_slot* s) {
     mp_u16 want = s->remote_item;
     if (s->remote_proc == PUPPET_PROC_FAN_SWING) want = PUPPET_ITEM_FAN_SWING;
-    else if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY) want = PUPPET_ITEM_NONE;
+    else if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY &&
+             want != PUPPET_ITEM_HOOKSHOT) want = PUPPET_ITEM_NONE;
     if (want != s->shown_item) {
         daPy_lk_c* l = (daPy_lk_c*)link;
         if (s->shown_item != PUPPET_ITEM_NONE) {
@@ -390,6 +467,9 @@ static void puppet_apply_item(void* link, puppet_slot* s) {
         else if (puppet_item_has_model(want)) wwhd_daPy_lk_c__makeItemType(link);
         else if (want == PUPPET_ITEM_SWORD) wwhd_daPy_lk_c__setSwordModel(link, 1);
         else if (want == PUPPET_ITEM_FAN_FLY) wwhd_daPy_lk_c__setParachuteFanModel(link, 1.0f);
+        /* the hookshot's own model only (makeItemType would also make a hookshot actor working
+         * for player 0, d_a_player_main_01.cpp): its chain is the owner's copy (actor_sync.h) */
+        else if (want == PUPPET_ITEM_HOOKSHOT) wwhd_daPy_lk_c__setHookshotModel(link);
         s->shown_item = want;
     }
     volatile u32* flags = (volatile u32*)((u8*)link + PUPPET_NO_RESET_FLG0);
@@ -488,6 +568,7 @@ static s32 puppet_execute(void* i_this) {
      * the pose of the previous frame, started by every setMoveAnime morph, never ends, and the
      * puppet's run looked like slow motion. */
     if (link->m_old_fdata) wwhd_ext_decOldCounter((void*)link->m_old_fdata);
+    puppet_item_points((daPy_lk_c*)i_this);
     const f32* head = puppet_anm_mtx(link->mpCLModel, CL_JNT_HEAD);
     puppet_follow_head(link->mpKatsuraModel, head);
     puppet_follow_head(link->mpYamuModel, head);
@@ -529,6 +610,7 @@ static puppet_slot* puppet_slot_for(mp_u32 uid, int create) {
     free_slot->remote_item = PUPPET_ITEM_NONE;
     free_slot->remote_extras = 0;
     free_slot->shown_item = PUPPET_ITEM_NONE;
+    for (int k = 0; k != MP_SKIN_MAX + 1; ++k) free_slot->skin[k] = 0;
     mp_anim_events_clear(&free_slot->pending);
     return free_slot;
 }
@@ -561,9 +643,26 @@ static void puppet_set_target(mp_u32 uid, const mp_transform* t) {
 }
 
 /* Remote tunic colours and proc (from ActorPlayerSync), for that player's puppet. */
-static void puppet_set_look(mp_u32 uid, mp_u16 primary, mp_u16 secondary, mp_u32 proc, mp_u16 item, mp_u8 extras) {
+static void puppet_set_look(mp_u32 uid, mp_u16 primary, mp_u16 secondary, mp_u32 proc, mp_u16 item, mp_u8 extras,
+                            const char* skin) {
     puppet_slot* s = puppet_slot_for(uid, 0);
     if (!s) return;
+    skin_note_remote(skin); /* loaded at the next scene load (skin.h) */
+    if (!skin_same_id(s->skin, skin)) {
+        skin_copy_id(s->skin, skin);
+        /* another model already loaded (or back to Link): the puppet is made again from it (one being
+         * created deletes itself as an orphan, puppet_is_orphan); else it stays as it is until the
+         * next area, where the new skin is loaded */
+        int shown = s->actor ? skin_of(s->actor) : SKIN_NONE;
+        if (skin_want(skin) != shown) {
+            if (s->proc != PUPPET_NO_PROC && s->actor != 0) wwhd_fopAcM_delete_id(s->proc);
+            s->actor = 0;
+            s->proc = PUPPET_NO_PROC;
+            s->retries = 0;
+            s->shown_item = PUPPET_ITEM_NONE;
+            wwhd_log_int("multiplayer: a player changed skin, puppet made again, uid", (int)uid);
+        }
+    }
     s->look = tunic_look_make(primary, secondary);
     s->remote_proc = proc;
     s->remote_item = item;

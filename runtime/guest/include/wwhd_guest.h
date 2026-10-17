@@ -170,6 +170,11 @@ u32 wwhd_hud_game_pixels(u32 texture,void* rgba,u32 capacity);
 /* An image handle from this mod's RGBA8 pixels (width*height*4 bytes, top-down), like
  * wwhd_hud_texture; release it with wwhd_hud_release, recreate it after an epoch change. */
 u32 wwhd_hud_image(const void* rgba,u32 width,u32 height);
+/* The game's own item icon of an icon frame (0-54: what the game's itemForSlot 0262F880 gives for an
+ * item number), read from the player's 2D pack, as an image handle; 0 before the game opened its
+ * 2D pack or for a frame it has not. Release it and get it again after an epoch change. Importing
+ * it makes an older host refuse the module at load. */
+u32 wwhd_hud_game_icon(u32 frame);
 /* Changes after full state load; old handles are invalid. Reload PNGs on a change. */
 unsigned long long wwhd_hud_epoch(void);
 

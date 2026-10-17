@@ -76,6 +76,37 @@ int main(int argc, char** argv) {
         too_big = true;
     }
     assert(too_big);
+    // read_texture: the inverse of texture() (the game's item icons, item_icons::game_icon)
+    {
+        const uint32_t w = 128, h = 96;
+        lyt_build::Bytes px(size_t(w) * h * 4);
+        for (size_t i = 0; i < px.size(); i++) px[i] = uint8_t(i * 7 + i / 513);
+        for (const char* tile : {"linear", "1d", "tiled"})
+            for (uint32_t sw : {0u, 3u, 7u}) {
+                if (sw && std::string(tile) != "tiled") continue;
+                const lyt_build::Bytes file = lyt_build::texture(px, w, h, "rgba8", tile, sw);
+                uint32_t rw = 0, rh = 0;
+                lyt_build::Bytes back;
+                std::string why;
+                assert(lyt_build::read_texture(file, rw, rh, back, why) && rw == w && rh == h && back == px);
+            }
+        lyt_build::Bytes flat(size_t(64) * 64 * 4);
+        for (size_t i = 0; i < flat.size(); i += 4) flat[i] = 255, flat[i + 1] = 0, flat[i + 2] = 0, flat[i + 3] = 255;
+        for (const char* fmt : {"bc1", "bc3"}) {
+            const lyt_build::Bytes file = lyt_build::texture(flat, 64, 64, fmt, "tiled", 2);
+            uint32_t rw = 0, rh = 0;
+            lyt_build::Bytes back;
+            std::string why;
+            assert(lyt_build::read_texture(file, rw, rh, back, why) && rw == 64 && rh == 64 && back == flat);
+        }
+        uint32_t rw, rh;
+        lyt_build::Bytes back;
+        std::string why;
+        assert(!lyt_build::read_texture(lyt_build::Bytes(16, 0), rw, rh, back, why));
+        lyt_build::Bytes cut = lyt_build::texture(px, w, h, "rgba8", "tiled", 0);
+        cut.erase(cut.begin(), cut.begin() + 4096);  // the footer kept, the image short
+        assert(!lyt_build::read_texture(cut, rw, rh, back, why));
+    }
     printf("lyt_build_test: ok\n");
     return 0;
 }

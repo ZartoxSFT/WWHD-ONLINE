@@ -474,9 +474,17 @@ void set_items(const std::vector<Item>& items, const std::filesystem::path& cach
     g_items = items, g_cache = cache_dir, g_built.clear(), g_served = false;
 }
 
+std::string g_game_pack;                             // the 2D pack the game opened (game_icon)
+std::map<std::string, Bytes> g_game_icons;           // its BtnItemIcon_00 files, read once
+bool g_game_icons_read = false;
+
 std::string pack_for(const std::string& guest, const std::string& host_path) {
     if (!is_2d_pack(guest)) return "";
     std::lock_guard lock(g_mu);
+    if (g_game_pack.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(host_path, ec)) g_game_pack = host_path;
+    }
     if (g_items.empty() || g_cache.empty()) return "";
     std::error_code exists_ec;
     if (!std::filesystem::is_regular_file(host_path, exists_ec)) return "";  // the game also asks for packs that aren't there
@@ -520,6 +528,34 @@ std::string pack_for(const std::string& guest, const std::string& host_path) {
         result.clear();
     }
     return result;
+}
+
+bool game_icon(int n, Bytes& rgba, uint32_t& w, uint32_t& h) {
+    std::lock_guard lock(g_mu);
+    if (n < 0 || n >= kGameFrames || g_game_pack.empty()) return false;
+    if (!g_game_icons_read) {
+        g_game_icons_read = true;
+        try {
+            Bytes pack;
+            if (!read_file(g_game_pack, pack)) fail("can't read the game's 2D pack");
+            const std::map<std::string, Bytes> members = read_sarc(pack);
+            auto it = members.find(kMember);
+            if (it == members.end()) fail(std::string("no ") + kMember + " in the pack");
+            g_game_icons = read_sarc(yaz0_decode(it->second));
+        } catch (const std::exception& e) {
+            LOG("[items] the game's item icons can't be read: %s", e.what());
+            g_game_icons.clear();
+        }
+    }
+    auto it = g_game_icons.find("timg/" + icon_name(n));
+    if (it == g_game_icons.end()) return false;
+    std::string why;
+    if (!lyt_build::read_texture(it->second, w, h, rgba, why)) {
+        static bool logged = false;
+        if (!logged) LOG("[items] the game's icon %d can't be read: %s", n, why.c_str()), logged = true;
+        return false;
+    }
+    return true;
 }
 
 int frame(uint16_t key) {

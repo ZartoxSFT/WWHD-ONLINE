@@ -204,6 +204,7 @@ enum {
  * MP_MULTIPLIER_ENTRY + decimal number carries the server's enemy multiplier, and
  * MP_RANDOMIZER_ENTRY + 0 or 1 whether the copies take random variants (actor_sync.h). The
  * GameCube client only adds them to its name set, where no actor name matches them. */
+#define MP_SAVE_MAP_MAX 256 /* SaveServer map runs (the WWSave of the server: 120) */
 #define MP_MAX_FACTORIES 64
 #define MP_ACTOR_NAME_MAX 8
 #define MP_MAX_FILTER 512
@@ -211,6 +212,12 @@ enum {
 #define MP_MULTIPLIER_ENTRY "#enemy_multiplier="
 #define MP_MULTIPLIER_MAX 15
 #define MP_RANDOMIZER_ENTRY "#enemy_randomizer="
+/* WWHD extensions, the same way (ActorFilter.java, elite.h): "1" when the enemies' health and
+ * damage follow the number of players in their area; the percentage (0..100) of the enemies that
+ * are elites. */
+#define MP_SCALING_ENTRY "#dynamic_scaling="
+#define MP_ELITE_ENTRY "#elite_chance="
+#define MP_ELITE_CHANCE_MAX 100
 
 typedef struct mp_factory {
     char name[MP_ACTOR_NAME_MAX + 1];
@@ -225,6 +232,19 @@ typedef struct mp_session {
     /* server -> client (index in the first init list) */
     mp_u32 server_create, server_update, server_remove;
     mp_u32 server_mutators; /* WWHD extension (ActorFilter.java): the mutators changed */
+    mp_u32 server_player_directory; /* WWHD extension: every player, whatever their area */
+    mp_u32 client_player_directory; /* WWHD extension: this player's entry of it */
+    mp_u32 server_player_summon;    /* WWHD extension: a creature another player bought for us */
+    mp_u32 client_player_summon;    /* WWHD extension: a creature bought for another player */
+    mp_u32 server_save_update;      /* SaveServer: values of the shared save another player changed */
+    mp_u32 server_save_from;        /* WWHD extension (SaveServer): who changed them */
+    mp_u32 server_world;            /* WWHD extension (ActorFilter): the world clock and weather */
+    mp_u32 client_save_update;      /* SaveServer: values this player's save changed */
+    mp_u32 client_save_merge;       /* WWHD extension (SaveServer): all of them, once connected */
+    /* the SaveServer initializer's map (SaveServer.writeMap): runs of {type, length in bytes} */
+    mp_u32 save_map_count;
+    mp_u8 save_map_type[MP_SAVE_MAP_MAX];
+    mp_u8 save_map_length[MP_SAVE_MAP_MAX];
     /* client -> server (index in the second init list) */
     mp_u32 client_init, client_change_manager, client_leave_manager;
     mp_u32 client_create, client_update, client_remove;
@@ -243,6 +263,8 @@ typedef struct mp_session {
     char filter[MP_MAX_FILTER][MP_ACTOR_NAME_MAX];
     mp_u32 enemy_multiplier; /* 1 when the server sends none */
     int enemy_randomizer;    /* 0 when the server sends none */
+    int dynamic_scaling;     /* 0 when the server sends none */
+    mp_u32 elite_chance;     /* percent, 0 when the server sends none */
 } mp_session;
 
 static inline void mp_assign_id(const char* s, mp_u32 n, mp_u32 index, const char* name, mp_u32* id) {
@@ -340,6 +362,29 @@ static inline int mp_read_actor_sync(mp_reader* r, mp_session* s) {
     return r->ok;
 }
 
+/* name[0..n) is prefix followed by at least one character; *rest is that remainder. */
+static inline int mp_entry_value(const char* name, mp_u32 n, const char* prefix, const char** rest, mp_u32* rest_n) {
+    mp_u32 k = 0;
+    while (prefix[k]) {
+        if (k == n || name[k] != prefix[k]) return 0;
+        ++k;
+    }
+    if (k == n) return 0;
+    *rest = name + k;
+    *rest_n = n - k;
+    return 1;
+}
+
+/* Decimal digits; max + 1 when malformed or larger than max. */
+static inline mp_u32 mp_entry_number(const char* text, mp_u32 n, mp_u32 max) {
+    mp_u32 value = 0;
+    for (mp_u32 k = 0; k != n; ++k) {
+        if (text[k] < '0' || text[k] > '9' || value > max) return max + 1;
+        value = value * 10 + (mp_u32)(text[k] - '0');
+    }
+    return value > max ? max + 1 : value;
+}
+
 /* ActorFilter: VLQ count + names. Names longer than an actor name are not kept (none can match). */
 static inline int mp_read_actor_filter(mp_reader* r, mp_session* s) {
     mp_u32 count = mp_read_vlq(r);
@@ -353,6 +398,17 @@ static inline int mp_read_actor_filter(mp_reader* r, mp_session* s) {
         for (mp_u32 k = 0; randomizer && k != random_prefix; ++k) randomizer = name[k] == MP_RANDOMIZER_ENTRY[k];
         if (randomizer) {
             s->enemy_randomizer = name[random_prefix] == '1';
+            continue;
+        }
+        const char* rest;
+        mp_u32 rest_n;
+        if (mp_entry_value(name, n, MP_SCALING_ENTRY, &rest, &rest_n)) {
+            s->dynamic_scaling = rest_n == 1 && rest[0] == '1';
+            continue;
+        }
+        if (mp_entry_value(name, n, MP_ELITE_ENTRY, &rest, &rest_n)) {
+            mp_u32 chance = mp_entry_number(rest, rest_n, MP_ELITE_CHANCE_MAX);
+            s->elite_chance = chance > MP_ELITE_CHANCE_MAX ? 0 : chance;
             continue;
         }
         int setting = n > prefix;
@@ -396,10 +452,17 @@ static inline int mp_skip_initializer(mp_reader* r, const char* name, mp_u32 n, 
     if (mp_string_equals(name, n, "ActorSync")) return mp_read_actor_sync(r, s);
     if (mp_string_equals(name, n, "ActorFilter")) return mp_read_actor_filter(r, s);
     if (mp_string_equals(name, n, "SaveServer")) {
-        /* SaveServer::readMap: VLQ entries of {u8 type, u8 length} */
+        /* SaveServer::readMap: VLQ entries of {u8 type, u8 length}; kept when they fit */
         count = mp_read_vlq(r);
         if (count > 0x7FFFFFFFu) return 0;
-        mp_skip(r, count * 2);
+        s->save_map_count = count <= MP_SAVE_MAP_MAX ? count : 0;
+        for (mp_u32 i = 0; r->ok && i != count; ++i) {
+            mp_u8 type = mp_read_u8(r), length = mp_read_u8(r);
+            if (i < MP_SAVE_MAP_MAX) {
+                s->save_map_type[i] = type;
+                s->save_map_length[i] = length;
+            }
+        }
         return r->ok;
     }
     if (mp_string_equals(name, n, "ResourceClient")) {
@@ -421,6 +484,11 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     mp_reader r = mp_reader_make(payload, size);
     mp_u32 n, count;
     s->server_create = s->server_update = s->server_remove = s->server_mutators = MP_NO_ID;
+    s->server_player_directory = s->client_player_directory = MP_NO_ID;
+    s->server_player_summon = s->client_player_summon = MP_NO_ID;
+    s->server_save_update = s->server_save_from = s->server_world = MP_NO_ID;
+    s->client_save_update = s->client_save_merge = MP_NO_ID;
+    s->save_map_count = 0;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
     s->client_exclusive_add = s->client_exclusive_remove = MP_NO_ID;
@@ -432,6 +500,8 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->filter_count = 0;
     s->enemy_multiplier = 1;
     s->enemy_randomizer = 0;
+    s->dynamic_scaling = 0;
+    s->elite_chance = 0;
 
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -440,6 +510,11 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_ACTOR_SYNC_UPDATE", &s->server_update);
         mp_assign_id(name, n, i, "SERVER_ACTOR_SYNC_REMOVE", &s->server_remove);
         mp_assign_id(name, n, i, "SERVER_MUTATORS", &s->server_mutators);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_DIRECTORY", &s->server_player_directory);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_SUMMON", &s->server_player_summon);
+        mp_assign_id(name, n, i, "SERVER_SAVE_UPDATE", &s->server_save_update);
+        mp_assign_id(name, n, i, "SERVER_SAVE_FROM", &s->server_save_from);
+        mp_assign_id(name, n, i, "SERVER_WORLD", &s->server_world);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -450,6 +525,10 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_CREATE", &s->client_create);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_UPDATE", &s->client_update);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_SYNC_REMOVE", &s->client_remove);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_DIRECTORY", &s->client_player_directory);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_SUMMON", &s->client_player_summon);
+        mp_assign_id(name, n, i, "CLIENT_SAVE_UPDATE", &s->client_save_update);
+        mp_assign_id(name, n, i, "CLIENT_SAVE_MERGE", &s->client_save_merge);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
@@ -659,13 +738,20 @@ typedef struct mp_strike {
 
 /* WWHD extension after the strikes: particle effects the player's Link made (hammer on the
  * ground, sword sparks and splashes...), replayed where they were (particle_sync.h). A byte count
- * (bit 7 clear), then per particle: u8 group, u16 id, u8 flags (1 angle, 2 scale, 4 matrix),
- * f32 x y z, [f32 rotation 3x3, row by row], [s16 angle x y z], [f32 scale x y z], u8 alpha. */
-#define MP_MAX_PARTICLES 8
+ * (bit 7 clear), then per particle: u8 group, u16 id, u8 flags (1 angle, 2 scale, 4 matrix,
+ * 8 follow, 16 stop, 32 colours), f32 x y z, [f32 rotation 3x3, row by row], [s16 angle x y z],
+ * [f32 scale x y z], u8 alpha, [u8 key], [u8 prm r g b a, u8 env r g b a].
+ * A followed emitter (0.2.41: one its maker moves every frame and stops itself, the sword's charge
+ * or spin) has a key of its maker's: the first record with that key makes it, the next ones move it
+ * (position and rotation), one with "stop" ends it. */
+#define MP_MAX_PARTICLES 16
 #define MP_PARTICLE_ANGLE 1
 #define MP_PARTICLE_SCALE 2
 #define MP_PARTICLE_MATRIX 4
-#define MP_PARTICLE_FLAGS 7
+#define MP_PARTICLE_FOLLOW 8
+#define MP_PARTICLE_STOP 16
+#define MP_PARTICLE_COLOR 32
+#define MP_PARTICLE_FLAGS 0x3F
 
 typedef struct mp_particle {
     mp_u8 group;
@@ -676,6 +762,9 @@ typedef struct mp_particle {
     mp_s16 angle[3];
     float scale[3];
     mp_u8 alpha;
+    mp_u8 key;         /* MP_PARTICLE_FOLLOW */
+    mp_u8 prm[4];      /* MP_PARTICLE_COLOR: primary and environment colours */
+    mp_u8 env[4];
 } mp_particle;
 
 typedef struct mp_swing {
@@ -964,6 +1053,11 @@ static inline void mp_write_particles(mp_writer* w, const mp_anim_events* e) {
         if (p->flags & MP_PARTICLE_SCALE)
             for (int c = 0; c != 3; ++c) mp_write_f32(w, p->scale[c]);
         mp_write_u8(w, p->alpha);
+        if (p->flags & MP_PARTICLE_FOLLOW) mp_write_u8(w, p->key);
+        if (p->flags & MP_PARTICLE_COLOR) {
+            for (int c = 0; c != 4; ++c) mp_write_u8(w, p->prm[c]);
+            for (int c = 0; c != 4; ++c) mp_write_u8(w, p->env[c]);
+        }
     }
 }
 
@@ -978,6 +1072,7 @@ static inline void mp_read_particles(mp_reader* r, mp_anim_events* e) {
         p.id = mp_read_u16(r);
         p.flags = mp_read_u8(r);
         if (p.flags & ~(mp_u32)MP_PARTICLE_FLAGS) r->ok = 0;
+        if ((p.flags & MP_PARTICLE_STOP) && !(p.flags & MP_PARTICLE_FOLLOW)) r->ok = 0; /* stop what? */
         for (int c = 0; c != 3; ++c) p.pos[c] = mp_read_f32(r);
         for (int c = 0; c != 9; ++c) p.matrix[c] = (c % 4) ? 0.0f : 1.0f;
         if (p.flags & MP_PARTICLE_MATRIX)
@@ -989,6 +1084,12 @@ static inline void mp_read_particles(mp_reader* r, mp_anim_events* e) {
         if (p.flags & MP_PARTICLE_SCALE)
             for (int c = 0; c != 3; ++c) p.scale[c] = mp_read_f32(r);
         p.alpha = mp_read_u8(r);
+        p.key = (p.flags & MP_PARTICLE_FOLLOW) ? mp_read_u8(r) : 0;
+        for (int c = 0; c != 4; ++c) p.prm[c] = p.env[c] = 0xFF;
+        if (p.flags & MP_PARTICLE_COLOR) {
+            for (int c = 0; c != 4; ++c) p.prm[c] = mp_read_u8(r);
+            for (int c = 0; c != 4; ++c) p.env[c] = mp_read_u8(r);
+        }
         if (r->ok) e->particle[mp_particle_slot(e)] = p;
     }
 }
@@ -1327,6 +1428,7 @@ typedef struct mp_actor_values {
     mp_transform transform;
     int has_health;
     mp_s16 health;     /* fopAc_ac_c::health, written as a short like ActorHealthSync */
+    mp_u8 tag;         /* WWHD: the owner's elite draw (elite.h), 0 none; see mp_health_word */
     mp_u32 status;     /* fopAc_ac_c::actor_status */
     int has_spawn;     /* in a create, or in an update when the owner's parameters changed */
     mp_spawn spawn;
@@ -1358,11 +1460,31 @@ static inline void mp_read_spawn(mp_reader* r, mp_spawn* p) {
     p->variant = mp_read_u8(r);
 }
 
+/* ActorHealthSync's health is a short, the game's an s8 (fopAc_ac_c::health): the high byte only
+ * repeats the sign (0x00 or 0xFF). WWHD puts the owner's elite draw there (elite.h EL_TAG_*, never
+ * 0x00 or 0xFF) with the health in the low byte; the GameCube client keeps the low byte
+ * (ActorHealthSync::calc, gameActor->health = mHealth). */
+static inline mp_u16 mp_health_word(mp_s16 health, mp_u8 tag) {
+    if (!tag || tag == 0xFF) return (mp_u16)health;
+    return (mp_u16)(((mp_u16)tag << 8) | (mp_u8)health);
+}
+
+static inline void mp_health_split(mp_u16 word, mp_s16* health, mp_u8* tag) {
+    mp_u8 high = (mp_u8)(word >> 8);
+    if (high == 0x00 || high == 0xFF) {
+        *health = (mp_s16)word;
+        *tag = 0;
+    } else {
+        *health = (mp_s16)(signed char)(word & 0xFF);
+        *tag = high;
+    }
+}
+
 static inline void mp_write_component(mp_writer* w, mp_u8 kind, const mp_actor_values* v) {
     if (kind == MP_COMPONENT_BASE) {
         mp_write_base(w, &v->transform);
     } else if (kind == MP_COMPONENT_HEALTH) {
-        mp_write_u16(w, (mp_u16)v->health);
+        mp_write_u16(w, mp_health_word(v->health, v->tag));
         mp_write_u32(w, v->status);
     } else if (kind == MP_COMPONENT_SPAWN) {
         mp_write_spawn(w, &v->spawn);
@@ -1475,7 +1597,7 @@ static inline int mp_read_actor_body(mp_reader* r, const mp_factory* f, mp_place
             mp_read_base(r, &a->values.transform);
             a->values.has_transform = 1;
         } else if (kind == MP_COMPONENT_HEALTH) {
-            a->values.health = (mp_s16)mp_read_u16(r);
+            mp_health_split(mp_read_u16(r), &a->values.health, &a->values.tag);
             a->values.status = mp_read_u32(r);
             a->values.has_health = 1;
         } else if (kind == MP_COMPONENT_SPAWN) {
@@ -1528,18 +1650,130 @@ static inline int mp_read_placed_update(const mp_u8* payload, mp_u32 size, const
     return mp_read_actor_body(&r, f, a) && r.pos == r.size;
 }
 
-/* SERVER_MUTATORS (WWHD extension): VLQ enemy multiplier, u8 randomizer. The server sends it to
- * every client when its mutators change while it runs; 0 when malformed. */
-static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer) {
+/* SERVER_MUTATORS (WWHD extension): VLQ enemy multiplier, u8 randomizer, then (0.2.47 servers)
+ * u8 dynamic scaling and u8 elite chance (percent). The server sends it to every client when its
+ * mutators change while it runs. A body without the last two (an older server) leaves *scaling and
+ * *elite at 0; 0 when malformed. */
+static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer,
+                                      int* scaling, mp_u32* elite) {
     mp_reader r = mp_reader_make(payload, size);
     mp_u32 m = mp_read_vlq(&r);
     mp_u8 random = mp_read_u8(&r);
+    mp_u8 scale = 0, chance = 0;
+    if (r.ok && r.pos != r.size) {
+        scale = mp_read_u8(&r);
+        chance = mp_read_u8(&r);
+    }
     if (!r.ok || r.pos != r.size) return 0;
     if (m < 1) m = 1;
     if (m > MP_MULTIPLIER_MAX) m = MP_MULTIPLIER_MAX;
     *multiplier = m;
     *randomizer = random != 0;
+    *scaling = scale != 0;
+    *elite = chance > MP_ELITE_CHANCE_MAX ? MP_ELITE_CHANCE_MAX : chance;
     return 1;
+}
+
+static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer) {
+    int scaling;
+    mp_u32 elite;
+    return mp_read_mutators_ex(payload, size, multiplier, randomizer, &scaling, &elite);
+}
+
+/* ------------------------------------------------------------------ player directory */
+
+/* WWHD extension: where every player is, whatever their area (the actor sync only shows the
+ * players of one's own area). For the launcher's world map and its teleport (mod.c map_step).
+ *
+ * CLIENT_PLAYER_DIRECTORY (about once a second): this player's entry without its id:
+ *   string name, u16 colour (RGB565, primary tunic), string stage (dStage_startStage_c name),
+ *   s16 start point, s8 start room, s8 start layer (how the player entered that stage: a point
+ *   that exists, for a teleport there), s8 current room, f32 x, y, z, s16 heading, u8 flags,
+ *   then with MP_DIR_SEA the last place on the Great Sea: f32 x, z.
+ * SERVER_PLAYER_DIRECTORY (the answer, WWClient.java): VLQ id of the receiver, VLQ count, then
+ *   per player VLQ id and its entry. Ids are the server's, stable while the client is connected. */
+#define MP_DIR_MAX 24
+#define MP_DIR_STAGE 8
+#define MP_DIR_SEA 0x01 /* the last place on the Great Sea follows */
+
+typedef struct mp_dir_entry {
+    mp_u32 id;
+    char name[MP_NAME_MAX + 1];
+    mp_u16 color;
+    char stage[MP_DIR_STAGE + 1];
+    mp_s16 point;
+    signed char start_room, layer, room;
+    float pos[3];
+    mp_s16 heading;
+    mp_u8 flags;
+    float sea[2];
+} mp_dir_entry;
+
+typedef struct mp_directory {
+    mp_u32 self;
+    mp_u32 count;
+    mp_dir_entry entry[MP_DIR_MAX];
+} mp_directory;
+
+static inline void mp_write_dir_entry(mp_writer* w, const mp_dir_entry* e) {
+    mp_write_string(w, e->name);
+    mp_write_u16(w, e->color);
+    mp_write_string(w, e->stage);
+    mp_write_u16(w, (mp_u16)e->point);
+    mp_write_u8(w, (mp_u8)e->start_room);
+    mp_write_u8(w, (mp_u8)e->layer);
+    mp_write_u8(w, (mp_u8)e->room);
+    for (int i = 0; i != 3; ++i) mp_write_f32(w, e->pos[i]);
+    mp_write_u16(w, (mp_u16)e->heading);
+    mp_write_u8(w, (mp_u8)(e->flags & MP_DIR_SEA));
+    if (e->flags & MP_DIR_SEA) {
+        mp_write_f32(w, e->sea[0]);
+        mp_write_f32(w, e->sea[1]);
+    }
+}
+
+static inline void mp_copy_text(char* out, mp_u32 capacity, const char* text, mp_u32 length) {
+    mp_u32 n = 0;
+    /* at most length characters, up to a NUL, printable ASCII (others become '?') */
+    for (; n != length && n + 1 != capacity && text[n]; ++n) out[n] = text[n] >= 0x20 && text[n] <= 0x7E ? text[n] : '?';
+    for (; n != capacity; ++n) out[n] = 0;
+}
+
+static inline void mp_read_dir_entry(mp_reader* r, mp_dir_entry* e) {
+    mp_u32 n;
+    const char* text = mp_read_string(r, &n);
+    mp_copy_text(e->name, MP_NAME_MAX + 1, text, n);
+    e->color = mp_read_u16(r);
+    text = mp_read_string(r, &n);
+    mp_copy_text(e->stage, MP_DIR_STAGE + 1, text, n);
+    e->point = (mp_s16)mp_read_u16(r);
+    e->start_room = (signed char)mp_read_u8(r);
+    e->layer = (signed char)mp_read_u8(r);
+    e->room = (signed char)mp_read_u8(r);
+    for (int i = 0; i != 3; ++i) e->pos[i] = mp_read_f32(r);
+    e->heading = (mp_s16)mp_read_u16(r);
+    e->flags = mp_read_u8(r);
+    if (e->flags & ~(mp_u32)MP_DIR_SEA) r->ok = 0;
+    e->sea[0] = e->sea[1] = 0.0f;
+    if (e->flags & MP_DIR_SEA) {
+        e->sea[0] = mp_read_f32(r);
+        e->sea[1] = mp_read_f32(r);
+    }
+}
+
+/* SERVER_PLAYER_DIRECTORY; 0 when malformed. Entries past MP_DIR_MAX are read and dropped. */
+static inline int mp_read_directory(const mp_u8* payload, mp_u32 size, mp_directory* d) {
+    mp_reader r = mp_reader_make(payload, size);
+    d->self = mp_read_vlq(&r);
+    mp_u32 count = mp_read_vlq(&r);
+    d->count = 0;
+    for (mp_u32 i = 0; r.ok && i != count; ++i) {
+        mp_dir_entry e;
+        e.id = mp_read_vlq(&r);
+        mp_read_dir_entry(&r, &e);
+        if (r.ok && d->count != MP_DIR_MAX) d->entry[d->count++] = e;
+    }
+    return r.ok && r.pos == r.size;
 }
 
 /* Splits one received transport item (VLQ id + VLQ length + payload). */
@@ -1552,3 +1786,153 @@ static inline int mp_split_frame(const mp_u8* frame, mp_u32 size, mp_u32* id,
     *payload = frame + r.pos;
     return 1;
 }
+
+/* ------------------------------------------------------------------ shop summons */
+
+/* WWHD extension: the launcher's shop (mod.c shop_*) buys a creature for another player of the
+ * directory; that player's game makes it next to its Link (actor_sync.h as_summon).
+ * CLIENT_PLAYER_SUMMON: VLQ the target's directory id, u8 creature (the shop's number), string the
+ *   buyer's name.
+ * SERVER_PLAYER_SUMMON (WWClient.java, to the target only): u8 creature, string the buyer's name. */
+#define MP_SUMMON_CREATURES 32
+
+static inline void mp_write_summon_request(mp_writer* w, mp_u32 target, mp_u8 creature, const char* buyer) {
+    mp_write_vlq(w, target);
+    mp_write_u8(w, creature);
+    mp_write_string(w, buyer);
+}
+
+/* SERVER_PLAYER_SUMMON; 0 when malformed (buyer: MP_NAME_MAX + 1 bytes, printable). */
+static inline int mp_read_summon(const mp_u8* payload, mp_u32 size, mp_u8* creature, char* buyer) {
+    mp_reader r = mp_reader_make(payload, size);
+    *creature = mp_read_u8(&r);
+    mp_u32 n;
+    const char* text = mp_read_string(&r, &n);
+    if (!r.ok || r.pos != r.size || *creature >= MP_SUMMON_CREATURES) return 0;
+    mp_copy_text(buyer, MP_NAME_MAX + 1, text, n);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ save sync */
+
+/* The SaveServer (save/SaveServer.java, the GameCube client's SaveServer.cpp): the shared save is
+ * dSv_save_c (0x778 bytes, d_save.h). Its map gives runs of values of one type: type 0 byte,
+ * 1 short, 2 int, 3 long, 4 float, 5 Vector3, 6 string (the run is one string of that length; the
+ * server also writes runs of length 0 after strings, which hold nothing), 7 bits (bytes of eight
+ * flags). An element is one value of a run, sent whole: its byte offset in dSv_save_c, then
+ * CLIENT_SAVE_UPDATE / CLIENT_SAVE_MERGE: VLQ count, then per element VLQ offset and its bytes
+ *   (a string up to its NUL, the NUL included);
+ * SERVER_SAVE_UPDATE: VLQ count, then per element VLQ offset, VLQ length and its bytes;
+ * SERVER_SAVE_FROM (WWHD): string, the name of the player who made the next SERVER_SAVE_UPDATE. */
+#define MP_SAVE_BYTES 0x778
+#define MP_SAVE_STRING 6
+
+typedef struct mp_save_element {
+    mp_u16 offset;
+    mp_u8 size;   /* bytes (a string: its whole room) */
+    mp_u8 type;
+} mp_save_element;
+
+static inline mp_u32 mp_save_type_size(mp_u8 type) {
+    static const mp_u8 sizes[8] = {1, 2, 4, 8, 4, 12, 0, 1};
+    return type < 8 ? sizes[type] : 0;
+}
+
+/* The elements of the map in order; the count, 0 when the map is unusable (an unknown type, a run
+ * not a whole number of its values, more than max elements, or past MP_SAVE_BYTES). */
+static inline mp_u32 mp_save_elements(const mp_session* s, mp_save_element* out, mp_u32 max) {
+    mp_u32 n = 0, offset = 0;
+    for (mp_u32 i = 0; i != s->save_map_count; ++i) {
+        mp_u8 type = s->save_map_type[i];
+        mp_u32 length = s->save_map_length[i];
+        if (!length) continue;
+        if (type == MP_SAVE_STRING) {
+            if (n == max || offset + length > MP_SAVE_BYTES) return 0;
+            out[n].offset = (mp_u16)offset;
+            out[n].size = (mp_u8)length;
+            out[n].type = type;
+            ++n;
+            offset += length;
+            continue;
+        }
+        mp_u32 size = mp_save_type_size(type);
+        if (!size || length % size) return 0;
+        for (mp_u32 k = 0; k != length / size; ++k) {
+            if (n == max || offset + size > MP_SAVE_BYTES) return 0;
+            out[n].offset = (mp_u16)offset;
+            out[n].size = (mp_u8)size;
+            out[n].type = type;
+            ++n;
+            offset += size;
+        }
+    }
+    return n;
+}
+
+/* One element of a CLIENT_SAVE_UPDATE / MERGE body (after its VLQ count): value is the element's
+ * bytes in dSv_save_c. */
+static inline void mp_write_save_element(mp_writer* w, const mp_save_element* e, const mp_u8* value) {
+    mp_write_vlq(w, e->offset);
+    if (e->type == MP_SAVE_STRING) {
+        mp_u32 n = 0;
+        while (n + 1 < e->size && value[n]) ++n;
+        for (mp_u32 i = 0; i != n; ++i) mp_write_u8(w, value[i]);
+        mp_write_u8(w, 0);
+        return;
+    }
+    for (mp_u32 i = 0; i != e->size; ++i) mp_write_u8(w, value[i]);
+}
+
+/* SERVER_SAVE_UPDATE, one entry at a time: the count first, then each entry; 0 at a bad one. */
+static inline mp_u32 mp_read_save_count(mp_reader* r) { return mp_read_vlq(r); }
+static inline int mp_read_save_entry(mp_reader* r, mp_u32* offset, mp_u32* length, const mp_u8** bytes) {
+    *offset = mp_read_vlq(r);
+    *length = mp_read_vlq(r);
+    if (!r->ok || *length > MP_SAVE_BYTES || *offset > MP_SAVE_BYTES || *offset + *length > MP_SAVE_BYTES ||
+        *length > r->size - r->pos) {
+        r->ok = 0;
+        return 0;
+    }
+    *bytes = r->data + r->pos;
+    r->pos += *length;
+    return 1;
+}
+
+/* SERVER_SAVE_FROM: the name (MP_NAME_MAX + 1 bytes, printable); 0 when malformed. */
+static inline int mp_read_save_from(const mp_u8* payload, mp_u32 size, char* name) {
+    mp_reader r = mp_reader_make(payload, size);
+    mp_u32 n;
+    const char* text = mp_read_string(&r, &n);
+    if (!r.ok || r.pos != r.size) return 0;
+    mp_copy_text(name, MP_NAME_MAX + 1, text, n);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ world */
+
+/* SERVER_WORLD (WWHD, ActorFilter.java): u8 flags, f32 time of day (degrees, 0-360), u16 day,
+ * u8 weather (0 the game's own, 1 sunny, 2 cloudy, 3 rain, 4 heavy rain, 5 storm). */
+#define MP_WORLD_TIME 1
+#define MP_WORLD_WEATHER 2
+#define MP_WORLD_EXPLICIT 4
+#define MP_WORLD_FLAGS 7
+#define MP_WEATHER_MAX 5
+
+typedef struct mp_world {
+    mp_u8 flags;
+    float time;
+    mp_u16 day;
+    mp_u8 weather;
+} mp_world;
+
+static inline int mp_read_world(const mp_u8* payload, mp_u32 size, mp_world* w) {
+    mp_reader r = mp_reader_make(payload, size);
+    w->flags = mp_read_u8(&r);
+    w->time = mp_read_f32(&r);
+    w->day = mp_read_u16(&r);
+    w->weather = mp_read_u8(&r);
+    if (!r.ok || r.pos != r.size || (w->flags & ~MP_WORLD_FLAGS) || w->weather > MP_WEATHER_MAX) return 0;
+    if (!(w->time >= 0.0f && w->time < 360.0f)) return 0;
+    return 1;
+}
+

@@ -307,6 +307,14 @@ void svc_hud_image(Cpu* c) {
     c->r[3]=hud::store().create_image(mod.id,w,h,w*4,(const uint8_t*)mem::ptr(pixels),size_t(w)*h*4);
     if(!c->r[3])hud::store().note(mod.id,"HUD image failed: per-mod image quota exceeded");
 }
+// wwhd_hud_game_icon(frame): the game's item icon of that frame (item_icons::game_icon), as an image
+void svc_hud_game_icon(Cpu* c) {
+    auto& mod=owner(c);const int frame=int(c->r[3]);c->r[3]=0;
+    item_icons::Bytes rgba;uint32_t w=0,h=0;
+    if(!item_icons::game_icon(frame,rgba,w,h))return;
+    c->r[3]=hud::store().create_image(mod.id,w,h,w*4,rgba.data(),rgba.size());
+    if(!c->r[3])hud::store().note(mod.id,"HUD game icon failed: per-mod image quota exceeded");
+}
 void svc_hud_release(Cpu* c) {c->r[3]=hud::store().release(owner(c).id,c->r[3]);}
 void svc_hud_epoch(Cpu* c) {auto epoch=hud::store().state_generation();c->r[3]=uint32_t(epoch>>32);c->r[4]=uint32_t(epoch);}
 void svc_hud_record(Cpu* c,bool clip_only) {
@@ -473,7 +481,7 @@ const std::unordered_map<std::string, PpcFunc> kServices = {
     {"wwhd_config_bool",svc_config_bool},{"wwhd_config_float",svc_config_float},{"wwhd_config_string",svc_config_string},
     {"wwhd_malloc",svc_malloc},{"wwhd_free",svc_free},{"wwhd_input_read",svc_input},
     {"wwhd_file_read",svc_file_read},{"wwhd_file_write",svc_file_write},
-    {"wwhd_hud_register",svc_hud_register},{"wwhd_hud_register_drc",svc_hud_register_drc},{"wwhd_hud_game_pixels",svc_hud_game_pixels},{"wwhd_hud_image",svc_hud_image},{"wwhd_hud_texture",svc_hud_texture},
+    {"wwhd_hud_register",svc_hud_register},{"wwhd_hud_register_drc",svc_hud_register_drc},{"wwhd_hud_game_pixels",svc_hud_game_pixels},{"wwhd_hud_image",svc_hud_image},{"wwhd_hud_game_icon",svc_hud_game_icon},{"wwhd_hud_texture",svc_hud_texture},
     {"wwhd_hud_clip",svc_hud_clip},{"wwhd_hud_release",svc_hud_release},{"wwhd_hud_epoch",svc_hud_epoch},{"wwhd_hud_emit",svc_hud_emit},
     {"wwhd_setting_get",svc_setting_get},{"wwhd_setting_changed",svc_setting_changed},
     {"wwhd_logic_dt",svc_logic_dt},{"wwhd_logic_step",svc_logic_step},

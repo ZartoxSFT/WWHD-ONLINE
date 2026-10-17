@@ -2,7 +2,7 @@
   "format_version": 1,
   "id": "multiplayer-connection",
   "name": "Wind Waker multiplayer connection",
-  "version": "0.2.31",
+  "version": "0.2.51",
   "game_id": "wwhd",
   "minimum_manager_version": "1.5.0",
   "kind": "guest",
@@ -69,6 +69,12 @@
       "default": false
     },
     {
+      "id": "hide_hud",
+      "type": "bool",
+      "name": "Hide the game's HUD (hearts, magic, rupees, buttons)",
+      "default": false
+    },
+    {
       "id": "actors_see_puppets",
       "type": "bool",
       "name": "Enemies and residents react to the remote Link puppets as to the player",
@@ -85,6 +91,12 @@
       "type": "string",
       "name": "Clothes: auto (the save), hero or casual",
       "default": "auto"
+    },
+    {
+      "id": "skin",
+      "type": "string",
+      "name": "Skin (skin_<id>.szs in the Data folder, empty: Link)",
+      "default": ""
     },
     {
       "id": "hit_stop",

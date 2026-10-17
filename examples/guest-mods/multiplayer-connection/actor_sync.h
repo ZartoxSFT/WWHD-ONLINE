@@ -252,6 +252,29 @@
 #define AS_PROC_ARROW 0x1D8     /* fpcNm_ARROW_e (d_a_arrow.h) */
 #define AS_PROC_BOOMERANG 0x1B0 /* fpcNm_BOOMERANG_e (d_a_player_main.h) */
 #define AS_PROC_IBALL 0x18F     /* fpcNm_Iball_e (d_a_disappear.h) */
+#define AS_PROC_HOOKSHOT 0xA9   /* fpcNm_HOOKSHOT_e (d_a_hookshot.h) */
+#define AS_PROC_ROPE 0x1BE      /* fpcNm_HIMO2_e, the Grappling Hook (d_a_player_main_01.h) */
+/* daBoomerang_c (include/d/actor/d_a_boomerang.h) */
+#define BOOM_IS_RETURNING 0x2626C
+#define BOOM_CATCH_AND_DELETE 0x2626F
+#define BOOM_THIRD_PERSON 0x26273
+#define BOOM_PROC_ADJUST 0x264C0   /* s16 */
+#define BOOM_PROC_SELECTOR 0x264C2 /* s16, -1: mProcTarget is the function */
+#define BOOM_PROC_TARGET 0x264C4
+/* daHookshot_c (include/d/actor/d_a_hookshot.h): mCurrProcFunc (GHS ptmf: s16 d, s16 i, u32 f) */
+#define HOOK_PROC_INDEX 0xD7AA
+/* himo2_class (include/d/actor/d_a_himo2.h) */
+#define ROPE_M029E 0x3BA          /* s16: != 0 hides */
+#define ROPE_START 0x3D0          /* m02B4: cXyz, the rope's first point */
+#define ROPE_FIRST 0x3E8          /* m02CC: s32, first segment drawn - 1 */
+#define ROPE_STATE 0x3F8          /* m02DC: s32, HIMO2_WAIT 0 .. HIMO2_HANG 11 */
+#define ROPE_HANDS 0x408          /* m02EC[2]: left, right hand points */
+#define ROPE_SEGMENTS 0x42C       /* m0310[100]: himo2_s, 0x24 each, m10 cXyz +0x10, m1C/m1E s16 */
+#define ROPE_SEGMENT_BYTES 0x24
+#define ROPE_LENGTH 0x2688        /* m2188: f32, rope paid out */
+#define ROPE_SPIN 0x2B08          /* m24D8: s8, rope wound round a post */
+#define ROPE_DEMO 0x2B09          /* m24D9: s8, < 0 hides */
+#define ROPE_LAUNCH_FREE 2
 #define AS_ARROW_TYPE 0x71D     /* daArrow_c::mArrowType */
 #define AS_PARAMETERS 0xB0      /* base_process_class::mParameters */
 #define AS_CARRY_BITS 0x102000u /* fopAcStts_CARRY_e | fopAcStts_HOOK_CARRY_e */
@@ -289,6 +312,8 @@ typedef struct as_slot {
     mp_u32 creator;      /* spawned replica: its creator's PlayerPuppet uid */
     u32 request_id;      /* replica: the process id fopAcM_create returned */
     u32 sent_params;     /* owner: mParameters last sent (an arrow is shot when they change) */
+    u32 applied_params;  /* boomerang copy: the owner's mParameters last given to it */
+    u32 wait_proc;       /* boomerang copy: its mProcTarget in procWait (this game's address) */
     u8 has_shot;         /* arrow copy: the owner's place and angles at the shot are known */
     u8 free_flight;      /* arrow copy: shot, flies on its own */
     mp_transform shot;
@@ -302,6 +327,7 @@ typedef struct as_slot {
     mp_transform target, display, sent;
     f32 before_pos[3];   /* current.pos when its execute began */
     s16 net_health, sent_health;
+    u8 net_tag, sent_tag;  /* the owner's elite draw (elite.h), with the health */
     u32 net_status;      /* the owner's actor_status (ActorHealthSync) */
     u8 sent_variant;     /* owner of a spawned actor: mp_spawn::variant last sent */
     u8 has_last_strike;  /* a strike was seen on it (to give it a lethal one) */
@@ -350,6 +376,18 @@ static u32 as_spawned_logged, as_replica_logged, as_suppressed_logged;
 static cXyz as_spawn_pos, as_spawn_scale;  /* fopAcM_create arguments, by guest address */
 static csXyz as_spawn_angle;
 
+/* elite.h (included after this file): dynamic scaling and elite enemies */
+typedef struct el_actor el_actor;
+static void el_note_create(void* actor, u32 prm);
+static el_actor* el_execute_begin(void* actor);
+static void el_execute_end(el_actor* e);
+static el_actor* el_delete_begin(const void* actor);
+static void el_delete_end(el_actor* e, s8 health);
+static el_actor* el_draw_begin(void* actor);
+static void el_draw_end(void);
+static u8 el_tag_of(const void* actor);
+static void el_adopt(void* actor, u8 tag);
+
 /* Live mutators (see the header): the placed enemies of the loaded areas. */
 #define AS_MAX_GROUPS 256
 #define AS_MAX_ENEMY_COPIES 2048
@@ -391,8 +429,14 @@ static const char* const as_enemies[] = {
     "Fganon", "Daiocta", "Btd", "Bst", "Bkm", "Bdk", "Dk", "big_pow", "Bwd", "Bgn", "Gnd",
 };
 
-/* Valid variants of the enemies' parameter fields (see the header). */
+/* Valid variants of the enemies' parameter fields (see the header). A field is in the parameter word
+ * (AS_WORD_PARAMS) or in angle.x of the block (AS_WORD_ANGLE_X, 0x10), which some enemies read as
+ * parameters (the Darknut's equipment). An entry applies only when params & require_mask equals
+ * require_value. 0.2.44: Moblin, Wizzrobe, Peahat and the Darknut's equipment (context.md). */
+#define AS_WORD_PARAMS 0
+#define AS_WORD_ANGLE_X 1
 typedef struct as_variant_field {
+    u8 word;
     u8 shift;
     u8 count;
     u32 mask;          /* of the field, after the shift */
@@ -401,23 +445,45 @@ typedef struct as_variant_field {
 
 typedef struct as_enemy_variants {
     const char* name;
+    u32 require_mask, require_value;
     u8 count;
-    as_variant_field fields[2];
+    as_variant_field fields[3];
 } as_enemy_variants;
 
-#define AS_CHUCHU_COLOURS {8, 5, 0xFF, {0, 1, 2, 3, 4}}
+#define AS_CHUCHU_COLOURS {AS_WORD_PARAMS, 8, 5, 0xFF, {0, 1, 2, 3, 4}}
 static const as_enemy_variants as_variants[] = {
-    {"Bk", 2, {{0, 3, 0xF, {0, 4, 0xB}},                   /* type: 0xB the pink one */
-               {5, 6, 0x7, {0, 1, 2, 3, 4, 5}}}},          /* 0x00..0xA0: tough bit, weapon bits */
-    {"c_red", 1, {AS_CHUCHU_COLOURS}},
-    {"c_green", 1, {AS_CHUCHU_COLOURS}},
-    {"c_blue", 1, {AS_CHUCHU_COLOURS}},
-    {"c_black", 1, {AS_CHUCHU_COLOURS}},
-    {"c_kiiro", 1, {AS_CHUCHU_COLOURS}},
-    {"Tn", 2, {{0, 2, 0xF, {0, 4}}, {4, 6, 0xF, {0, 1, 2, 3, 4, 5}}}},
-    {"keeth", 1, {{15, 2, 0x1, {0, 1}}}},
-    {"Fkeeth", 1, {{15, 2, 0x1, {0, 1}}}},
-    {"Oq", 1, {{8, 3, 0xFF, {0, 1, 0xFF}}}},
+    {"Bk", 0, 0, 2, {{AS_WORD_PARAMS, 0, 3, 0xF, {0, 4, 0xB}},          /* type: 0xB the pink one */
+                     {AS_WORD_PARAMS, 5, 6, 0x7, {0, 1, 2, 3, 4, 5}}}}, /* 0x00..0xA0: green body, weapon */
+    {"c_red", 0, 0, 1, {AS_CHUCHU_COLOURS}},
+    {"c_green", 0, 0, 1, {AS_CHUCHU_COLOURS}},
+    {"c_blue", 0, 0, 1, {AS_CHUCHU_COLOURS}},
+    {"c_black", 0, 0, 1, {AS_CHUCHU_COLOURS}},
+    {"c_kiiro", 0, 0, 1, {AS_CHUCHU_COLOURS}},
+    /* behaviour 0 or 4, armour colour 0..5, equipment (angle.x bits 5-7, d_a_tn.cpp create:
+     * 0 none, 1 helmet, 2 shield, 3 helmet and shield, 4 shield and cape, 5 all three) */
+    {"Tn", 0, 0, 3, {{AS_WORD_PARAMS, 0, 2, 0xF, {0, 4}},
+                     {AS_WORD_PARAMS, 4, 6, 0xF, {0, 1, 2, 3, 4, 5}},
+                     {AS_WORD_ANGLE_X, 5, 6, 0x7, {0, 1, 2, 3, 4, 5}}}},
+    /* mode 1: the lantern Moblin of the Forsaken Fortress, its own darker model and its lantern
+     * (d_a_mo2.cpp createHeap, kantera_get_init); 0 and 0xFF the ordinary one */
+    {"mo2", 0, 0, 1, {{AS_WORD_PARAMS, 0, 3, 0xFF, {0, 1, 0xFF}}}},
+    /* type 3: the ordinary Wizzrobe in its other colour (d_a_wz.cpp: brk frame 3, behaviour 0);
+     * 1 and 2 summon from a room path, 12 and 13 are door scenes: left as placed */
+    {"wiz_r", 0, 0, 1, {{AS_WORD_PARAMS, 0, 3, 0xFF, {0, 3, 0xFF}}}},
+    /* the land Peahat only (type byte 0xFF; 1 is the Seahat): its notice and chase ranges in
+     * hundreds of units (d_a_ph.cpp create, 0xFF the defaults 1000 and 500) */
+    {"p_hat", 0xFF, 0xFF, 2, {{AS_WORD_PARAMS, 8, 4, 0xFF, {0xFF, 0x05, 0x0F, 0x1E}},
+                              {AS_WORD_PARAMS, 16, 4, 0xFF, {0xFF, 0x05, 0x0F, 0x1E}}}},
+    {"keeth", 0, 0, 1, {{AS_WORD_PARAMS, 15, 2, 0x1, {0, 1}}}},
+    {"Fkeeth", 0, 0, 1, {{AS_WORD_PARAMS, 15, 2, 0x1, {0, 1}}}},
+    {"Oq", 0, 0, 1, {{AS_WORD_PARAMS, 8, 3, 0xFF, {0, 1, 0xFF}}}},
+    /* the regular Mothula (d_a_gm.cpp create): parameter byte 2 1 on the ground without wings
+     * ("gmos_g", wing flags 15, health 2), 2 flying ("gmos_f"); 0 and 0xFF are the mini-boss and
+     * byte 1 not 0 (0xFF counts as 0) a larva on a wall: those are left as placed */
+    {"gmos", 0x00FFFF00, 0x00010000, 1, {{AS_WORD_PARAMS, 16, 2, 0xFF, {1, 2}}}},
+    {"gmos", 0x00FFFF00, 0x00020000, 1, {{AS_WORD_PARAMS, 16, 2, 0xFF, {1, 2}}}},
+    {"gmos", 0x00FFFF00, 0x0001FF00, 1, {{AS_WORD_PARAMS, 16, 2, 0xFF, {1, 2}}}},
+    {"gmos", 0x00FFFF00, 0x0002FF00, 1, {{AS_WORD_PARAMS, 16, 2, 0xFF, {1, 2}}}},
 };
 
 static u32 as_hash(const u8* data, u32 size, u32 seed) {
@@ -426,30 +492,43 @@ static u32 as_hash(const u8* data, u32 size, u32 seed) {
     return h;
 }
 
-/* Gives a copy's parameter word a listed variant, field by field. The hash leaves out gbaName and
- * argument, which dStage_actorCreate writes (a block before it and one after it give the same). */
-static u32 as_randomize(const char* name, const u8* original, u32 copy, u32 params) {
+static u32 as_ld32_block(const u8* b, u32 at) {
+    return ((u32)b[at] << 24) | ((u32)b[at + 1] << 16) | ((u32)b[at + 2] << 8) | b[at + 3];
+}
+
+/* Gives a block (parameters and angle.x) listed variants, field by field, drawn from original's
+ * bytes and the copy number. The hash leaves out gbaName and argument, which dStage_actorCreate
+ * writes (a block before it and one after it give the same). block may be original. */
+static void as_randomize(const char* name, const u8* original, u32 copy, u8* block) {
     u8 key[AS_PRM_PADDING_START];
     memcpy(key, original, sizeof(key));
     key[AS_PRM_GBA_NAME] = 0;
     key[AS_PRM_ARGUMENT] = 0;
+    u32 words[2];
+    words[AS_WORD_PARAMS] = as_ld32_block(block, 0);
+    words[AS_WORD_ANGLE_X] = ((u32)block[AS_PRM_ANGLE] << 8) | block[AS_PRM_ANGLE + 1];
     for (u32 e = 0; e != sizeof(as_variants) / sizeof(as_variants[0]); ++e) {
         const as_enemy_variants* v = &as_variants[e];
         u32 i = 0;
         while (i != MP_ACTOR_NAME_MAX && v->name[i] && name[i] == v->name[i]) ++i;
         if (!(i == MP_ACTOR_NAME_MAX ? v->name[i] == 0 : (v->name[i] == 0 && name[i] == 0))) continue;
+        /* an enemy may have several entries for several required values (gmos) */
+        if ((words[AS_WORD_PARAMS] & v->require_mask) != v->require_value) continue;
         for (u32 f = 0; f != v->count; ++f) {
             const as_variant_field* field = &v->fields[f];
-            u32 value = (params >> field->shift) & field->mask;
+            u32* word = &words[field->word];
+            u32 value = (*word >> field->shift) & field->mask;
             int listed = 0;
             for (u32 k = 0; k != field->count; ++k) listed |= field->values[k] == value;
             if (!listed) continue; /* a scripted or special value stays */
             u32 pick = as_hash(key, sizeof(key), copy * 31u + f) % field->count;
-            params = (params & ~(field->mask << field->shift)) | (field->values[pick] << field->shift);
+            *word = (*word & ~(field->mask << field->shift)) | (field->values[pick] << field->shift);
         }
-        return params;
+        for (u32 b = 0; b != 4; ++b) block[b] = (u8)(words[AS_WORD_PARAMS] >> (24 - 8 * b));
+        block[AS_PRM_ANGLE] = (u8)(words[AS_WORD_ANGLE_X] >> 8);
+        block[AS_PRM_ANGLE + 1] = (u8)words[AS_WORD_ANGLE_X];
+        return;
     }
-    return params;
 }
 
 /* cos/sin of k * 45 degrees */
@@ -517,6 +596,7 @@ static void as_read_values(const fopAc_ac_c* a, mp_actor_values* v) {
     v->transform.rot[1] = a->shape_angle.y;
     v->transform.rot[2] = a->shape_angle.z;
     v->health = a->health;
+    v->tag = el_tag_of(a); /* the owner's elite draw rides with the health (elite.h) */
     v->status = a->actor_status;
 }
 
@@ -553,15 +633,75 @@ static u32 as_make_copy(const char* name, const u8* original, u32 i, int randomi
     f32 radius = AS_SPREAD * (f32)(1 + (i - 1) / 8);
     position[0] += radius * as_ring_x[(i - 1) & 7];
     position[2] += radius * as_ring_z[(i - 1) & 7];
-    if (randomized) {
-        u32* parameters = (u32*)(copy + 0x00);
-        *parameters = as_randomize(name, original, i, *parameters);
-    }
+    if (randomized) as_randomize(name, original, i, (u8*)copy);
     *(u8*)(copy + AS_PRM_TAG) = AS_TAG;
     *(u8*)(copy + AS_PRM_COPY) = (u8)i;
     if (group) as_note_add(copy, group, i, 0, randomized, name);
     if ((++as_copies & 63) == 1) wwhd_log_int("multiplayer: enemy copies created", (int)as_copies);
     return copy;
+}
+
+/* ---- the stage's actors and how their creation went (world_sync.h: day and night together) ----
+ * Every block given to dStage_actorCreate (the stage's own actors and the multiplier's copies) is
+ * noted with its stage, name and bytes (before dStage_actorCreate writes argument and gbaName,
+ * which it writes again when asked again); fopAc_Create of the actor reading that block
+ * (mpUserData) gives the result: cPhs_COMPLEATE_e 4 made, cPhs_ERROR_e 5 refused (an actor of the
+ * other time of day, a switch, an event...). Only the actors whose creation asked the time of day
+ * (dKy_daynight_check 02556D14 called while fopAc_Create runs for their block: the people of
+ * Windfall, d_a_npc_*.cpp init_*) are "timed"; as_roster_retry asks again for the refused timed
+ * ones of the stage and room being played, once per placed actor. The others (switches, events,
+ * collected things...) are never asked again: made out of their context, some crash the game
+ * (0.2.45: 176 actors asked again, a crash in 027E6664 when going back from night to day). */
+#define AS_ROSTER 384
+#define AS_PHASE_DONE 4
+#define AS_PHASE_ERROR 5
+typedef struct as_roster_entry {
+    char stage[8];
+    char name[8];
+    u8 block[AS_PRM_BYTES];
+    u32 address;          /* the block while its actor is being made */
+    u8 state;             /* 0 free, 1 being made, 2 made, 3 refused */
+    u8 timed;             /* its creation asked dKy_daynight_check */
+} as_roster_entry;
+static as_roster_entry as_roster[AS_ROSTER];
+static u32 as_roster_next;
+static u32 as_roster_creating;   /* the block of the fopAc_Create running, 0 outside */
+
+/* dKy_daynight_check (decomp bindings.h, no argument), before it runs: the actor being created
+ * depends on the time of day. */
+WWHD_HOOK(0x02556D14, as_roster_daynight, (void)) {
+    u32 prm = as_roster_creating;
+    if (!prm) return;
+    for (u32 i = 0; i != AS_ROSTER; ++i)
+        if (as_roster[i].state == 1 && as_roster[i].address == prm) {
+            as_roster[i].timed = 1;
+            return;
+        }
+}
+
+static void as_roster_note(u32 data, u32 prm) {
+    const u8* play = wwhd_play_get();
+    if (!play || !data || !prm) return;
+    as_roster_entry* e = &as_roster[as_roster_next++ % AS_ROSTER];
+    for (u32 i = 0; i != 8; ++i) {
+        e->stage[i] = (char)play[WWHD_PLAY_START_STAGE_NAME_OFFSET + i];
+        e->name[i] = ((const char*)data)[i];
+    }
+    memcpy(e->block, (const void*)prm, AS_PRM_BYTES);
+    e->address = prm;
+    e->state = 1;
+    e->timed = 0;
+}
+
+static void as_roster_result(u32 prm, s32 result) {
+    if (!prm || (result != AS_PHASE_DONE && result != AS_PHASE_ERROR)) return;
+    for (u32 i = 0; i != AS_ROSTER; ++i) {
+        as_roster_entry* e = &as_roster[i];
+        if (e->state != 1 || e->address != prm) continue;
+        e->state = result == AS_PHASE_DONE ? 2 : 3;
+        e->address = 0;
+        return;
+    }
 }
 
 /* Placed actors: tag every parameter block, and create the server's number of copies of the
@@ -583,11 +723,13 @@ WWHD_REPLACE(0x025C1154, void, as_stage_create, (u32 data, u32 prm)) {
     for (; i < copies; ++i) {
         u32 copy = as_make_copy((const char*)data, (const u8*)prm, i, randomized, group);
         if (!copy) break; /* game heap exhausted: keep what was created */
+        as_roster_note(data, copy);
         as_stage_create_original(data, copy);
     }
     *(u8*)(prm + AS_PRM_TAG) = AS_TAG;
     *(u8*)(prm + AS_PRM_COPY) = 0;
     if (group) as_note_add(prm, group, 0, i, randomized, (const char*)data);
+    as_roster_note(data, prm);
     as_stage_create_original(data, prm);
 }
 
@@ -680,7 +822,8 @@ static mp_u32 as_spawn_factory(void) {
 static u8 as_spawn_class(s32 proc) {
     if (proc == AS_PROC_ITEM) return AS_CLS_ITEM;
     if (proc == AS_PROC_IBALL) return AS_CLS_BALL;
-    if (proc == AS_PROC_BOMB || proc == AS_PROC_BOMB2 || proc == AS_PROC_ARROW || proc == AS_PROC_BOOMERANG)
+    if (proc == AS_PROC_BOMB || proc == AS_PROC_BOMB2 || proc == AS_PROC_ARROW || proc == AS_PROC_BOOMERANG ||
+        proc == AS_PROC_HOOKSHOT || proc == AS_PROC_ROPE)
         return AS_CLS_WEAPON;
     return AS_CLS_NONE;
 }
@@ -691,6 +834,8 @@ static const char* as_spawn_name(s32 proc) {
     if (proc == AS_PROC_BOMB2) return "Bomb2";
     if (proc == AS_PROC_ARROW) return "Arrow";
     if (proc == AS_PROC_IBALL) return "Iball";
+    if (proc == AS_PROC_HOOKSHOT) return "Hookshot";
+    if (proc == AS_PROC_ROPE) return "Himo2";
     return "Boomrang";
 }
 
@@ -866,12 +1011,20 @@ WWHD_REPLACE(0x025D4C70, s32, as_create, (void* actor)) {
     }
     if (actor && *(const volatile s8*)((const u8*)actor + AS_INIT_STATE) == 0) {
         u32 prm = *(const volatile u32*)((const u8*)actor + AS_USER_DATA);
-        if (prm) as_track_enemy(actor, prm); /* live mutators, also before the connection */
+        if (prm) {
+            as_track_enemy(actor, prm); /* live mutators, also before the connection */
+            el_note_create(actor, prm); /* dynamic scaling and elites (elite.h) */
+        }
     }
     as_player_swap swap;
     as_swap_in(actor ? as_find(actor) : 0, &swap); /* a weapon copy's create reads the player too */
+    u32 user = actor ? *(const volatile u32*)((const u8*)actor + AS_USER_DATA) : 0;
+    u32 outer = as_roster_creating;
+    as_roster_creating = user;
     s32 result = as_create_original(actor);
+    as_roster_creating = outer;
     as_swap_out(&swap);
+    as_roster_result(user, result);
     return result;
 }
 
@@ -926,10 +1079,12 @@ static void as_on_deleted(as_slot* s, s8 health) {
 WWHD_REPLACE(0x025D4B4C, s32, as_delete, (void* actor)) {
     as_slot* s = actor ? as_find(actor) : 0;
     s8 health = actor ? ((const fopAc_ac_c*)actor)->health : 0;
+    el_actor* elite = actor ? el_delete_begin(actor) : 0;
     u8 saved = as_context;
     if (actor) as_context = as_context_of(actor, s); /* drops made while dying */
     s32 result = as_delete_original(actor);
     as_context = saved;
+    if (result) el_delete_end(elite, health); /* a dead elite explodes (elite.h) */
     if (actor && result) {
         if (as_inherit_count) as_ctx_drop(as_inherit, &as_inherit_count, actor);
         if (as_kill_count) as_ctx_drop(as_kill, &as_kill_count, actor);
@@ -972,10 +1127,41 @@ static void as_apply_carry(const as_slot* s, fopAc_ac_c* a) {
     a->actor_status = (a->actor_status & ~AS_CARRY_BITS) | bits;
 }
 
+/* A boomerang copy is thrown as the owner's: daBoomerang_c::procWait (020CF4CC) starts the flight
+ * when mParameters is 1, which the owner's Link sets at the throw; procMove sets it back to 0 at the
+ * catch. Before 0.2.41 only arrows got their owner's parameters: a boomerang copy stayed in procWait,
+ * whose setKeepMatrix puts its model in the puppet's hand every frame, with no attack collider. Its
+ * place then follows the owner's (as_follows_owner), its collider hits there (as_hit). */
+static void as_boomerang_params(as_slot* s, fopAc_ac_c* a) {
+    if (s->kind != AS_KIND_SPAWNED || !s->replica || s->spawn.proc != AS_PROC_BOOMERANG) return;
+    u32 b = (u32)a;
+    /* its procWait function as this game stores it (create() sets it): given back at the catch */
+    if (!s->wait_proc && a->mParameters == 0 && *(const volatile s16*)(b + BOOM_PROC_SELECTOR) == -1)
+        s->wait_proc = *(const volatile u32*)(b + BOOM_PROC_TARGET);
+    /* it reached the puppet's hand before its owner's catch came: no self deletion */
+    if (*(const volatile u8*)(b + BOOM_CATCH_AND_DELETE)) *(volatile u8*)(b + BOOM_CATCH_AND_DELETE) = 0;
+    if (s->spawn.params == s->applied_params) return;
+    s->applied_params = s->spawn.params;
+    *(volatile u32*)(b + AS_PARAMETERS) = s->spawn.params;
+    if (s->spawn.params == 0 && s->wait_proc) {
+        /* caught by its owner: back in the hand as procMove does at the catch (020CEE10) */
+        *(volatile u8*)(b + BOOM_IS_RETURNING) = 0;
+        *(volatile u8*)(b + BOOM_THIRD_PERSON) = 0;
+        *(volatile s16*)(b + BOOM_PROC_ADJUST) = 0;
+        *(volatile s16*)(b + BOOM_PROC_SELECTOR) = -1;
+        *(volatile u32*)(b + BOOM_PROC_TARGET) = s->wait_proc;
+        a->speedF = 0.0f;
+    }
+    static u32 logged;
+    if (logged++ < 3) wwhd_log_int("multiplayer: boomerang copy given its owner's parameters", (int)s->spawn.params);
+}
+
 static void as_before_execute(as_slot* s, fopAc_ac_c* a) {
+    as_boomerang_params(s, a);
     if (as_follows_owner(s)) {
         as_place(s, a);
         as_apply_carry(s, a);
+        if (s->has_net_health && s->net_tag) el_adopt(a, s->net_tag); /* the owner's elite draw */
         /* a missed hit only: never heals a copy that was hit first, never touches a dying one */
         if (s->has_net_health && a->health > 1 && s->net_health < a->health)
             a->health = (s8)(s->net_health < 1 ? 1 : s->net_health); /* the death comes as a hit */
@@ -1010,10 +1196,119 @@ static void as_after_execute(as_slot* s, fopAc_ac_c* a) {
             return;
         }
     }
+    /* a hookshot copy in the puppet's hand: procWait put it there (as_execute) */
+    if (following && s->kind == AS_KIND_SPAWNED && s->spawn.proc == AS_PROC_HOOKSHOT && s->spawn.params == 0) return;
     if (following) {
         as_place(s, a);
         as_apply_carry(s, a);
     }
+}
+
+/* ---- the others' hookshot and Grappling Hook, shown only (0.2.42) ----
+ * daHookshot_c::execute (02176D98, d_a_hookshot.cpp) runs its proc, then from its place and
+ * player 0's mHookshotRootPos computes the chain (mChainCnt, shape_angle) and its tip's matrix;
+ * draw (02176C50) lays the chain from the link player's mHookshotRootPos. Its procs pull the player
+ * and catch actors: a copy runs procWait only, in its owner's waiting mode (0), which keeps it in
+ * the puppet's hand; in the other modes (shot 1, return 2, pull 3) it is put at its owner's
+ * hookshot's place and runs execute with the proc skipped (execute calls it only when the ptmf's
+ * index is not 0), so only the chain and the tip are computed.
+ * himo2_class (the Grappling Hook, d_a_himo2.cpp / d_a_himo2_move.cpp) reads the local camera
+ * and pad and its hooking starts an event: a copy never runs its execute. Its owner's state
+ * (m02DC, sent as the spawn variant) and place are enough for its draw (0216CA5C): waiting (0, 1),
+ * the hook in the left hand and the coil in the right; out (2 and more), a line of segments from
+ * the puppet's left hand to the owner's hook, drawn as the free flight (state 2) draws it
+ * (himo2_draw: m02B4, then m0310[m02CC + 1 .. 97], the hook at m0310[98] turned by its m1E, m1C). */
+/* Square root (the 750 has no fsqrt; no libm): a power-of-4 start, then Newton. */
+static f32 as_sqrt(f32 x) {
+    if (!(x > 0.0f)) return 0.0f;
+    f32 g = 1.0f;
+    f32 y = x;
+    while (y > 4.0f) { y *= 0.25f; g *= 2.0f; }
+    while (y < 0.25f) { y *= 4.0f; g *= 0.5f; }
+    for (int i = 0; i != 6; ++i) g = 0.5f * (g + x / g);
+    return g;
+}
+
+static void as_rope_point(const f32* m, f32* out) { /* the hand matrix times (4, 0, 0), as execute */
+    out[0] = m[0] * 4.0f + m[3];
+    out[1] = m[4] * 4.0f + m[7];
+    out[2] = m[8] * 4.0f + m[11];
+}
+
+static void as_rope_visual(as_slot* s, fopAc_ac_c* a) {
+    puppet_slot* ps = puppet_slot_for(s->creator, 0);
+    if (!ps || !ps->actor) return;
+    const daPy_lk_c* pl = (const daPy_lk_c*)ps->actor;
+    const f32* lh = puppet_anm_mtx(pl->mpCLModel, 8);  /* cl_LhandA */
+    const f32* rh = puppet_anm_mtx(pl->mpCLModel, 12); /* cl_RhandA */
+    if (!lh || !rh) return;
+    u32 r = (u32)a;
+    f32 left[3], right[3];
+    as_rope_point(lh, left);
+    as_rope_point(rh, right);
+    volatile f32* hands = (volatile f32*)(r + ROPE_HANDS);
+    volatile f32* start = (volatile f32*)(r + ROPE_START);
+    for (int c = 0; c != 3; ++c) {
+        hands[c] = left[c];
+        hands[3 + c] = right[c];
+        start[c] = left[c];
+    }
+    *(volatile s16*)(r + ROPE_M029E) = 0;
+    *(volatile s8*)(r + ROPE_SPIN) = 0;
+    *(volatile s8*)(r + ROPE_DEMO) = 0;
+    if (s->spawn.variant < ROPE_LAUNCH_FREE) {
+        *(volatile s32*)(r + ROPE_STATE) = 0;
+        *(volatile s32*)(r + ROPE_FIRST) = 97;
+        *(volatile f32*)(r + ROPE_LENGTH) = 0.0f;
+        a->current.pos.x = left[0];
+        a->current.pos.y = left[1];
+        a->current.pos.z = left[2];
+        return;
+    }
+    f32 end[3] = {a->current.pos.x, a->current.pos.y, a->current.pos.z}; /* the owner's hook */
+    f32 d[3] = {end[0] - left[0], end[1] - left[1], end[2] - left[2]};
+    f32 square = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    f32 dist = as_sqrt(square);
+    s32 n = (s32)(dist / 40.0f);
+    if (n < 2) n = 2;
+    if (n > 90) n = 90;
+    s32 first = 97 - n;
+    for (s32 k = 1; k <= n + 1; ++k) {
+        f32 t = (f32)k / (f32)(n + 1);
+        volatile f32* p = (volatile f32*)(r + ROPE_SEGMENTS + (u32)(first + k) * ROPE_SEGMENT_BYTES + 0x10);
+        for (int c = 0; c != 3; ++c) p[c] = left[c] + d[c] * t;
+    }
+    f32 horizontal = as_sqrt(d[0] * d[0] + d[2] * d[2]);
+    u32 hook = r + ROPE_SEGMENTS + 98u * ROPE_SEGMENT_BYTES;
+    *(volatile s16*)(hook + 0x1C) = (s16)-wwhd_cM_atan2s_hd(d[1], horizontal);
+    *(volatile s16*)(hook + 0x1E) = wwhd_cM_atan2s_hd(d[0], d[2]);
+    *(volatile s32*)(r + ROPE_FIRST) = first;
+    *(volatile s32*)(r + ROPE_STATE) = ROPE_LAUNCH_FREE;
+    *(volatile f32*)(r + ROPE_LENGTH) = dist;
+}
+
+/* The execute of a hookshot or Grappling Hook copy; 0 when it is not one. */
+static int as_visual_execute(as_slot* s, void* actor, s32* result) {
+    if (!s || s->kind != AS_KIND_SPAWNED || !s->replica || s->state != AS_SYNCED) return 0;
+    fopAc_ac_c* a = (fopAc_ac_c*)actor;
+    if (s->spawn.proc == AS_PROC_ROPE) {
+        as_rope_visual(s, a);
+        *result = 1;
+        return 1;
+    }
+    if (s->spawn.proc != AS_PROC_HOOKSHOT) return 0;
+    if (s->spawn.params == 0) {
+        a->mParameters = 0; /* procWait: in the hand, never shot */
+        *result = sense_execute(actor);
+        return 1;
+    }
+    a->mParameters = s->spawn.params;
+    volatile s16* index = (volatile s16*)((u32)actor + HOOK_PROC_INDEX);
+    s16 saved = *index;
+    *index = 0;
+    *result = sense_execute(actor);
+    *index = saved;
+    return 1;
 }
 
 /* particle_sync.h: the emitters the local Link (or its ship) made in its execute, read after it */
@@ -1041,12 +1336,35 @@ WWHD_REPLACE(0x025D475C, s32, as_execute, (void* actor)) {
     int local = as_context == AS_CTX_LOCAL;
     int saved_capture = ps_capturing;
     ps_capturing = local;
-    s32 result = sense_execute(actor);
+    s32 result;
+    el_actor* elite = el_execute_begin(actor); /* an elite's animations go faster (elite.h) */
+    if (!as_visual_execute(s, actor, &result)) result = sense_execute(actor);
+    el_execute_end(elite);
     ps_capturing = saved_capture;
     if (local) ps_flush();
     if (s) as_after_execute(s, (fopAc_ac_c*)actor);
     as_swap_out(&swap);
     as_context = saved;
+    return result;
+}
+
+/* fopAc_Draw (025D4654, one argument, f_op_actor.cpp): the boomerang, hookshot and Grappling
+ * Hook draw from the player (the hookshot's chain from the link player's mHookshotRootPos, the
+ * rope's coil and hook in player 0's hands): a copy draws with its creator's puppet as player. */
+WWHD_GAME_ORIGINAL(0x025D4654, s32, as_draw_original, (void* actor));
+WWHD_REPLACE(0x025D4654, s32, as_draw, (void* actor)) {
+    as_slot* s = actor ? as_find(actor) : 0;
+    if (!s || s->kind != AS_KIND_SPAWNED || !s->replica ||
+        (s->spawn.proc != AS_PROC_BOOMERANG && s->spawn.proc != AS_PROC_HOOKSHOT && s->spawn.proc != AS_PROC_ROPE)) {
+        el_draw_begin(actor); /* an elite draws with its own colours (elite.h) */
+        s32 drawn = as_draw_original(actor);
+        el_draw_end();
+        return drawn;
+    }
+    as_player_swap swap;
+    as_swap_in(s, &swap);
+    s32 result = as_draw_original(actor);
+    as_swap_out(&swap);
     return result;
 }
 
@@ -1161,6 +1479,7 @@ static void as_apply_values(as_slot* s, const mp_placed_actor* a) {
     }
     if (a->values.has_health) {
         s->net_health = a->values.health;
+        s->net_tag = a->values.tag;
         s->net_status = a->values.status;
         s->has_net_health = 1;
         s->age = 0;
@@ -1200,8 +1519,141 @@ static void as_add_replica(const mp_placed_actor* a) {
     s->uid = a->uid;
     s->creator = a->owner;
     s->spawn = a->values.spawn;
+    s->applied_params = a->values.spawn.params; /* it is created with them */
     s->pending_clock = 0;
     as_apply_values(s, a);
+}
+
+/* ---- the launcher's shop: creatures summoned next to a player (mod.c shop_*) ----
+ * A summoned creature is made like a placed actor of the stage: a block from fopAcM_CreateAppend
+ * (025D5600: cleared, setID 0xFFFF, scale 10, parent -1, argument 0xFF), its parameters, place,
+ * angles and room, then dStage_actorCreate (025C1154, the original: it writes argument and gbaName
+ * from the name table and requests the process). The block is tagged (AS_TAG) with AS_SUMMON as
+ * its copy number (a multiplier copy is < 16), so the actor is synchronised like the stage's
+ * enemies, its game UID being the block. The server sends its creation to the other players of
+ * the area (SyncedActorManager.broadcastActor); a game that has no actor with that block makes it
+ * from the received block (as_summon_remote), then matches it as for a placed actor. Not for a
+ * player who enters the area later (the server sends only the actors without a game UID then). */
+#define AS_SUMMON 0xFE
+#define AS_SUMMON_RECENT 8
+#define AS_SUMMON_FORGET 150 /* logic steps a remote creature is not made twice */
+#define AS_PRM_SET_ID 0x16
+#define AS_PRM_ROOM 0x21
+
+typedef struct as_summon_note {
+    u8 block[AS_PRM_BYTES];
+    unsigned long long step;
+    int used;
+} as_summon_note;
+static as_summon_note as_summon_notes[AS_SUMMON_RECENT];
+static u32 as_summon_next;
+
+static void as_summon_create(const char* name, u32 block) {
+    for (u32 n = 0; n != sizeof(as_stage_data); ++n) as_stage_data[n] = 0;
+    for (u32 n = 0; n != AS_STAGE_NAME && name[n]; ++n) as_stage_data[n] = (u8)name[n];
+    as_stage_create_original((u32)as_stage_data, block);
+}
+
+/* A creature of name next to a place: 1 when requested. */
+#define AS_SUMMON_SEED 0x5E /* the "copy number" of a summoned creature's variants */
+static int as_summon(const char* name, u32 params, s16 angle_x, s16 angle_z, const f32* pos, s16 yaw, s8 room,
+                     int randomized) {
+    u32 b = wwhd_fopAcM_CreateAppend();
+    if (!b) return 0;
+    *(volatile u32*)b = params;
+    for (u32 c = 0; c != 3; ++c) *(volatile f32*)(b + AS_PRM_POSITION + c * 4) = pos[c];
+    *(volatile s16*)(b + AS_PRM_ANGLE) = angle_x;
+    *(volatile s16*)(b + AS_PRM_ANGLE + 2) = yaw;
+    *(volatile s16*)(b + AS_PRM_ANGLE + 4) = angle_z;
+    *(volatile s8*)(b + AS_PRM_ROOM) = room;
+    *(volatile u8*)(b + AS_PRM_TAG) = AS_TAG;
+    *(volatile u8*)(b + AS_PRM_COPY) = AS_SUMMON;
+    /* variants drawn from this block (its place differs each time); the others get the result in
+     * the block itself, their game UID */
+    if (randomized) as_randomize(name, (const u8*)b, AS_SUMMON_SEED, (u8*)b);
+    as_summon_create(name, b);
+    wwhd_log("multiplayer: creature summoned:");
+    wwhd_log(name);
+    return 1;
+}
+
+/* Another player's summoned creature this game does not have: made from its block, once. */
+static void as_summon_remote(const mp_placed_actor* a) {
+    if (a->game_uid_size != AS_PRM_BYTES || a->game_uid[AS_PRM_TAG] != AS_TAG || a->game_uid[AS_PRM_COPY] != AS_SUMMON)
+        return;
+    if (!as_enabled || !mp_filter_contains(as_session, a->name)) return;
+    unsigned long long now = wwhd_logic_step();
+    for (u32 i = 0; i != AS_SUMMON_RECENT; ++i) {
+        as_summon_note* n = &as_summon_notes[i];
+        if (n->used && now - n->step < AS_SUMMON_FORGET && as_same_bytes(n->block, a->game_uid, AS_PRM_BYTES)) return;
+    }
+    u32 b = wwhd_fopAcM_CreateAppend();
+    if (!b) return;
+    memcpy((void*)b, a->game_uid, AS_PRM_BYTES);
+    as_summon_note* n = &as_summon_notes[as_summon_next++ % AS_SUMMON_RECENT];
+    memcpy(n->block, a->game_uid, AS_PRM_BYTES);
+    n->step = now;
+    n->used = 1;
+    as_summon_create(a->name, b);
+    wwhd_log("multiplayer: another player's summoned creature made here:");
+    wwhd_log(a->name);
+}
+
+
+static int as_roster_same(const void* a, const void* b, u32 n) {
+    for (u32 k = 0; k != n; ++k)
+        if (((const u8*)a)[k] != ((const u8*)b)[k]) return 0;
+    return 1;
+}
+
+/* The same placed actor (name and block) as entry i, made, being made or already asked. */
+static int as_roster_twin(u32 i) {
+    const as_roster_entry* e = &as_roster[i];
+    for (u32 j = 0; j != AS_ROSTER; ++j) {
+        const as_roster_entry* o = &as_roster[j];
+        if (j == i || o->state == 0 || o->state == 3) continue;
+        if (as_roster_same(o->name, e->name, 8) && as_roster_same(o->stage, e->stage, 8) &&
+            as_roster_same(o->block, e->block, AS_PRM_BYTES))
+            return 1;
+    }
+    return 0;
+}
+
+/* The refused timed actors of the stage and room being played, asked again (world_sync.h): the count. */
+static u32 as_roster_retry(void) {
+    const u8* play = wwhd_play_get();
+    if (!play) return 0;
+    u32 link = *(const volatile u32*)(play + WWHD_PLAY_PLAYER_OFFSET);
+    s8 room = link ? ((const fopAc_ac_c*)link)->current.roomNo : -1;
+    u32 asked = 0;
+    for (u32 i = 0; i != AS_ROSTER; ++i) {
+        as_roster_entry* e = &as_roster[i];
+        if (e->state != 3 || !e->timed) continue;
+        int same = 1;
+        for (u32 k = 0; k != 8 && same; ++k) {
+            if (e->stage[k] != (char)play[WWHD_PLAY_START_STAGE_NAME_OFFSET + k]) same = 0;
+            if (!e->stage[k]) break;
+        }
+        s8 at = (s8)e->block[AS_PRM_ROOM];
+        if (!same || (at != room && at != -1)) continue;
+        if (as_roster_twin(i)) { /* noted twice (the room loaded again): one is enough */
+            e->state = 0;
+            continue;
+        }
+        u32 b = wwhd_fopAcM_CreateAppend();
+        if (!b) break;
+        memcpy((void*)b, e->block, AS_PRM_BYTES);
+        char name[9];
+        for (u32 k = 0; k != 8; ++k) name[k] = e->name[k];
+        name[8] = 0;
+        e->address = b;
+        e->state = 1;
+        e->timed = 0;
+        as_summon_create(name, b);
+        ++asked;
+    }
+    wwhd_log_int("multiplayer: day and night: timed stage actors asked again", (int)asked);
+    return asked;
 }
 
 static int as_handle_create(const mp_u8* body, mp_u32 length) {
@@ -1214,6 +1666,7 @@ static int as_handle_create(const mp_u8* body, mp_u32 length) {
         return 1;
     }
     as_slot* s = as_match_create(&a);
+    if (!s) as_summon_remote(&a);
     if (!s || s->factory != a.factory) return 1;
     s->uid = a.uid;
     s->state = AS_SYNCED;
@@ -1289,13 +1742,45 @@ static as_slot* as_weapon_of(u32 at, u32* offset) {
     return s;
 }
 
-/* cCcSState::SetAtTgCommonHitInf. A weapon copy hits nothing (its creator's hits come as strikes).
+/* The actor a collider belongs to (its status's actor), 0 when none. */
+static u32 as_collider_actor(u32 obj) {
+    u32 stts = as_ld32(obj + AS_OBJ_STTS);
+    return stts ? as_ld32(stts + AS_STTS_ACTOR) : 0;
+}
+
+/* cCcSState::SetAtTgCommonHitInf. A weapon copy (another player's bomb, arrow, boomerang) hits
+ * what its creator's game cannot hit for this one: the local Link (a bomb hurts every player near
+ * it, as one's own bomb hurts oneself) and the actors that are not synchronised (pots, grass, an
+ * enemy outside the server's list). Not a synchronised actor (its creator's hit comes as a strike,
+ * replayed with this copy's collider: once only) nor a Link puppet (that player's own game says
+ * whether it was hit). Before 0.2.41 a copy hit nothing.
  * The hitter's game: a hit of its Link's sword, or of its own spawned weapon, on a synchronised
  * actor joins the next ActorPlayerSync update. */
+static u32 as_copy_hits_logged, as_copy_skips_logged;
 WWHD_REPLACE(0x0200CFA8, void, as_hit, (void* self, void* at, void* tg, void* pos)) {
     u32 at_offset = 0;
     as_slot* weapon = (at && as_session) ? as_weapon_of((u32)at, &at_offset) : 0;
-    if (weapon && weapon->replica && !as_replaying) return;
+    if (weapon && weapon->replica && !as_replaying &&
+        (weapon->spawn.proc == AS_PROC_HOOKSHOT || weapon->spawn.proc == AS_PROC_ROPE))
+        return; /* shown only: the hooks of the others pull and catch nothing here */
+    if (weapon && weapon->replica && !as_replaying) {
+        u32 target = tg ? as_collider_actor((u32)tg) : 0, unused;
+        if (!target || (tg && as_collider_owner((u32)tg, &unused)) || puppet_slot_of_actor(target) >= 0) {
+            if (as_copy_skips_logged < 3 && target) {
+                ++as_copy_skips_logged;
+                wwhd_log_hex("multiplayer: weapon copy hit left to its creator's strike, target", target);
+            }
+            return;
+        }
+        as_hit_original(self, at, tg, pos);
+        if (as_copy_hits_logged < 3) {
+            ++as_copy_hits_logged;
+            wwhd_log_hex(target == as_link ? "multiplayer: another player's weapon hit the local Link"
+                                           : "multiplayer: another player's weapon hit an actor here",
+                         target);
+        }
+        return;
+    }
     as_hit_original(self, at, tg, pos);
     if (!as_enabled || !as_session || as_local_uid == MP_NO_ID || !as_link || !at || !tg || !pos) return;
     u32 a = (u32)at, t = (u32)tg;
@@ -1336,6 +1821,12 @@ WWHD_REPLACE(0x0200CFA8, void, as_hit, (void* self, void* at, void* tg, void* po
     s->last_strike = k;
     s->has_last_strike = 1;
     if (!as_strikes_sent++) wwhd_log_int("multiplayer: first hit sent, damage", (int)k.atp);
+    static u32 weapon_strikes_logged;
+    if (attacker && weapon_strikes_logged < 3) {
+        ++weapon_strikes_logged;
+        wwhd_log_int("multiplayer: weapon hit sent, weapon uid", (int)attacker);
+        wwhd_log_int("multiplayer:   damage", (int)k.atp);
+    }
 }
 
 /* The attack values a strike carries, written into a collider (saved and restored around the
@@ -1436,6 +1927,13 @@ static void as_replay(u32 ccs, const as_pending_strike* p) {
     as_hit_pos.y = k->pos[1];
     as_hit_pos.z = k->pos[2];
     u32 g = as_weapon_collider(k); /* a bomb's or arrow's hit: with the copy's own collider */
+    static u32 weapon_replays_logged;
+    if (k->attacker && weapon_replays_logged < 6) {
+        ++weapon_replays_logged;
+        wwhd_log_int(g ? "multiplayer: weapon hit replayed with the copy's collider, damage"
+                       : "multiplayer: weapon hit replayed without its copy (puppet's collider), damage",
+                     (int)k->atp);
+    }
     if (g) {
         as_at_values saved;
         as_save_at(g, &saved);
@@ -1445,7 +1943,11 @@ static void as_replay(u32 ccs, const as_pending_strike* p) {
         as_replaying = 0;
         u32 hit = as_ld32(tg + AS_OBJ_TG_HITOBJ) == g;
         as_load_at(g, &saved);
-        if (!hit) return;
+        if (!hit) {
+            static u32 refused_logged;
+            if (refused_logged++ < 3) wwhd_log_int("multiplayer: weapon hit refused by the target's collider, damage", (int)k->atp);
+            return;
+        }
     } else {
         u32 hitter = as_link;
         puppet_slot* puppet = puppet_slot_for(p->player, 0);
@@ -1536,6 +2038,8 @@ static void as_read_spawn(const as_slot* s, const fopAc_ac_c* a, mp_spawn* p) {
     p->gravity = a->gravity;
     if (s->spawn.proc == AS_PROC_ARROW)
         p->variant = *(const volatile u8*)((const u8*)a + AS_ARROW_TYPE);
+    else if (s->spawn.proc == AS_PROC_ROPE) /* its state: in the hand or out (as_rope_visual) */
+        p->variant = (u8)*(const volatile s32*)((const u8*)a + ROPE_STATE);
     else
         p->variant = (u8)(((a->actor_status & 0x2000u) ? 1 : 0) | ((a->actor_status & 0x100000u) ? 2 : 0));
 }
@@ -1559,6 +2063,7 @@ static void as_send_create(as_slot* s, const fopAc_ac_c* a) {
     s->pending_clock = 0;
     s->sent = v.transform;
     s->sent_health = v.health;
+    s->sent_tag = v.tag;
     s->sent_status = v.status;
     s->has_sent = 1;
 }
@@ -1573,11 +2078,14 @@ static void as_send_owner(as_slot* s, const fopAc_ac_c* a, double dt) {
         moved |= v.transform.pos[k] != s->sent.pos[k] || v.transform.rot[k] != s->sent.rot[k];
     v.has_transform = moved && s->send_clock <= 0;
     v.has_health = as_session->factories[s->factory].health_index != 0xFF &&
-                   (v.health != s->sent_health || v.status != s->sent_status);
+                   (v.health != s->sent_health || v.tag != s->sent_tag || v.status != s->sent_status);
     v.has_spawn = 0;
     if (s->kind == AS_KIND_SPAWNED && !s->replica) {
         as_read_spawn(s, a, &v.spawn);
         if (s->spawn.proc == AS_PROC_ARROW) v.has_spawn = a->mParameters != s->sent_params;
+        else if (s->spawn.proc == AS_PROC_BOOMERANG || s->spawn.proc == AS_PROC_HOOKSHOT ||
+                 s->spawn.proc == AS_PROC_ROPE) /* thrown, back in the hand; the rope's state */
+            v.has_spawn = a->mParameters != s->sent_params || v.spawn.variant != s->sent_variant;
         else v.has_spawn = v.spawn.variant != s->sent_variant; /* picked up, put down, thrown */
         if (v.has_spawn) v.has_transform = 1; /* the place it happens at */
     }
@@ -1591,6 +2099,7 @@ static void as_send_owner(as_slot* s, const fopAc_ac_c* a, double dt) {
     }
     if (v.has_health) {
         s->sent_health = v.health;
+        s->sent_tag = v.tag;
         s->sent_status = v.status;
     }
     if (v.has_spawn) {

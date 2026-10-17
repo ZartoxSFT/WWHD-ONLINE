@@ -23,7 +23,9 @@
  *    states 1049EC84 / 1049ECB0 / 1049ECDC (menu entry, menu and subwindow: items, collection, map,
  *    bag): its current state object (+0x18) has the descriptor at +8; with none, the pending
  *    descriptor is at +0x14 (docs/gamepad-display.md, runtime/src/gfx/gamepad_ui_state.cpp). The
- *    GamePad keeps its sea chart up during play: the players are drawn only while the menu is open.
+ *    GamePad keeps its sea chart up during play: there the players are drawn whenever the chart
+ *    updates (0.2.36; before, only while the menu was open). Deduced, not verified in game: the
+ *    chart does not update while the GamePad shows another screen (items), or its panes are hidden.
  *  - The remote players wear the game's Link icon itself, decoded at run time from its texture
  *    (wwhd_hud_game_pixels: nothing of the game is in the package) before our recolouring, then
  *    recoloured per player like the tunic (mod.c).
@@ -157,8 +159,67 @@ static int chart_menu_open(void) {
                           descriptor == (u32)&WWHD_GAME_DATA(0x1049ECDC, u8));
 }
 
-static int chart_on_screen(chart_view* v) {
-    if (!chart_menu || chart_busy || !chart_menu_open()) return 0;
+/* in_menu: only while the Start menu is open (the TV's chart). The GamePad's chart is the same
+ * screen and stays up during play: there it counts as on screen whenever the game updated it this
+ * step and its panes are shown (in_menu 0). */
+/* ---- any screen with the sea chart's grid ----
+ * hdSeaChartGrid_c::refreshChartMarks (026834A4, every update of a chart grid: runtime/src/mods/
+ * story_chart.cpp) gives the grid; its chart area is the pane at +0xC8 (the 7 x 7 squares, square
+ * D4's centre at its position, a square = its size / 7, y up: updateChartMarkLayout). The MAP
+ * screen has one; the Ballad of Gales' warp map (layout WarpMap_00, with Map_00, MapAreaNow_00 and
+ * BtnMapBalloon_00 like the MAP screen) is drawn on whatever grid updates while the MAP screen is
+ * not on screen (deduced from its layout names, not verified in game: the first grid of each kind
+ * is logged). A return hook: story_chart.cpp replaces nothing there either. */
+#define GRID_CHART_AREA 0xC8
+static u32 chart_grid;
+static unsigned long long chart_grid_step;
+static u32 chart_grid_logged[4];
+
+WWHD_HOOK_RETURN(0x026834A4, chart_grid_refresh, (u32 grid)) {
+    chart_grid = grid;
+    chart_grid_step = wwhd_logic_step();
+    for (int i = 0; i != 4; ++i) {
+        if (chart_grid_logged[i] == grid) break;
+        if (!chart_grid_logged[i]) {
+            chart_grid_logged[i] = grid;
+            wwhd_log_hex("multiplayer: sea chart grid", grid);
+            u32 area = tunic_ld32(grid + GRID_CHART_AREA);
+            wwhd_log_int("multiplayer: sea chart grid   is the MAP screen's", chart_menu && area && tunic_ld32(chart_menu + CHART_MAIN_PANE) == area);
+            wwhd_log_int("multiplayer: sea chart grid   Start menu open", chart_menu_open());
+            if (area && !(area & 3)) wwhd_log((const char*)(area + PANE_NAME));
+            break;
+        }
+    }
+}
+
+/* in_menu (the TV): the MAP screen's own grid (its chart area is the menu's main pane) only while
+ * the Start menu is open; with the Pro Controller the GamePad's screens keep updating during play
+ * (0.2.38 drew them on the TV then). Another grid (the warp map) whenever it updates. */
+static int chart_grid_is_menu(u32 area) {
+    return chart_menu && tunic_ld32(chart_menu + CHART_MAIN_PANE) == area;
+}
+
+static int chart_grid_on_screen(chart_view* v, int in_menu) {
+    if (!chart_grid || wwhd_logic_step() - chart_grid_step > CHART_SEEN_STEPS) return 0;
+    u32 area = tunic_ld32(chart_grid + GRID_CHART_AREA);
+    if (!area || (area & 3)) return 0;
+    if (in_menu && !chart_menu_open() && chart_grid_is_menu(area)) return 0;
+    chart_space s;
+    if (!chart_pane_space(area, &s)) return 0;
+    f32 square_x = *(const volatile f32*)(area + PANE_SIZE) / CHART_SQUARES;
+    f32 square_y = *(const volatile f32*)(area + PANE_SIZE + 4) / CHART_SQUARES;
+    if (!(square_x > 0.0f && square_y > 0.0f) || !chart_finite(square_x) || !chart_finite(square_y)) return 0;
+    v->ox = CHART_LAYOUT_W * 0.5f + s.ox;
+    v->oy = CHART_LAYOUT_H * 0.5f - s.oy;
+    v->kx = square_x / CHART_SQUARE * s.kx;
+    v->ky = square_y / CHART_SQUARE * s.ky;
+    v->alpha = 1.0f;
+    v->icon = square_x * s.kx * 0.35f;
+    return 1;
+}
+
+static int chart_on_screen(chart_view* v, int in_menu) {
+    if (!chart_menu || chart_busy || (in_menu && !chart_menu_open())) return 0;
     if (wwhd_logic_step() - chart_step > CHART_SEEN_STEPS) return 0;
     u32 main = tunic_ld32(chart_menu + CHART_MAIN_PANE);
     if (!main || (main & 3)) return 0;

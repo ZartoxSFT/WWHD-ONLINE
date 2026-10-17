@@ -6,6 +6,7 @@
  * Format: UTF-8/ASCII lines "key=value", '#' comments, CR/LF or LF, at most 4096 bytes.
  * Keys: uid (exactly 8 bytes), host, port (1..65535), color, color2, ship_color, cursor
  * (RRGGBB with an optional '#'), puppet (0/1), hide_names (0/1: no name above any player),
+ * hide_hud (0/1: the game's HUD hidden, mod.c hud_meter_draw),
  * outfit (auto, hero, casual: the clothes, outfit.h), name (1..16 printable ASCII characters, shown
  * above the player's head on the other clients), skin (another Link model, skin.h: 1..12 of a-z 0-9 _,
  * the file skin_<id>.szs next to launcher.cfg; empty for Link). Unknown keys are ignored; a malformed value is ignored on its own
@@ -28,6 +29,8 @@ typedef struct mp_launcher_cfg {
     int puppet;
     int has_hide_names;
     int hide_names;
+    int has_hide_hud;
+    int hide_hud;
     int has_outfit;
     int outfit;          /* -1 auto (the save), 0 hero's clothes, 1 casual clothes */
     int has_name;
@@ -105,6 +108,11 @@ static inline void mp_cfg_value(const char* key, unsigned int key_length, const 
         if (length == 1 && (value[0] == '0' || value[0] == '1')) {
             cfg->hide_names = value[0] == '1';
             cfg->has_hide_names = 1;
+        }
+    } else if (mp_cfg_key(key, key_length, "hide_hud")) {
+        if (length == 1 && (value[0] == '0' || value[0] == '1')) {
+            cfg->hide_hud = value[0] == '1';
+            cfg->has_hide_hud = 1;
         }
     } else if (mp_cfg_key(key, key_length, "outfit")) {
         if (length == 4 && value[0] == 'a' && value[1] == 'u' && value[2] == 't' && value[3] == 'o') {
