@@ -165,6 +165,7 @@ static int send_payload(mp_u32 id, const mp_writer* body) {
 #include "save_sync.h"  /* the shared progression (SaveServer) */
 #include "world_sync.h" /* the world's clock and weather */
 #include "elite.h"      /* dynamic scaling and elite enemies */
+#include "bonus.h"      /* yellow hearts and magic bought in the shop */
 static void wd_roster_retry(void) { as_roster_retry(); }
 
 static void read_transform(const fopAc_ac_c* actor, mp_transform* t) {
@@ -250,6 +251,7 @@ static u32 shop_notice_bytes;
 static int shop_notice_steps;
 static mp_directory directory; /* the server's player directory (launcher map section) */
 static int directory_valid;
+#include "death.h"    /* no game over while another player of the stage lives */
 
 static void handle_frame(const unsigned char* item, u32 size) {
     mp_u32 id, length;
@@ -327,6 +329,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         directory_received(body, length);
     } else if (id == session.server_player_summon) {
         shop_received(body, length);
+    } else if (id == session.server_player_revive) {
+        dh_revived(body, length);
     } else if (id == session.server_save_from) {
         sv_from_received(body, length);
     } else if (id == session.server_save_update) {
@@ -368,6 +372,7 @@ static mp_player_look current_look(const daPy_lk_c* link) {
         while (n != MP_SKIN_MAX && id[n]) ++n;
         mp_set_skin(&look, id, n);
     }
+    dh_fill_look(&look); /* a ghost's body and directory id (death.h) */
     return look;
 }
 
@@ -489,7 +494,7 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         m->x = x;
         m->y = y;
         m->scale = scale;
-        m->opacity = opacity;
+        m->opacity = r->has_look && (r->look.death & MP_DEATH_GHOST) ? opacity * 0.35f : opacity; /* a ghost */
         m->label_bytes = 0;
         if (r->has_look)
             while (m->label_bytes != MP_NAME_MAX && r->look.name[m->label_bytes]) {
@@ -545,11 +550,12 @@ typedef struct chart_face_image {
     u32 generation;
     unsigned long long epoch;
 } chart_face_image;
-static chart_face_image chart_faces[MP_DIR_MAX];
+#define CHART_FACE_SLOTS (MP_DIR_MAX + SV_SIDE_NOTICES) /* the chart's players, then the join notices */
+static chart_face_image chart_faces[CHART_FACE_SLOTS];
 static u8* chart_face_work;
 
 static u32 chart_face_for(int slot, const tunic_look* wanted, unsigned long long epoch) {
-    if (!chart_face_w || !chart_face_rgba || slot < 0 || slot >= MP_DIR_MAX) return 0;
+    if (!chart_face_w || !chart_face_rgba || slot < 0 || slot >= CHART_FACE_SLOTS) return 0;
     tunic_look look = *wanted;
     chart_face_image* f = &chart_faces[slot];
     if (f->image && f->epoch == epoch && f->generation == chart_face_generation && tunic_same_look(&f->look, &look))
@@ -578,6 +584,25 @@ static u32 chart_face_for(int slot, const tunic_look* wanted, unsigned long long
     f->generation = chart_face_generation;
     f->epoch = epoch;
     return f->image;
+}
+
+static void chart_arrow_load(unsigned long long epoch);
+
+/* save_sync.h's join notices: the sea chart's Link icon in the player's tunic colour (the icon the
+ * chart shows for them), slot k of the left notices; while the game's icon is not decoded yet (it
+ * is read from the MAP screen's layout, sea_chart.h), the chart's other player mark, the arrow
+ * (assets/map_player.png), in their colour. */
+static u32 sv_player_icon(u32 k, u16 color, u32* tint) {
+    unsigned long long epoch = wwhd_hud_epoch();
+    tunic_look look = tunic_look_make(color, color);
+    u32 face = k < SV_SIDE_NOTICES ? chart_face_for(MP_DIR_MAX + (int)k, &look, epoch) : 0;
+    if (face) {
+        *tint = 0xFFFFFFu;
+        return face;
+    }
+    chart_arrow_load(epoch);
+    *tint = mp_rgb565_to_888(color);
+    return chart_arrow_texture;
 }
 
 static int sea_stage(void) {
@@ -797,6 +822,7 @@ static void draw_gamepad(u32 list) {
 static void draw_markers(u32 list) {
     chart_view v;
     sv_draw(list); /* what the other players got, bottom left */
+    bonus_draw(list); /* the yellow hearts and magic, next to the game's (bonus.h) */
     if (!chart_menu_open()) el_draw_crowns(list); /* the elites' crowns, not over the Start menu */
     if (chart_menus_to_tv() && chart_menu_open() && dmap_shown()) draw_dungeon_players(list, 1.0f);
     if (chart_menus_to_tv() && (chart_on_screen(&v, 1) || chart_grid_on_screen(&v, 1))) {
@@ -805,6 +831,7 @@ static void draw_markers(u32 list) {
     }
     /* the names float over the game picture: not over the Start menu (sea_chart.h chart_menu_open:
      * items, collection, map and bag, on the TV or the GamePad) */
+    dh_draw(list); /* the dead players' bodies, the revive prompt (death.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
@@ -876,6 +903,7 @@ static int same_look(const mp_player_look* a, const mp_player_look* b) {
     for (int i = 0; i != 4; ++i) if (a->cursor[i] != b->cursor[i]) return 0;
     for (int i = 0; i != MP_NAME_MAX; ++i) if (a->name[i] != b->name[i]) return 0;
     if (!skin_same_id(a->skin, b->skin)) return 0;
+    if (a->death != b->death || a->death_dir != b->death_dir) return 0;
     return a->item == b->item && a->proc == b->proc && a->extras == b->extras;
 }
 
@@ -938,9 +966,18 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
         wwhd_log("multiplayer: launcher colours changed");
     }
     skin_choose_local();
-    tunic_set_local((u16)local_look.colors[0], (u16)local_look.colors[1]);
-    /* a skinned Link keeps the skin's own textures */
-    if (skin_of((u32)link) < 0) tunic_refresh((u32)link);
+    /* A skinned local Link keeps the skin's own textures; the Link texture the puppets without skin
+     * share is then taken from one of them and kept in its original colours, each puppet getting
+     * its own colours (tunic.h remote copies). Before 0.2.62 it was left as it was: holding the
+     * local colours written before the skin was put on, every such puppet wore them. */
+    if (skin_of((u32)link) < 0) {
+        tunic_set_local((u16)local_look.colors[0], (u16)local_look.colors[1]);
+        tunic_refresh((u32)link);
+    } else {
+        tunic_set_local(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
+        u32 source = puppet_unskinned_actor();
+        if (source) tunic_refresh(source);
+    }
 }
 
 WWHD_HOOK_RETURN(WWHD_ADDR_daShip_c__execute, after_ship_execute, (void* ship)) {
@@ -995,7 +1032,9 @@ static void start(void) {
         wwhd_log("multiplayer: host option is empty");
         return;
     }
-    tunic_remote_enabled = wwhd_config_bool("remote_tunics", 0);
+    /* on by default since 0.2.62: the same draw-time texture swap as the elites' colours works in
+     * game, and the per-player colours were seen working (0.2.29) */
+    tunic_remote_enabled = wwhd_config_bool("remote_tunics", 1);
     int port = cfg.has_port ? (int)cfg.port : wwhd_config_int("port", 10014);
     if (port < 1 || port > 65535) { wwhd_log("multiplayer: invalid port"); return; }
     if (!wwhd_net_connect(host, (u32)port)) { wwhd_log("multiplayer: connect rejected"); return; }
@@ -1017,28 +1056,62 @@ static void start(void) {
  *    busy, offline);
  *  - teleport.cfg, written by the launcher: "id=<number>" and "target=<uid>"; a new id is one
  *    request. The id found at the first read is not acted on (a request older than the game).
- * Teleport to another stage (0.2.37): the target's stage is loaded with the start point, room and
- * layer the target entered it with (dComIfGp_setNextStage 0252012C, decomp d_com_inf_game.cpp;
- * dStage_startStage_c at play + 0x5134: name, s16 point +8, s8 room +0xA, s8 layer +0xB), then
- * Link hops to the target's latest place TELEPORT_SETTLE steps after arriving. Deduced, not
- * verified in game: a target in another room than its start room may stand in a room not loaded.
+ * The teleport is the game's own respawn (decomp, verified): Link restarts at the save's restart
+ * place (dSv_restart_c at *(101F84DC) + 0x1148, d_a_npc_os_b.h; setRoom 025B9810: position,
+ * angle, room, d_save_4.cpp) when a stage is entered with start point -1 (d_stage_2.cpp player
+ * init: the restart position and angle, parameters = the restart room param at + 0x116C). The game
+ * does it so after a fall into the void (dStage_restartRoom 025C3D68, d_stage_4.cpp:
+ * dComIfGp_setNextStage(current stage, -1, restart room, layer -1, 0, mode, 0, 0), then the param;
+ * daPy_lk_c::startRestartRoom d_a_player_main_03.cpp: mode 5, event info 0xC9, param =
+ * setParamData(room, 0, 0xC9, 0) = room | 0xC9 << 24, d_a_player_main.cpp). The teleport sets the
+ * restart place to the target's last place, angle and room, and enters the target's stage that way
+ * (its layer when it is another stage): the room is loaded and Link stands on its ground. 0.2.37-
+ * 0.2.57 moved Link by hand above the target, in a room often not loaded: he fell and the game put
+ * him back at his restart place. The restart place stays the target's (a later fall returns there).
  *
  * Rupees (decomp, verified): the save's dSv_player_status_a_c::mRupee is at *(101F84DC) + 0x20 +
  * 4 (d/d_save.h); a payment is added to dComIfG_play_c::mItemRupeeCount, play + 0x12A0 + 0x48A8
  * from dComIfGp_get(), which the rupee meter applies with its count-down and clears
  * (d_meter_02.cpp), as shops do (dComIfGp_setItemRupeeCount).
- *
- * The teleport moves Link (current and old place) next to the target's last received place and
- * holds him there TELEPORT_HOLD steps without speed, while the sea rooms around load (deduced, not
- * verified in game: the sea loads rooms around Link as he sails). Not while he rides his ship
- * (play + 0x5CD8 SHIP_RIDE, puppet.h) or during an event. */
+ * Not while Link rides his ship (play + 0x5CD8 SHIP_RIDE, puppet.h) or during an event. */
 #define MAP_PERIOD 0.5
 #define TELEPORT_COST 35
-#define TELEPORT_HOLD 45
-#define TELEPORT_ABOVE 100.0f
 #define PLAY_ITEM_RUPEE_COUNT (0x12A0 + 0x48A8)
 #define SAVE_POINTER 0x101F84DC
 #define SAVE_RUPEE (0x20 + 0x04)
+#define SAVE_RESTART 0x1148        /* dSv_restart_c */
+#define SAVE_RESTART_PARAM 0x116C  /* dSv_restart_c::mRestartParam */
+#define TELEPORT_MODE 5            /* the void respawn's mode and event info (startRestartRoom) */
+#define TELEPORT_EVENT_INFO 0xC9u
+
+/* The Great Sea's squares the player has unlocked (the fishman's chart, decomp d_save_3.cpp
+ * dSv_player_map_c::isSaveArriveGrid: bit 0 of mFmapBits[square], save + 0x20 + 0xC4 + 0x40,
+ * d_save.h; the fishman tests it for its room - 1, d_a_npc_so_mode.cpp; three squares at the start,
+ * d_save_3.cpp init). Square = row * 7 + column, from the north-west (sea rooms 1..49). players.txt
+ * "chart=" lists them (49 of 0/1) for the launcher's map; a teleport to a player on a locked square
+ * is refused ("locked"). */
+#define SAVE_FMAP_BITS (0x20 + 0xC4 + 0x40)
+#define SEA_SQUARES 49
+#define SEA_SQUARE_SIZE 100000.0f
+#define SEA_HALF_SIZE 350000.0f
+
+static int sea_square_unlocked(u32 square) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    if (!save || square >= SEA_SQUARES) return 1;
+    return (*(const volatile u8*)(save + SAVE_FMAP_BITS + square) & 1u) != 0;
+}
+
+/* The square of a place on the Great Sea, -1 outside. */
+static int sea_square_of(f32 x, f32 z) {
+    if (!(x > -SEA_HALF_SIZE && x < SEA_HALF_SIZE && z > -SEA_HALF_SIZE && z < SEA_HALF_SIZE)) return -1;
+    int column = (int)((x + SEA_HALF_SIZE) / SEA_SQUARE_SIZE), row = (int)((z + SEA_HALF_SIZE) / SEA_SQUARE_SIZE);
+    if (column > 6) column = 6;
+    if (row > 6) row = 6;
+    return row * 7 + column;
+}
+
+/* dSv_restart_c::setRoom (025B9810: this, const cXyz* position, angle, room) */
+WWHD_GAME_FUNC(0x025B9810, void, teleport_set_restart, (u32 restart, u32 position, u32 angle, u32 room));
 
 static double map_clock;
 static char map_text[4096];
@@ -1047,8 +1120,7 @@ static int teleport_read_once;
 static u32 teleport_last_id;
 static u32 teleport_result_id;
 static const char* teleport_result = "";
-static int teleport_hold;
-static f32 teleport_to[3];
+static cXyz teleport_pos; /* passed to the game by address: in mod memory */
 
 typedef struct map_out {
     char* data;
@@ -1122,7 +1194,8 @@ static u32 map_cfg_number(const char* text, u32 size, const char* key) {
  * server) the map shows the remote players of the area, as before. */
 #define DIR_PERIOD 1.0
 #define TELEPORT_STAGE_TIMEOUT (30 * 60) /* steps to reach the target's stage */
-#define TELEPORT_SETTLE 20               /* steps in the new stage before the last hop */
+#define TELEPORT_SETTLE 20               /* steps in the stage, out of events, before "ok" */
+#define TELEPORT_RELOAD_STEPS 45         /* the reload's fade and load take at least that */
 #define PLAY_START_POINT (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0x8)  /* dStage_startStage_c::mPoint */
 #define PLAY_START_ROOM (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0xA)   /* mRoomNo */
 #define PLAY_START_LAYER (WWHD_PLAY_START_STAGE_NAME_OFFSET + 0xB)  /* mLayer */
@@ -1207,6 +1280,19 @@ static void directory_received(const mp_u8* body, mp_u32 length) {
         drop_frame("multiplayer: malformed player directory skipped", body, length);
         return;
     }
+    /* a player who joined: an id the last directory did not have (not at the first one) */
+    if (directory_valid) {
+        for (mp_u32 i = 0; i != incoming_directory.count; ++i) {
+            const mp_dir_entry* e = &incoming_directory.entry[i];
+            if (e->id == incoming_directory.self) continue;
+            int known = 0;
+            for (mp_u32 j = 0; j != directory.count && !known; ++j) known = directory.entry[j].id == e->id;
+            if (known) continue;
+            sv_notice_joined(e->name, e->color);
+            wwhd_log("multiplayer: a player joined the game:");
+            wwhd_log(e->name[0] ? e->name : "(no name)");
+        }
+    }
     directory = incoming_directory;
     if (!directory_valid) wwhd_log_int("multiplayer: player directory received, players", (int)directory.count);
     directory_valid = 1;
@@ -1219,11 +1305,24 @@ static const mp_dir_entry* directory_find(mp_u32 id) {
     return 0;
 }
 
-static void teleport_hop(const f32* pos) {
-    teleport_to[0] = pos[0];
-    teleport_to[1] = pos[1] + TELEPORT_ABOVE;
-    teleport_to[2] = pos[2];
-    teleport_hold = TELEPORT_HOLD;
+/* Enters `stage` (here or another) as the game's respawn does, Link at pos, facing angle, in room. */
+static int teleport_go(const char* stage, const f32* pos, s16 angle, s8 room, s8 layer, int same_stage) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    if (!save || room < 0) return 0;
+    for (int i = 0; i != STAGE_NAME_BYTES + 1; ++i) teleport_stage[i] = stage[i];
+    teleport_stage[STAGE_NAME_BYTES] = 0;
+    teleport_pos.x = pos[0];
+    teleport_pos.y = pos[1];
+    teleport_pos.z = pos[2];
+    teleport_set_restart(save + SAVE_RESTART, (u32)&teleport_pos, (u32)(s32)angle, (u32)(s32)room);
+    if (!wwhd_dComIfGp_setNextStage((u32)teleport_stage, 0xFFFFFFFFu, (u32)(s32)room,
+                                    same_stage ? 0xFFFFFFFFu : (u32)(s32)layer, 0.0f, TELEPORT_MODE, 0, 0))
+        return 0;
+    *(volatile u32*)(save + SAVE_RESTART_PARAM) = ((u32)(s32)room & 0x3Fu) | (TELEPORT_EVENT_INFO << 24);
+    teleport_stage_wait = 1;
+    teleport_settle = 0;
+    teleport_stage_since = wwhd_logic_step();
+    return 1;
 }
 
 static int teleport_pay(u8* play) {
@@ -1233,36 +1332,30 @@ static int teleport_pay(u8* play) {
     return 1;
 }
 
-/* target: a directory id (the server has the directory), else a remote player's uid. In the
- * same stage Link hops to the target; in another one the target's stage is loaded the way the
- * target entered it (its start point, room and layer: they exist), then Link hops to the target
- * once there (teleport_stage_step). */
+/* target: a directory id (the server has the directory), else a remote player of the area by uid
+ * (its room unknown: Link's own, in the same stage). The stage is entered as the game's respawn
+ * does (teleport_go), then teleport_stage_step reports the arrival. */
 static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
-    (void)link;
     if (state != READY) return "offline";
-    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_hold || teleport_stage_wait) return "busy";
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_stage_wait) return "busy";
     if (*(const volatile u32*)(play + PUPPET_PLAY_STATUS0) & PUPPET_STATUS0_RIDE) return "riding";
     char here[STAGE_NAME_BYTES + 1];
     map_stage(play, here);
     const mp_dir_entry* e = directory_find(target);
     if (e) {
-        if (e->id == directory.self) return "no_target";
-        if (map_same_stage(e->stage, here)) {
-            if (!teleport_pay(play)) return "rupees";
-            teleport_hop(e->pos);
-            wwhd_log_int("multiplayer: teleport to the player, id", (int)target);
-            return "ok";
-        }
-        if (!e->stage[0]) return "no_target";
+        if (e->id == directory.self || !e->stage[0] || e->room < 0) return "no_target";
+        /* on the Great Sea, or in an island's stage with its last place at sea: that square */
+        int at_sea = e->stage[0] == 's' && e->stage[1] == 'e' && e->stage[2] == 'a' && !e->stage[3];
+        int square = at_sea ? sea_square_of(e->pos[0], e->pos[2])
+                            : (e->flags & MP_DIR_SEA) ? sea_square_of(e->sea[0], e->sea[1]) : -1;
+        if (square >= 0 && !sea_square_unlocked((u32)square)) return "locked";
         if (!teleport_pay(play)) return "rupees";
-        for (int i = 0; i != STAGE_NAME_BYTES + 1; ++i) teleport_stage[i] = e->stage[i];
+        if (!teleport_go(e->stage, e->pos, e->heading, e->room, e->layer, map_same_stage(e->stage, here))) {
+            *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) += TELEPORT_COST; /* refused: given back */
+            return "failed";
+        }
         teleport_target = target;
-        teleport_stage_wait = 1;
-        teleport_settle = 0;
-        teleport_stage_since = wwhd_logic_step();
-        wwhd_dComIfGp_setNextStage((u32)teleport_stage, (u32)(s32)e->point, (u32)(s32)e->start_room,
-                                   (u32)(s32)e->layer, 0.0f, 0, 0, 0);
-        wwhd_log("multiplayer: teleport: loading the player's stage");
+        wwhd_log("multiplayer: teleport: to the player's place in");
         wwhd_log(teleport_stage);
         return "loading";
     }
@@ -1270,14 +1363,22 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     for (int i = 0; i != MAX_REMOTES; ++i)
         if (remotes[i].active && remotes[i].has_transform && remotes[i].uid == target) r = &remotes[i];
     if (!r) return "no_target";
+    if (here[0] == 's' && here[1] == 'e' && here[2] == 'a' && !here[3]) {
+        int square = sea_square_of(r->transform.pos[0], r->transform.pos[2]);
+        if (square >= 0 && !sea_square_unlocked((u32)square)) return "locked";
+    }
     if (!teleport_pay(play)) return "rupees";
-    teleport_hop(r->transform.pos);
+    if (!teleport_go(here, r->transform.pos, r->transform.rot[1], link->current.roomNo, 0, 1)) {
+        *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) += TELEPORT_COST;
+        return "failed";
+    }
+    teleport_target = 0;
     wwhd_log_int("multiplayer: teleport to the player, uid", (int)target);
-    return "ok";
+    return "loading";
 }
 
-/* After the stage change asked by teleport_try: once Link stands in the target's stage, the hop
- * to the target's latest place (if the target is still there). */
+/* After teleport_go: Link stands in the stage again (the reload done: at least TELEPORT_SETTLE
+ * steps after the request, out of any event) -> "ok". */
 static void teleport_stage_step(const u8* play) {
     if (!teleport_stage_wait) return;
     char here[STAGE_NAME_BYTES + 1];
@@ -1288,31 +1389,15 @@ static void teleport_stage_step(const u8* play) {
         wwhd_log("multiplayer: teleport: the player's stage was not reached");
         return;
     }
-    if (!map_same_stage(here, teleport_stage) || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) {
+    if (!map_same_stage(here, teleport_stage) || play[WWHD_PLAY_EVENT_RUNNING_OFFSET] ||
+        wwhd_logic_step() - teleport_stage_since < TELEPORT_RELOAD_STEPS) {
         teleport_settle = 0;
         return;
     }
     if (++teleport_settle < TELEPORT_SETTLE) return;
     teleport_stage_wait = 0;
-    const mp_dir_entry* e = directory_find(teleport_target);
-    if (e && map_same_stage(e->stage, here)) {
-        teleport_hop(e->pos);
-        teleport_result = "ok";
-        wwhd_log("multiplayer: teleport: arrived, hop to the player");
-    } else {
-        teleport_result = "arrived"; /* in the stage, the player went elsewhere */
-    }
-}
-
-/* Holds the teleported Link in place while the rooms around him load (after his execute). */
-static void teleport_apply(fopAc_ac_c* link) {
-    if (!teleport_hold) return;
-    --teleport_hold;
-    link->current.pos.x = link->old.pos.x = teleport_to[0];
-    link->current.pos.y = link->old.pos.y = teleport_to[1];
-    link->current.pos.z = link->old.pos.z = teleport_to[2];
-    link->speed.x = link->speed.y = link->speed.z = 0.0f;
-    link->speedF = 0.0f;
+    teleport_result = "ok";
+    wwhd_log("multiplayer: teleport: arrived");
 }
 
 /* ------------------------------------------------------------------ the launcher's shop
@@ -1333,7 +1418,12 @@ static void teleport_apply(fopAc_ac_c* link) {
  * is made next to Link (actor_sync.h as_summon); for another player the request goes through the
  * server (CLIENT_PLAYER_SUMMON) and that player's game makes it next to its own Link
  * (SERVER_PLAYER_SUMMON, shop_received). The launcher's catalogue (LauncherUI SHOP_ITEMS) shows
- * the same numbers, prices and icons: keep both in step. */
+ * the same numbers, prices and icons: keep both in step.
+ * Items from SHOP_UPGRADES on are the "Upgrades & Utilities", for oneself only (the target is not
+ * read): yellow heart and yellow magic (bonus.h), 75 rupees each; the long hookshot (5 Blue Chu
+ * Jelly, 5 Knight's Crests, 1000 rupees) and the golden pig (5 Golden Feathers, 100 rupees) are
+ * shown by the launcher but not made yet ("soon", nothing paid). players.txt "bonus=" gives the
+ * yellow quarter hearts, the yellow magic, and 1 when each is at its maximum. */
 #define SHOP_SPOILS 8
 #define PLAY_ITEM_BEAST_COUNTS 0x5B70
 #define SAVE_BEAST_NUM (0x20 + 0x9C)
@@ -1362,6 +1452,9 @@ static const shop_creature shop_creatures[] = {
     {"Bb", 0xFFFF0F04u, 0x1F, 0xFF, 2, 1, 5, "a Kargaroc", 0},
 };
 #define SHOP_CREATURES (sizeof(shop_creatures) / sizeof(shop_creatures[0]))
+#define SHOP_UPGRADES 8u
+enum { SHOP_YELLOW_HEART = SHOP_UPGRADES, SHOP_YELLOW_MAGIC, SHOP_LONG_HOOKSHOT, SHOP_GOLDEN_PIG, SHOP_ITEMS_END };
+#define SHOP_UPGRADE_RUPEES 75
 
 static char shop_text[256];
 static int shop_read_once;
@@ -1404,9 +1497,23 @@ static int shop_summon_here(const fopAc_ac_c* link, u32 item) {
                      (s8)link->current.roomNo, c->randomized);
 }
 
+/* An upgrade for oneself: checked, then paid once given. */
+static const char* shop_try_upgrade(u8* play, u32 item) {
+    if (item == SHOP_LONG_HOOKSHOT || item == SHOP_GOLDEN_PIG) return "soon";
+    if (item != SHOP_YELLOW_HEART && item != SHOP_YELLOW_MAGIC) return "unknown";
+    s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    if (rupees < SHOP_UPGRADE_RUPEES) return "price";
+    const char* result = item == SHOP_YELLOW_HEART ? bonus_buy_heart() : bonus_buy_magic();
+    if (result[0] != 'o' || result[1] != 'k' || result[2]) return result;
+    volatile s32* pay = (volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    *pay = *pay - SHOP_UPGRADE_RUPEES;
+    return "ok";
+}
+
 static const char* shop_try(const fopAc_ac_c* link, u8* play, u32 item, u32 target) {
-    if (item >= SHOP_CREATURES) return "unknown";
     if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return "busy";
+    if (item >= SHOP_UPGRADES) return shop_try_upgrade(play, item);
+    if (item >= SHOP_CREATURES) return "unknown";
     const shop_creature* c = &shop_creatures[item];
     if (!shop_affordable(play, c)) return "price";
     if (!target || (directory_valid && target == directory.self)) {
@@ -1425,6 +1532,14 @@ static const char* shop_try(const fopAc_ac_c* link, u8* play, u32 item, u32 targ
     wwhd_log("multiplayer: shop: creature sent to");
     wwhd_log(e->name);
     return "sent";
+}
+
+/* CLIENT_WORLD (world_sync.h wd_report); a server without it ignores the sailor's clock. */
+static int wd_send_world(const mp_world* w) {
+    if (state != READY || session.client_world == MP_NO_ID) return 0;
+    mp_writer body = mp_writer_make(payload, sizeof(payload));
+    mp_write_world(&body, w);
+    return send_payload(session.client_world, &body);
 }
 
 /* SERVER_PLAYER_SUMMON: made at the next steps, when the game allows it. */
@@ -1482,9 +1597,11 @@ static void map_put_entry(map_out* o, const char* key, const mp_dir_entry* e) {
     map_put(o, (e->flags & MP_DIR_SEA) ? "|1\n" : "|0\n");
 }
 
+static void connect_read(void);            /* the launcher's "Connect to the server", below */
+static const char* connection_state(void);
+
 static void map_step(void* link_actor, double dt) {
     fopAc_ac_c* link = (fopAc_ac_c*)link_actor;
-    teleport_apply(link);
     u8* play = wwhd_play_get();
     if (!play) return;
     if (map_on_sea(play)) {
@@ -1494,6 +1611,7 @@ static void map_step(void* link_actor, double dt) {
     }
     teleport_stage_step(play);
     shop_step(link, play);
+    bonus_tick();
     dir_clock -= dt;
     if (dir_clock <= 0) {
         dir_clock = DIR_PERIOD;
@@ -1529,6 +1647,7 @@ static void map_step(void* link_actor, double dt) {
         }
     }
     shop_read_once = 1;
+    connect_read(); /* the launcher's "Connect to the server" */
 
     map_out o = {map_text, 0, sizeof(map_text)};
     mp_dir_entry me;
@@ -1550,6 +1669,11 @@ static void map_step(void* link_actor, double dt) {
     map_put(&o, "\nstep=");
     map_put_uint(&o, (u32)wwhd_logic_step());
     map_put(&o, directory_valid ? "\ndirectory=1\n" : "\ndirectory=0\n");
+    map_put(&o, "connection=");
+    map_put(&o, connection_state());
+    map_put(&o, "\nchart=");
+    for (u32 i = 0; i != SEA_SQUARES; ++i) map_put(&o, sea_square_unlocked(i) ? "1" : "0");
+    map_put(&o, "\n");
     map_put_entry(&o, "me=", &me);
     if (state == READY && directory_valid) {
         for (mp_u32 i = 0; i != directory.count; ++i)
@@ -1586,6 +1710,12 @@ static void map_step(void* link_actor, double dt) {
         map_put_int(&o, n < 0 ? 0 : n);
         map_put(&o, i + 1 == SHOP_SPOILS ? "\n" : ",");
     }
+    map_put(&o, "bonus=");
+    map_put_uint(&o, bonus_hearts);
+    map_put(&o, ",");
+    map_put_uint(&o, bonus_magic);
+    map_put(&o, bonus_heart_full() ? ",1" : ",0");
+    map_put(&o, bonus_magic_full() ? ",1\n" : ",0\n");
     if (shop_result_id) {
         map_put(&o, "shop=");
         map_put_uint(&o, shop_result_id);
@@ -1607,11 +1737,56 @@ static void stop_remote_views(void) {
     swing_clear_all();
 }
 
+/* The launcher's "Connect to the server" (Play Online): connect.cfg "id=" (a new id is one
+ * request, the one found at the first read is not acted on), read with the map files. The current
+ * connection, if any, is closed, everything the session made is cleared as when it is lost, then
+ * start() connects again with launcher.cfg's host and port, read anew. players.txt "connection=":
+ * connecting, connected or offline. */
+static char connect_text[128];
+static int connect_read_once, connect_requested, hud_registered;
+static u32 connect_last_id;
+
+static const char* connection_state(void) {
+    if (state == READY) return "connected";
+    if (state == IDLE || state == WAIT_INIT) return "connecting";
+    return "offline";
+}
+
+static void connect_read(void) {
+    s32 got = wwhd_file_read("connect.cfg", connect_text, sizeof(connect_text));
+    if (got >= 0) {
+        u32 id = map_cfg_number(connect_text, (u32)got, "id");
+        if (connect_read_once && id && id != connect_last_id) connect_requested = 1;
+        connect_last_id = id;
+    }
+    connect_read_once = 1;
+}
+
+static void reconnect(void) {
+    if (state != IDLE && state != FAILED) wwhd_net_disconnect();
+    stop_remote_views();
+    clear_area_state();
+    for (int i = 0; i != STAGE_NAME_BYTES + 1; ++i) area[i] = 0; /* entered again once connected */
+    area_settle = 0;
+    directory_valid = 0;
+    teleport_stage_wait = 0;
+    memset(&sent_look, 0, sizeof(sent_look));
+    state = IDLE;
+    wwhd_log("multiplayer: connecting again (launcher)");
+}
+
 static void multiplayer_connection_step(void* link) {
+    if (connect_requested) {
+        connect_requested = 0;
+        reconnect();
+    }
     if (state == IDLE) {
         start();
-        wwhd_hud_register(draw_markers, WWHD_HUD_TV);
-        wwhd_hud_register_drc(draw_gamepad);
+        if (!hud_registered) {
+            hud_registered = 1;
+            wwhd_hud_register(draw_markers, WWHD_HUD_TV);
+            wwhd_hud_register_drc(draw_gamepad);
+        }
     }
     double dt = wwhd_logic_dt();
     refresh_launcher_settings((const daPy_lk_c*)link, dt);
@@ -1704,9 +1879,12 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
         skin_leave(skin);
         return result;
     }
+    bonus_note_link(i_this); /* the yellow hearts and magic follow this Link (bonus.h) */
+    dh_note_link(i_this);    /* its death and revive (death.h) */
     el_link_step(i_this); /* an electric elite's shock, given in Link's own execute (elite.h) */
     s32 result = daPy_Execute_original(i_this);
     skin_leave(skin);
     multiplayer_connection_step(i_this);
+    dh_step(i_this, wwhd_logic_dt());
     return result;
 }

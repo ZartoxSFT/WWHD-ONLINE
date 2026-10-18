@@ -97,7 +97,7 @@ static tunic_texture tunic_textures[TUNIC_MAX_TEXTURES];
 static u32 tunic_texture_count;
 static tunic_look tunic_local_wanted, tunic_local_applied;
 static int tunic_disabled;   /* unusable texture: logged once, nothing written */
-static int tunic_remote_enabled; /* option remote_tunics, off by default (experimental) */
+static int tunic_remote_enabled; /* option remote_tunics, on by default since 0.2.62 */
 static tunic_clone tunic_clones[TUNIC_MAX_SLOTS][TUNIC_MAX_TEXTURES];
 static int tunic_clone_failed;
 static u32 tunic_swap_table;

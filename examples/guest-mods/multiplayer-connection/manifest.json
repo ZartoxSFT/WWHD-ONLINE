@@ -2,7 +2,7 @@
   "format_version": 1,
   "id": "multiplayer-connection",
   "name": "Wind Waker multiplayer connection",
-  "version": "0.2.51",
+  "version": "0.2.67",
   "game_id": "wwhd",
   "minimum_manager_version": "1.5.0",
   "kind": "guest",
@@ -107,8 +107,8 @@
     {
       "id": "remote_tunics",
       "type": "bool",
-      "name": "Remote Links wear their own tunic colours (experimental, may crash)",
-      "default": false
+      "name": "Remote Links wear their own tunic colours",
+      "default": true
     }
   ]
 }

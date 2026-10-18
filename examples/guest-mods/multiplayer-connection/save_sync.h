@@ -123,8 +123,14 @@ typedef struct sv_notice {
     u32 bytes;
     u32 item;          /* the item whose icon shows, 0xFF none */
     int steps;
+    u8 player;         /* a player who joined: the map's Link icon in their colour instead */
+    u16 color;         /* their primary tunic colour, RGB565 */
 } sv_notice;
 static sv_notice sv_notices[SV_NOTICES];
+
+/* mod.c: the sea chart's Link icon in a player's colours for notice slot k, and the tint to draw it
+ * with (white, or the colour itself for the map arrow while the icon is not decoded yet). */
+static u32 sv_player_icon(u32 k, u16 color, u32* tint);
 
 /* English names of the items a notice can name (d_item_data.h numbers) */
 static const char* sv_item_name(u32 item) {
@@ -186,6 +192,28 @@ static void sv_notice_add(const char* what, u32 item, int side) {
     n->bytes = k;
     n->item = item;
     n->steps = SV_NOTICE_STEPS;
+    n->player = 0;
+}
+
+/* Bottom left: "<name> joined the game", with the map's Link icon in the player's colour (mod.c,
+ * a new id in the server's player directory). */
+static void sv_notice_joined(const char* name, u16 color) {
+    u32 slot = 0;
+    for (u32 i = 0; i != SV_SIDE_NOTICES; ++i)
+        if (sv_notices[i].steps < sv_notices[slot].steps) slot = i;
+    sv_notice* n = &sv_notices[slot];
+    u32 k = 0;
+    const char* who = name && name[0] ? name : "A player";
+    for (u32 i = 0; who[i] && k + 1 < sizeof(n->text); ++i)
+        n->text[k++] = (who[i] < 0x20 || who[i] > 0x7E) ? '?' : who[i];
+    const char* tail = " joined the game";
+    for (u32 i = 0; tail[i] && k + 1 < sizeof(n->text); ++i) n->text[k++] = tail[i];
+    n->text[k] = 0;
+    n->bytes = k;
+    n->item = 0xFF;
+    n->steps = SV_NOTICE_STEPS;
+    n->player = 1;
+    n->color = color;
 }
 
 static u32 sv_bits_new(u32 before, u32 after) { return after & ~before; }
@@ -395,15 +423,17 @@ static void sv_draw_side(u32 list, int side) {
                                        .w = width, .h = 48.0f, .thickness = 1, .u1 = 1, .v1 = 1,
                                        .rgba = 0x10202C00u | (u32)(alpha * 190.0f)};
         wwhd_hud_emit(list, &sv_element);
-        u32 icon = sv_icon(s->item);
+        u32 tint = 0xFFFFFFu;
+        u32 icon = s->player ? sv_player_icon((u32)order[k], s->color, &tint) : sv_icon(s->item);
         if (icon) {
             sv_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
                                            .x = x + 6.0f, .y = y - 21.0f, .w = 42.0f, .h = 42.0f, .thickness = 1,
-                                           .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | (u32)(alpha * 255.0f), .image = icon};
+                                           .u1 = 1, .v1 = 1, .rgba = (tint << 8) | (u32)(alpha * 255.0f), .image = icon};
         } else { /* no icon: a small gold mark */
             sv_element = (wwhd_hud_element){.kind = WWHD_HUD_CIRCLE, .anchor = WWHD_HUD_CENTER, .x = x + 27.0f, .y = y,
                                            .size = 9.0f, .thickness = 1, .u1 = 1, .v1 = 1,
-                                           .rgba = 0xF9C74F00u | (u32)(alpha * 255.0f)};
+                                           .rgba = ((s->player ? (u32)mp_rgb565_to_888(s->color) : 0xF9C74Fu) << 8) |
+                                                   (u32)(alpha * 255.0f)};
         }
         wwhd_hud_emit(list, &sv_element);
         f32 text_width = name_width(s->text, s->bytes, scale);

@@ -139,6 +139,13 @@ static void test_init(void) {
     assert(!mp_parse_init(init, size, &s));
 }
 
+/* The alive byte of the death block (the last one a player component ends with): checked, then
+ * dropped, so the bytes before it are tested as a sender before the death block wrote them. */
+static void drop_alive(mp_writer* w) {
+    assert(w->ok && w->size && w->data[w->size - 1] == 0x00);
+    --w->size;
+}
+
 static const mp_transform kTransform = {{1.0f, 2.0f, -1.0f}, {0x1234, -1, 0}};
 
 #define BASE_BYTES 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, \
@@ -447,6 +454,7 @@ static void test_client_packets(void) {
         0x00,                                     /* WWHD extension: no strikes */
         0x00,                                     /* WWHD extension: no particles */
         0x00,                                     /* WWHD extension: no skin */
+        0x00,                                     /* WWHD extension: alive */
     };
     expect_bytes(&payload, create, sizeof(create));
 
@@ -479,6 +487,7 @@ static void test_client_packets(void) {
         0x00,                                     /* no strikes */
         0x00,                                     /* no particles */
         0x00,                                     /* no skin */
+        0x00,                                     /* alive */
     };
     expect_bytes(&payload, look_update, sizeof(look_update));
 
@@ -487,12 +496,12 @@ static void test_client_packets(void) {
     payload = mp_writer_make(buffer, sizeof(buffer));
     mp_write_look_update(&payload, &s, 300, 5, &red);
     assert(payload.ok && payload.size == sizeof(look_update) + 5);
-    assert(memcmp(payload.data + sizeof(look_update) - 7, "Tetra", 6) == 0);
-    assert(payload.data[payload.size - 6] == 0x00 &&
+    assert(memcmp(payload.data + sizeof(look_update) - 8, "Tetra", 6) == 0);
+    assert(payload.data[payload.size - 7] == 0x00 && payload.data[payload.size - 6] == 0x00 &&
            payload.data[payload.size - 5] == 0x00 && payload.data[payload.size - 4] == 0x00 &&
            payload.data[payload.size - 3] == 0x00 && payload.data[payload.size - 2] == 0x00 &&
            payload.data[payload.size - 1] == 0x00);
-    /* no ship, no extras, no swings, no strikes, no particles, no skin */
+    /* no ship, no extras, no swings, no strikes, no particles, no skin, alive */
 
     /* without an ActorBaseSync in the factory an update cannot be encoded */
     mp_session no_base = s;
@@ -710,6 +719,7 @@ static void write_player_by_hand(mp_writer* w, const mp_player_look* l) {
     mp_write_u8(w, 0);                                    /* WWHD extension: no strikes */
     mp_write_u8(w, 0);                                    /* WWHD extension: no particles */
     mp_write_u8(w, 0);                                    /* WWHD extension: no skin */
+    mp_write_u8(w, 0);                                    /* WWHD extension: alive */
 }
 
 static void sample_events(mp_anim_events* e) {
@@ -747,7 +757,7 @@ static void test_player_events(void) {
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, &e);
+    mp_write_player_events(&w, &look, &e); drop_alive(&w);
     static mp_actor_state a;
     assert(mp_read_actor_update(w.data, w.size, &s, &a));
     assert(a.has_look && a.look.item == 0x0103 && a.look.proc == 0x30);
@@ -779,7 +789,7 @@ static void test_player_events(void) {
         mp_writer bw = mp_writer_make(buffer, sizeof(buffer));
         mp_write_vlq(&bw, 77); mp_write_u8(&bw, 3); mp_write_vlq(&bw, 77);
         mp_write_vlq(&bw, 1); mp_write_vlq(&bw, 1);
-        mp_write_player_events(&bw, &booted, 0);
+        mp_write_player_events(&bw, &booted, 0); drop_alive(&bw);
         assert(bw.ok && bw.data[bw.size - 5] == MP_EXTRA_HEAVY_BOOTS && bw.data[bw.size - 4] == 0x00 &&
                bw.data[bw.size - 3] == 0x00 && bw.data[bw.size - 2] == 0x00 && bw.data[bw.size - 1] == 0x00);
         assert(mp_read_actor_update(bw.data, bw.size, &s, &a) && a.look.extras == MP_EXTRA_HEAVY_BOOTS);
@@ -796,7 +806,7 @@ static void test_player_events(void) {
         mp_writer sw = mp_writer_make(buffer, sizeof(buffer));
         mp_write_vlq(&sw, 77); mp_write_u8(&sw, 3); mp_write_vlq(&sw, 77);
         mp_write_vlq(&sw, 1); mp_write_vlq(&sw, 1);
-        mp_write_player_events(&sw, &sailing, 0);
+        mp_write_player_events(&sw, &sailing, 0); drop_alive(&sw);
         static const mp_u8 ship_bytes[] = {0x2F, 0x44, 0xBB, 0x90, 0x00, 0xC0, 0x00, 0x00, 0x00,
                                            0xC8, 0x43, 0x50, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0xFF, 0xFD,
                                            0x12, 0x34, 0x56};
@@ -961,7 +971,7 @@ static void test_swings(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, &e);
+    mp_write_player_events(&w, &look, &e); drop_alive(&w);
     static mp_actor_state a;
     assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look);
     assert(a.events.swing_count == 3 && a.events.dropped == 0 && !mp_anim_events_empty(&a.events));
@@ -999,7 +1009,7 @@ static void test_swings(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, 0);
+    mp_write_player_events(&w, &look, 0); drop_alive(&w);
     w.size -= 4; /* replace the empty swing, strike, particle and skin blocks */
     mp_write_u8(&w, MP_MAX_SWINGS + 1);
     for (mp_u32 i = 0; i != MP_MAX_SWINGS + 1; ++i) {
@@ -1016,7 +1026,7 @@ static void test_swings(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, 0);
+    mp_write_player_events(&w, &look, 0); drop_alive(&w);
     w.size -= 4;
     mp_write_u8(&w, 1); mp_write_u32(&w, 2);
     mp_write_f32(&w, 0); mp_write_f32(&w, 0); mp_write_f32(&w, 0);
@@ -1034,7 +1044,7 @@ static void test_swings(void) {
     mp_anim_events only;
     mp_anim_events_clear(&only);
     only.swing[mp_swing_slot(&only)] = one;
-    mp_write_player_events(&c, &look, &only);
+    mp_write_player_events(&c, &look, &only); drop_alive(&c);
     mp_write_vlq(&c, 0);
     mp_write_base(&c, &kTransform);
     assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && a.has_look);
@@ -1044,7 +1054,7 @@ static void test_swings(void) {
     mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
     mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
     mp_write_vlq(&c, 1);
-    mp_write_player_events(&c, &look, 0);
+    mp_write_player_events(&c, &look, 0); drop_alive(&c);
     c.size -= 4; /* a sender before the swings: the extras, then the next index */
     mp_write_vlq(&c, 0);
     mp_write_base(&c, &kTransform);
@@ -1222,13 +1232,72 @@ static void test_save_sync(void) {
     storm[1] = 0x43; storm[2] = 0xB4; /* 360 degrees */
     assert(!mp_read_world(storm, sizeof(storm), &wd));
 
+    /* CLIENT_WORLD: the same body (WWClient.receiveWorld), here a sailor's clock and heavy rain */
+    mp_u8 report[16];
+    mp_writer rw = mp_writer_make(report, sizeof(report));
+    mp_world sailor = {MP_WORLD_TIME | MP_WORLD_WEATHER, 90.0f, 3, 4};
+    mp_write_world(&rw, &sailor);
+    static const mp_u8 report_bytes[] = {0x03, 0x42, 0xB4, 0x00, 0x00, 0x00, 0x03, 0x04};
+    assert(rw.ok && rw.size == sizeof(report_bytes) && memcmp(report, report_bytes, sizeof(report_bytes)) == 0);
+    assert(mp_read_world(report, rw.size, &wd) && wd.flags == 3 && wd.time == 90.0f && wd.weather == 4);
+
     /* the names map by name from the init list; an init without them leaves them unset */
     mp_session p = parsed_session();
     assert(p.server_save_update == MP_NO_ID && p.client_save_merge == MP_NO_ID && p.server_world == MP_NO_ID);
+    assert(p.client_world == MP_NO_ID);
 }
 
 /* The launcher's shop: a creature bought for another player (CLIENT_PLAYER_SUMMON) and the one
  * received (SERVER_PLAYER_SUMMON, WWClient.receiveSummon). */
+/* The death block after the skin (death.h) and the revive packets (WWClient.receiveRevive). */
+static void test_death(void) {
+    mp_u8 buffer[256];
+    mp_player_look l = mp_player_look_default(), got;
+    l.death = MP_DEATH_GHOST;
+    l.death_dir = 300;
+    l.corpse[0] = 1.0f;
+    l.corpse[1] = -2.0f;
+    l.corpse[2] = 3.5f;
+    l.corpse_angle = -0x4000;
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_player(&w, &l);
+    static const mp_u8 tail[] = {0x01, 0x02, 0xAC, 0x3F, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                                 0x40, 0x60, 0x00, 0x00, 0xC0, 0x00};
+    assert(w.ok && w.size > sizeof(tail) && memcmp(w.data + w.size - sizeof(tail), tail, sizeof(tail)) == 0);
+    mp_reader r = mp_reader_make(buffer, w.size);
+    mp_read_player(&r, &got);
+    assert(r.ok && r.pos == r.size && got.death == MP_DEATH_GHOST && got.death_dir == 300);
+    assert(got.corpse[0] == 1.0f && got.corpse[1] == -2.0f && got.corpse[2] == 3.5f && got.corpse_angle == -0x4000);
+    /* a sender before the death block: alive */
+    r = mp_reader_make(buffer, w.size - sizeof(tail));
+    mp_read_player(&r, &got);
+    assert(r.ok && r.pos == r.size && got.death == 0);
+    /* a truncated body fails */
+    r = mp_reader_make(buffer, w.size - 1);
+    mp_read_player(&r, &got);
+    assert(!r.ok);
+    /* alive: one byte */
+    l.death = 0;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_player(&w, &l);
+    assert(w.ok && buffer[w.size - 1] == 0x00 && buffer[w.size - 2] == 0x00); /* no skin, alive */
+
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_revive_request(&w, 7, "Medli");
+    static const mp_u8 request[] = {0x87, 'M', 'e', 'd', 'l', 'i', 0x00};
+    expect_bytes(&w, request, sizeof(request));
+    static const mp_u8 revive[] = {'A', 'r', 'y', 'l', 'l', 0x00};
+    char who[MP_NAME_MAX + 1];
+    assert(mp_read_revive(revive, sizeof(revive), who) && strcmp(who, "Aryll") == 0);
+    assert(!mp_read_revive(revive, sizeof(revive) - 1, who));
+    mp_u8 longer[sizeof(revive) + 1];
+    memcpy(longer, revive, sizeof(revive));
+    longer[sizeof(revive)] = 1;
+    assert(!mp_read_revive(longer, sizeof(longer), who));
+    mp_session p = parsed_session();
+    assert(p.client_player_revive == MP_NO_ID && p.server_player_revive == MP_NO_ID);
+}
+
 static void test_summon(void) {
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_summon_request(&w, 300, 4, "Tetra");
@@ -1259,7 +1328,7 @@ static void test_skin(void) {
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, 0);
+    mp_write_player_events(&w, &look, 0); drop_alive(&w);
     assert(w.ok && memcmp(w.data + w.size - 7, "miku_2", 7) == 0 && w.data[w.size - 8] == 0x00); /* after the particles */
     static mp_actor_state a;
     assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && strcmp(a.look.skin, "miku_2") == 0);
@@ -1272,7 +1341,7 @@ static void test_skin(void) {
         w = mp_writer_make(buffer, sizeof(buffer));
         mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
         mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-        mp_write_player_events(&w, &look, 0);
+        mp_write_player_events(&w, &look, 0); drop_alive(&w);
         w.size -= 7;
         mp_write_string(&w, bad[i]);
         assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && a.look.skin[0] == 0);
@@ -1287,7 +1356,7 @@ static void test_skin(void) {
     mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
     mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
     mp_write_vlq(&c, 1);
-    mp_write_player_events(&c, &look, 0);
+    mp_write_player_events(&c, &look, 0); drop_alive(&c);
     c.size -= 7; /* a sender before the skin */
     mp_write_vlq(&c, 0);
     mp_write_base(&c, &kTransform);
@@ -1297,7 +1366,7 @@ static void test_skin(void) {
     mp_write_string(&c, "PlayerPuppet"); mp_write_string(&c, "PlayerPuppet");
     mp_write_u8(&c, 9); mp_write_vlq(&c, 42); mp_write_vlq(&c, 2);
     mp_write_vlq(&c, 1);
-    mp_write_player_events(&c, &look, 0);
+    mp_write_player_events(&c, &look, 0); drop_alive(&c);
     mp_write_vlq(&c, 0);
     mp_write_base(&c, &kTransform);
     assert(c.ok && mp_read_actor_create(packet, c.size, &s, &a) && a.has_transform && strcmp(a.look.skin, "miku_2") == 0);
@@ -1338,7 +1407,7 @@ static void test_strikes(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, &e);
+    mp_write_player_events(&w, &look, &e); drop_alive(&w);
     static mp_actor_state a;
     assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.has_look && a.events.strike_count == 1);
     const mp_strike* k = &a.events.strike[0];
@@ -1389,7 +1458,7 @@ static void test_strikes(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 77); mp_write_u8(&w, 3); mp_write_vlq(&w, 77);
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
-    mp_write_player_events(&w, &look, &pe);
+    mp_write_player_events(&w, &look, &pe); drop_alive(&w);
     assert(mp_read_actor_update(w.data, w.size, &s, &a) && a.events.particle_count == 2);
     assert(a.events.particle[0].id == 0x8125 && a.events.particle[0].angle[1] == -1);
     assert(a.events.particle[0].scale[1] == 0.5f && a.events.particle[1].alpha == 0x80);
@@ -1608,6 +1677,7 @@ int main(void) {
     test_skin();
     test_directory();
     test_summon();
+    test_death();
     test_save_sync();
     test_tunic_colors();
     test_placed_actors();

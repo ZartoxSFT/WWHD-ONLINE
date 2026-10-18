@@ -1,0 +1,175 @@
+hero_custom_colors:
+  Eyes: 0x0152BA
+  Sclera: 0xFFFFFF
+  Skin: 0xC9825E
+  Hair: 0x734D21
+  Metal: 0xBBBBBB
+  Crown: 0x9A9FA1
+  Pendant: 0xCBCBCB
+  Shirt: 0x292534
+  Shirt Pocket: 0x9C291F
+  Jacket Hood Inner: 0x393939
+  Jacket Hood Outer: 0x393939
+  Jacket Shoulder: 0x393939
+  Jacket Upper: 0x393939
+  Jacket Lower: 0x393939
+  Trim: 0x868686
+  Belt Waist: 0x202F49
+  Belt Leg: 0xD48108
+  Belt Pocket: 0x1B1A1C
+  Pants Seat: 0x393939
+  Pants Upper: 0x393939
+  Pants Lower: 0x393939
+  Pants Pocket: 0x9C291F
+  Shoe Light: 0xE0920D
+  Shoe Dark: 0x3C3C3C
+  Shoe Bottom: 0x393939
+
+hero_color_presets:
+  Valor:
+    Trim: 0xD0CED7
+    Shirt: 0x393939
+    Shirt Pocket: 0xD0CED7
+    Jacket Shoulder: 0x393939
+    Jacket Hood Outer: 0xEA0004
+    Jacket Hood Inner: 0x393939
+    Jacket Upper: 0xEA0004
+    Jacket Lower: 0xEA0004
+    Belt Waist: 0x393939
+    Belt Leg: 0x393939
+    Belt Pocket: 0x393939
+    Pants Seat: 0x393939
+    Pants Upper: 0xEA0004
+    Pants Lower: 0x393939
+    Shoe Light: 0x393939
+    Shoe Dark: 0xEA0004
+    Shoe Bottom: 0xD0CED7
+  Wisdom:
+    Trim: 0xD0CED7 
+    Shirt: 0x393939
+    Shirt Pocket: 0xD0CED7
+    Jacket Hood Outer: 0x0945C9
+    Jacket Hood Inner: 0x393939
+    Jacket Shoulder: 0xD0CED7
+    Jacket Upper: 0x393939
+    Jacket Lower: 0x4D3CE0
+    Belt Pocket: 0x0945C9
+    Belt Leg: 0x393939
+    Pants Seat: 0x393939
+    Pants Pocket: 0x393939
+    Pants Upper: 0x4D3CE0
+    Pants Lower: 0x393939
+    Shoe Light: 0x393939
+    Shoe Dark: 0x4D3CE0
+    Shoe Bottom: 0xD0CED7
+  Limit:
+    Trim: 0xD0CED7
+    Shirt: 0xCA0100
+    Shirt Pocket: 0xCA0100
+    Jacket Upper: 0xDEDEDE
+    Jacket Hood Outer: 0x393939
+    Jacket Hood Inner: 0x00358C
+    Jacket Lower: 0x393939
+    Jacket Shoulder: 0x393939
+    Belt Leg: 0x393939
+    Belt Pocket: 0x393939
+    Belt Waist: 0x00358C
+    Pants Upper: 0xCA0100
+    Pants Seat: 0xCA0100
+    Pants Pocket: 0xCA0100
+    Pants Lower: 0xCA0100
+    Shoe Light: 0xFFC800
+    Shoe Dark: 0xFFC800
+  Master:
+    Trim: 0xD0CED7 
+    Shirt: 0x393939
+    Shirt Pocket: 0xD0CED7
+    Jacket Hood Inner: 0xFFAA00
+    Jacket Upper: 0x393939
+    Jacket Shoulder: 0xD0CED7
+    Jacket Hood Outer: 0x393939
+    Jacket Lower: 0xFFAA00
+    Belt Leg: 0x393939
+    Belt Pocket: 0xD0CED7
+    Pants Seat: 0x393939
+    Pants Pocket: 0x393939
+    Pants Lower: 0x393939
+    Pants Upper: 0xFFAA00
+    Shoe Light: 0x393939
+    Shoe Dark: 0xFFAA00
+    Shoe Bottom: 0xD0CED7
+  Final:
+    Shirt: 0x393939
+    Shirt Pocket: 0xD0CED7
+    Jacket Hood Inner: 0xD0CED7
+    Jacket Hood Outer: 0xE2E7EB
+    Jacket Shoulder: 0x739CA1
+    Jacket Upper: 0xE2E7EB
+    Jacket Lower: 0xE2E7EB
+    Trim: 0xEAEAEA
+    Belt Waist: 0x393939
+    Belt Leg: 0x739CA1
+    Belt Pocket: 0xE2E7EB
+    Pants Seat: 0x393939
+    Pants Upper: 0xE2E7EB
+    Pants Lower: 0x739CA1
+    Pants Pocket: 0x67798A
+    Shoe Light: 0x393939
+    Shoe Dark: 0xE2E7EB
+    Shoe Bottom: 0x393939
+  Anti:
+    Eyes: 0xFFE000
+    Sclera: 0x273960
+    Skin: 0x273960
+    Hair: 0x273960
+    Metal: 0x273960
+    Crown: 0x273960
+    Pendant: 0x273960
+    Shirt: 0x273960
+    Shirt Pocket: 0x273960
+    Jacket Hood Inner: 0x273960
+    Jacket Hood Outer: 0x273960
+    Jacket Shoulder: 0x273960
+    Jacket Upper: 0x273960
+    Jacket Lower: 0x273960
+    Trim: 0x273960
+    Belt Waist: 0x273960
+    Belt Leg: 0x273960
+    Belt Pocket: 0x273960
+    Pants Seat: 0x273960
+    Pants Upper: 0x273960
+    Pants Lower: 0x273960
+    Pants Pocket: 0x273960
+    Shoe Light: 0x273960
+    Shoe Dark: 0x273960
+    Shoe Bottom: 0x273960
+  Timeless:
+    Eyes: 0x000000
+    Sclera: 0xCBCBCB
+    Skin: 0xCBCBCB
+    Hair: 0x696969
+    Metal: 0xCBCBCB
+    Pendant: 0xCBCBCB
+    Shirt: 0x696969
+    Shirt Pocket: 0x696969
+    Jacket Hood Inner: 0x696969
+    Jacket Hood Outer: 0x393939
+    Jacket Shoulder: 0x393939
+    Jacket Upper: 0x393939
+    Jacket Lower: 0x393939
+    Trim: 0x868686
+    Belt Waist: 0x393939
+    Belt Leg: 0x868686
+    Belt Pocket: 0x868686
+    Pants Seat: 0x696969
+    Pants Upper: 0x696969
+    Pants Lower: 0x696969
+    Pants Pocket: 0x696969
+    Shoe Light: 0xCBCBCB
+    Shoe Dark: 0xCBCBCB
+    Shoe Bottom: 0xCBCBCB
+
+disable_casual_clothes: true
+hide_ship_sail: true
+author: Malqua
+comment: V 1.0.1 Sheathed Weapons Visible

@@ -106,6 +106,18 @@ if (-not $NoCheck) {
             if ($missing) { throw ("mod.elf imports what the game does not provide: " + ($missing -join ", ")) }
             Write-Host "check  : every import is a host service"
         }
+        # the runtime refuses a mod that hooks or calls a function whose code differs in another
+        # regional build ("function differs between game builds", 0.2.55: dMeter_Execute 02593B10)
+        $used = @($r.hooks | ForEach-Object { $_.target }) + @($r.game_calls)
+        foreach ($map in Get-ChildItem -LiteralPath (Join-Path $repo "tools\recomp\builds") -Filter *.json) {
+            $build = Get-Content -LiteralPath $map.FullName -Raw | ConvertFrom-Json
+            foreach ($d in $build.differing_functions) {
+                $start = [Convert]::ToUInt32($d[0], 16); $end = $start + [uint32]$d[1]
+                $bad = $used | Where-Object { $a = [Convert]::ToUInt32($_, 16); $a -ge $start -and $a -lt $end }
+                if ($bad) { throw ("mod.elf uses " + ($bad -join ", ") + ", which differs in the " + $build.name + " build: the game refuses the mod") }
+            }
+        }
+        Write-Host "check  : no function that differs between builds"
     } else {
         Write-Host "check  : skipped (no Python)"
     }

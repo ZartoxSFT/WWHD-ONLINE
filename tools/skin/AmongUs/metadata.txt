@@ -1,0 +1,7 @@
+hero_custom_colors:
+  Body: c04148
+  Skin: a2373d
+
+author: sup3rgh0st
+comment: After being falsly venting into space, a crewmate from the hit game Among Us has fallen into the land of Hyrule. Don't get caught doing anything sus or else Ganon will eject you into the ocean.
+disable_casual_clothes: true

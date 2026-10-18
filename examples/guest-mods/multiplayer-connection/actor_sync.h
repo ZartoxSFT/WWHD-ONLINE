@@ -999,6 +999,125 @@ static void as_register_runtime(void* actor, u32 prm) {
         as_ctx_add(as_inherit, &as_inherit_count, AS_MAX_INHERIT, actor, ctx); /* e.g. the death puff */
 }
 
+/* The actors' memory, with the enemy multiplier. fopAcM_entrySolidHeap (025D63E8: actor, create-heap
+ * callback, estimate; f_op_actor_mng_2.cpp) ignores the estimate in HD: it calls
+ * fopAcM_entrySolidHeap_ (025D6174: actor, callback, 0, parent heap; f_op_actor_mng.cpp), whose solid
+ * heap takes the parent's whole largest free block while the actor builds its models and is then cut
+ * to what it used. The parent is mDoExt_getHeap(1) (025E2F64) on the sea or when stageHeapFlags
+ * (1047E6C0) bit 0 is off, else mDoExt_getHeap(0); a few actors take the other one. When that block is
+ * too small the actor's own code writes through an allocation that failed (a Moblin's line material,
+ * crash-20261018-161706.log; a copy's weapon, daBoko_c::createHeap 020C1DA8, -171223/-202101.log).
+ * So the size each actor kind really used is kept (its solid heap at fopAc_ac_c + 0xF4, getHeapSize
+ * vtable +0x6C; the largest free block is getFreeSize, vtable +0x74, the heap's vtable at +0xC:
+ * story_lyt_screen.cpp). A copy goes into whichever of the two actors' heaps has the largest block,
+ * refused only when neither keeps room for it and AS_HEAP_KEEP more (the game's own failure: its create
+ * returns cPhs_ERROR_e and the game deletes it, never asked again: as_roster). Any other actor whose
+ * heap has no block for its known size goes into the other heap, and is refused only when neither has
+ * one, instead of the crash. */
+#define AS_HEAP_KEEP (1u << 20)        /* room a copy leaves for the stage's own actors */
+#define AS_HEAP_UNKNOWN_COPY (1u << 20) /* a copy of a kind not built yet */
+#define AS_HEAP_UNKNOWN (256u << 10)
+#define AS_HEAP_VTABLE 0x0C
+#define AS_HEAP_VT_SIZE 0x6C
+#define AS_HEAP_VT_FREE_BLOCK 0x74
+#define AS_ACTOR_HEAP 0xF4
+#define AS_HEAP_KINDS 128
+WWHD_GAME_ORIGINAL(0x025D63E8, s32, as_solid_heap_original, (u32 actor, u32 callback, u32 size));
+WWHD_GAME_FUNC(0x025D6174, s32, as_entry_solid_heap, (u32 actor, u32 callback, u32 size, u32 parent));
+WWHD_GAME_FUNC(0x025E2F64, u32, as_game_heap, (s32 index));
+typedef u32 (*as_heap_query_fn)(u32 heap);
+static u32 as_heap_refused, as_heap_refused_other, as_heap_moved;
+static s16 as_kind_proc[AS_HEAP_KINDS];
+static u32 as_kind_size[AS_HEAP_KINDS];
+static u32 as_kind_count;
+
+static u32 as_heap_query(u32 heap, u32 slot) {
+    u32 vtable = heap ? *(const volatile u32*)(heap + AS_HEAP_VTABLE) : 0;
+    as_heap_query_fn fn = vtable ? (as_heap_query_fn) * (const volatile u32*)(vtable + slot) : 0;
+    return fn ? fn(heap) : 0;
+}
+
+/* The heap the game takes for most actors (first) and the other one. */
+static void as_actor_heaps(u32* first, u32* other) {
+    const u8* play = wwhd_play_get();
+    int sea = play && play[WWHD_PLAY_START_STAGE_NAME_OFFSET] == 's' && play[WWHD_PLAY_START_STAGE_NAME_OFFSET + 1] == 'e' &&
+              play[WWHD_PLAY_START_STAGE_NAME_OFFSET + 2] == 'a' && !play[WWHD_PLAY_START_STAGE_NAME_OFFSET + 3];
+    u32 flags = WWHD_GAME_DATA(0x1047E6C0, u32);
+    s32 index = sea || !(flags & 1u) ? 1 : 0;
+    *first = as_game_heap(index);
+    *other = as_game_heap(1 - index);
+}
+
+static u32 as_kind_known(s16 proc) {
+    for (u32 i = 0; i != as_kind_count; ++i)
+        if (as_kind_proc[i] == proc) return as_kind_size[i];
+    return 0;
+}
+
+static void as_kind_note(u32 actor, s16 proc) {
+    u32 heap = *(const volatile u32*)(actor + AS_ACTOR_HEAP);
+    u32 used = heap ? as_heap_query(heap, AS_HEAP_VT_SIZE) : 0;
+    if (!used) return;
+    for (u32 i = 0; i != as_kind_count; ++i)
+        if (as_kind_proc[i] == proc) {
+            if (used > as_kind_size[i]) as_kind_size[i] = used;
+            return;
+        }
+    if (as_kind_count == AS_HEAP_KINDS) return;
+    as_kind_proc[as_kind_count] = proc;
+    as_kind_size[as_kind_count++] = used;
+}
+
+static void as_heap_log_refusal(const char* what, s16 proc, u32 need, u32 largest) {
+    wwhd_log_int(what, proc);
+    wwhd_log_int("multiplayer:   room needed", (int)need);
+    wwhd_log_int("multiplayer:   largest free block", (int)largest);
+}
+
+WWHD_REPLACE(0x025D63E8, s32, as_solid_heap, (u32 actor, u32 callback, u32 size)) {
+    if (!as_enabled || !actor) return as_solid_heap_original(actor, callback, size);
+    u32 first, other;
+    as_actor_heaps(&first, &other);
+    if (!first) return as_solid_heap_original(actor, callback, size);
+    s16 proc = *(const volatile s16*)(actor + AS_PROC_NAME);
+    u32 known = as_kind_known(proc);
+    u32 need = known ? known + known / 4u + 0x10000u : 0;
+    u32 l_first = as_heap_query(first, AS_HEAP_VT_FREE_BLOCK);
+    u32 l_other = other && other != first ? as_heap_query(other, AS_HEAP_VT_FREE_BLOCK) : 0;
+    const u8* block = (const u8*)as_roster_creating;
+    s32 ret;
+    if (block && block[AS_PRM_TAG] == AS_TAG && block[AS_PRM_COPY] != 0 && block[AS_PRM_COPY] != 0xFE) {
+        if (!known) need = AS_HEAP_UNKNOWN_COPY;
+        u32 best = l_other > l_first ? other : first;
+        u32 largest = best == first ? l_first : l_other;
+        if (largest < need + AS_HEAP_KEEP) {
+            if ((as_heap_refused++ & 31) == 0) {
+                as_heap_log_refusal("multiplayer: enemy copy not made, no room in the actors' heaps (proc)", proc, need,
+                                    largest);
+                wwhd_log_int("multiplayer:   copies refused so far", (int)as_heap_refused);
+            }
+            return 0;
+        }
+        ret = as_entry_solid_heap(actor, callback, 0, best);
+    } else {
+        if (!known) need = AS_HEAP_UNKNOWN;
+        if (l_first >= need) {
+            ret = as_solid_heap_original(actor, callback, size);
+        } else if (l_other >= need && l_other > l_first) {
+            if ((as_heap_moved++ & 15) == 0) wwhd_log_int("multiplayer: actor built in the other actors' heap (proc)", proc);
+            ret = as_entry_solid_heap(actor, callback, 0, other);
+        } else if (!known) {
+            ret = as_solid_heap_original(actor, callback, size); /* its size is not known: the game tries */
+        } else {
+            if ((as_heap_refused_other++ & 15) == 0)
+                as_heap_log_refusal("multiplayer: actor not made, no room in the actors' heaps (proc)", proc, need,
+                                    l_first > l_other ? l_first : l_other);
+            return 0;
+        }
+    }
+    if (ret) as_kind_note(actor, proc);
+    return ret;
+}
 /* fopAc_Create: the block is read before the original runs, on the first call only. */
 WWHD_REPLACE(0x025D4C70, s32, as_create, (void* actor)) {
     if (actor && as_enabled && as_session && as_session->factories_complete &&

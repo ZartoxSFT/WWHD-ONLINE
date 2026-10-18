@@ -281,10 +281,13 @@ WWHD_REPLACE(0x0247C358, s32, ship_puppet_create, (void* self)) {
     if (!play) return 0; /* cPhs_INIT: wait */
     volatile u32* ship_actor = (volatile u32*)(play + SHIP_PLAY_SHIP_ACTOR);
     u32 saved = *ship_actor;
+    puppet_status_keep status; /* player 0's ride and sail status (puppet.h): a new ship froze the sailing Link */
+    puppet_status_save(&status);
     ++ship_puppet_creating;
     s32 result = ship_create_original(self);
     --ship_puppet_creating;
     *ship_actor = saved;
+    puppet_status_restore(&status);
     return result;
 }
 
@@ -308,12 +311,12 @@ WWHD_REPLACE(0x025DADA4, u32, ship_ky_create, (s32 name, s32 param, void* pos, v
 
 WWHD_REPLACE(0x0247AF74, s32, ship_puppet_delete, (void* i_this)) {
     if (!ship_puppet_is(i_this)) return ship_delete_original(i_this);
-    u8* play = wwhd_play_get();
-    u32 status = play ? shipp_ld32((u32)play + SHIP_PLAY_STATUS1) : 0;
+    puppet_status_keep status; /* both status words (puppet.h), SAIL included */
+    puppet_status_save(&status);
     u32 grid = shipp_ld32((u32)i_this + SHIP_GRID_ID);
     if (grid != SHIP_NO_PROC) wwhd_fopAcM_delete_id(grid); /* its cloth goes with it */
     s32 result = ship_delete_original(i_this);
-    if (play) *(volatile u32*)(play + SHIP_PLAY_STATUS1) = status;
+    puppet_status_restore(&status);
     for (int i = 0; i != SHIP_PUPPET_MAX; ++i)
         if (ship_slots[i].actor == (u32)i_this) {
             ship_slots[i].actor = 0;

@@ -27,16 +27,22 @@
  *  - one faculty: none, bombs, summons or electricity (el_faculty). Bombs: while the local Link is
  *    within 1400 units, every 4 to 8 seconds a lit bomb
  *    (daBomb_c state 1: fuse, l_attrState 0x1C; parameters state | 0x80000000, d_a_bomb_static.cpp
- *    daBomb_prm_make) falls near the local Link; made with fopAcM_create (025D5834), untagged
- *    (as_spawning), so it stays in this game and hurts this game's Link, like an enemy's own bomb;
+ *    daBomb_prm_make) falls near the local Link; made with fopAcM_create (025D5834) in the LOCAL
+ *    context, so the other players see it fall on this player's puppet (el_make_bomb);
  *    Summons (rare, by the game that runs it, at most 3): a Keese or a Miniblin (el_summon).
  *    Electricity: sparks around it (el_sparks) and, the local Link within 300 units, a shock every
  *    5 to 9 s (el_link_step);
- *  - loot when it dies: 3 random spoils and 15 % a purple rupee (el_loot);
+ *  - loot when it dies: 3 random spoils among those the player has ever picked up (blue rupees
+ *    while none) and 15 % a purple rupee (el_loot);
  *  - a big explosion when it dies (deleted with health <= 0, or 3 s after its health fell to 0):
  *    seven bombs that explode at once (state 0, l_attrState 0xA1; the centre one state 8, mAtp 2);
- *  - 25 % bigger: its fopAc_ac_c::scale (0x330) times 1.25 after its execute, again whenever the
- *    actor wrote it itself (the value left there is not ours any more);
+ *  - 25 % bigger, in its models only: after each J3DModel::calc (027F4D5C) run during the elite's
+ *    execute or draw, the world matrices it wrote (model +0x2C -> block, +0x10 matrices, +0x2C u16
+ *    count, runtime interp.cpp) are scaled by 1.25 around the model's root joint. calc rebuilds them
+ *    from scratch each time, so nothing adds up. (0.2.40-0.2.53 multiplied fopAc_ac_c::scale again
+ *    whenever the actor had written it: the actors that grow their scale step by step - a Bokoblin
+ *    out of a pot, the skulls - grew without end, and those whose model ignores scale never grew.)
+ *    The actor's collision and logic are not changed;
  *  - a crown above it (assets/crown.png, drawn by this mod, projected with the game camera), shown
  *    up to 10 m (1000 units) from the local Link, fading from 7 m;
  *  - another colour: elite_color.h finds the primary colour of the model's textures and turns it
@@ -111,6 +117,15 @@ static const u8 el_ability_odds[4] = {20, 30, 25, 25};
  * "0 <= i_no && i_no < 128", 0.2.50). */
 #define EL_SPOILS 7
 static const u8 el_spoils[EL_SPOILS] = {0x1F, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A};
+/* Their bag index (dBeastIdx_*, d_item_4.h): the bit dSv_player_get_bag_item_c::onBeast sets the
+ * first time the spoil is picked up (d_item.cpp, d_item_2.cpp item_func_*). Only those the player
+ * has ever had drop; with none, a blue rupee. */
+static const u8 el_spoil_beast[EL_SPOILS] = {7, 0, 1, 2, 3, 4, 5};
+#define EL_BLUE_RUPEE 0x02       /* dItemNo_BLUE_RUPEE_e */
+#define EL_SAVE_POINTER 0x101F84DC
+#define EL_SAVE_GET_BAG (0x20 + 0x90) /* dSv_player_c::mGetBagItem (d_save.h) */
+/* dSv_player_get_bag_item_c::isBeast (025B7690, d_save_2.cpp: this, index) */
+WWHD_GAME_FUNC(0x025B7690, s32, el_is_beast, (u32 self, u32 index));
 #define EL_CROWN_FADE 700.0f     /* units (about 7 m) */
 #define EL_CROWN_HIDE 1000.0f    /* about 10 m, as asked */
 #define EL_ELITE_SIZE 1.25f
@@ -141,13 +156,12 @@ typedef struct el_actor {
     f32 last_pos[3];
     s8 last_room;
     f32 crown_x, crown_y, crown_scale, crown_alpha;
-    f32 grown[3];         /* the scale this mod wrote, to see when the actor writes its own */
-    u8 has_grown;
 } el_actor;
 
 static el_actor el_actors[EL_MAX];
 static u32 el_count;
 static int el_fast;               /* an elite runs its execute */
+static int el_growing;            /* an elite runs its execute or draw: its models are bigger */
 static el_actor* el_drawing;      /* an elite runs fopAc_Draw */
 static u32 el_random_state = 0x2545F491u;
 static int el_players_cached = 1;
@@ -266,7 +280,7 @@ static u8 el_tag_of(const void* actor) {
 }
 
 /* The owner's draw on this game's copy (actor_sync.h as_before_execute, before the owner's health
- * is applied): the health is rescaled at once to the new factor, the size put back. */
+ * is applied): the health is rescaled at once to the new factor. */
 static void el_adopt(void* actor, u8 tag) {
     el_actor* e = el_find(actor);
     if (!e || (tag != EL_TAG_REGULAR && !(tag & EL_TAG_ELITE))) return;
@@ -282,13 +296,6 @@ static void el_adopt(void* actor, u8 tag) {
             el_round_health(a, want / e->applied);
             e->applied = want;
         }
-        if (!elite && e->has_grown && a->scale.x == e->grown[0] && a->scale.y == e->grown[1] &&
-            a->scale.z == e->grown[2]) {
-            a->scale.x /= EL_ELITE_SIZE;
-            a->scale.y /= EL_ELITE_SIZE;
-            a->scale.z /= EL_ELITE_SIZE;
-        }
-        e->has_grown = 0;
     }
     e->ability = ability;
     e->seed = seed;
@@ -312,15 +319,37 @@ static void el_round_health(fopAc_ac_c* a, f32 ratio) {
 static cXyz el_bomb_pos, el_bomb_scale;
 static csXyz el_bomb_angle;
 
-static void el_make_bomb(u32 bomb_state, f32 x, f32 y, f32 z, s8 room) {
+/* shared: the lit bomb falling on the local Link is made in the LOCAL context, as his own bombs
+ * (actor_sync.h as_register_runtime: a weapon of the local Link is announced; the others make a
+ * copy run with this player's puppet as player 0, which falls on that puppet and whose blast hurts
+ * the players near it). Before 0.2.59 it was untagged: only the player it fell on saw it. The death
+ * explosion's bombs stay untagged: every game makes them. */
+/* The player's camera exists: a bomb's explosion starts with dCamera_c::ForceLockOff on it
+ * (daBomb_c::procExplode_init, d_a_bomb.cpp: dComIfGp_getCamera(dComIfGp_getPlayerCameraID(0))).
+ * During a stage change (a teleport, 15:59 crash-20261018-155932.log) the dead elites deleted with
+ * the stage exploded and their bombs read a null camera. Camera id: s8 at mPlayerInfo[0] + 4 (play +
+ * WWHD_PLAY_PLAYER_OFFSET 0x5B2C, data.h); camera: dComIfG_camera_info_class (0x34 bytes) at play +
+ * 0x12A0 + 0x4858 (d_com_inf_game.h), its camera_class* first. */
+#define EL_PLAY_CAMERAS (0x12A0 + 0x4858)
+#define EL_CAMERA_INFO_BYTES 0x34
+static int el_camera_ready(void) {
+    const u8* play = wwhd_play_get();
+    if (!play) return 0;
+    s8 id = *(const volatile s8*)(play + WWHD_PLAY_PLAYER_OFFSET + 4);
+    if (id < 0 || id > 3) return 0;
+    return *(const volatile u32*)(play + EL_PLAY_CAMERAS + (u32)id * EL_CAMERA_INFO_BYTES) != 0;
+}
+
+static void el_make_bomb(u32 bomb_state, f32 x, f32 y, f32 z, s8 room, int shared) {
+    if (!el_camera_ready()) return;
     el_bomb_pos.x = x;
     el_bomb_pos.y = y;
     el_bomb_pos.z = z;
     el_bomb_angle.x = el_bomb_angle.y = el_bomb_angle.z = 0;
     el_bomb_scale.x = el_bomb_scale.y = el_bomb_scale.z = 1.0f;
     u8 saved = as_context;
-    as_context = AS_CTX_NONE; /* this game's bomb only (actor_sync.h: untagged, never announced) */
-    as_spawning = 1;
+    as_context = shared && as_session ? AS_CTX_LOCAL : AS_CTX_NONE;
+    as_spawning = !shared;
     wwhd_fopAcM_create(EL_PROC_BOMB, bomb_state | EL_BOMB_VERSION, (u32)&el_bomb_pos, (s32)room, (u32)&el_bomb_angle,
                        (u32)&el_bomb_scale, 0xFFFFFFFFu, 0);
     as_spawning = 0;
@@ -333,11 +362,23 @@ WWHD_GAME_FUNC(0x025D8870, u32, el_create_item, (u32 pos, s32 item, s32 bit, s32
                                                  s32 action, u32 scale));
 static cXyz el_item_pos;
 
-/* Three random spoils and sometimes a purple rupee, by the game that runs the elite: made in its
- * OWNED context they are announced like an enemy's drops (actor_sync.h), so every player gets the
- * same ones; an elite not synchronised drops in each game. */
+/* The spoils this game's player has ever picked up; returns how many. */
+static u32 el_unlocked_spoils(u8* out) {
+    u32 save = WWHD_GAME_DATA(EL_SAVE_POINTER, u32), n = 0;
+    if (!save) return 0;
+    for (u32 i = 0; i != EL_SPOILS; ++i)
+        if (el_is_beast(save + EL_SAVE_GET_BAG, el_spoil_beast[i])) out[n++] = el_spoils[i];
+    return n;
+}
+
+/* Three random spoils among those unlocked (else blue rupees) and sometimes a purple rupee, by the
+ * game that runs the elite: made in its OWNED context they are announced like an enemy's drops
+ * (actor_sync.h), so every player gets the same ones (the unlocked ones of the owner's save); an
+ * elite not synchronised drops in each game. */
 static void el_loot(el_actor* e) {
     if (!e->owned) return;
+    u8 unlocked[EL_SPOILS];
+    u32 unlocked_count = el_unlocked_spoils(unlocked);
     u8 saved = as_context;
     as_context = as_session ? AS_CTX_OWNED : AS_CTX_NONE;
     for (u32 i = 0; i != EL_LOOT + 1; ++i) {
@@ -346,7 +387,7 @@ static void el_loot(el_actor* e) {
             if (el_random() % 100u >= EL_PURPLE_PERCENT) break;
             item = EL_PURPLE_RUPEE;
         } else {
-            item = el_spoils[el_random() % EL_SPOILS];
+            item = unlocked_count ? unlocked[el_random() % unlocked_count] : EL_BLUE_RUPEE;
         }
         el_item_pos.x = e->last_pos[0] + (el_random01() - 0.5f) * 80.0f;
         el_item_pos.y = e->last_pos[1] + 20.0f;
@@ -360,11 +401,11 @@ static void el_explode(el_actor* e) {
     if (e->exploded) return;
     e->exploded = 1;
     f32 x = e->last_pos[0], y = e->last_pos[1] + 30.0f, z = e->last_pos[2];
-    el_make_bomb(EL_BOMB_BIG_BLAST, x, y, z, e->last_room);
+    el_make_bomb(EL_BOMB_BIG_BLAST, x, y, z, e->last_room, 0);
     static const f32 ring_x[6] = {1.0f, 0.5f, -0.5f, -1.0f, -0.5f, 0.5f};
     static const f32 ring_z[6] = {0.0f, 0.866f, 0.866f, 0.0f, -0.866f, -0.866f};
     for (int i = 0; i != 6; ++i)
-        el_make_bomb(EL_BOMB_BLAST, x + EL_BLAST_RADIUS * ring_x[i], y, z + EL_BLAST_RADIUS * ring_z[i], e->last_room);
+        el_make_bomb(EL_BOMB_BLAST, x + EL_BLAST_RADIUS * ring_x[i], y, z + EL_BLAST_RADIUS * ring_z[i], e->last_room, 0);
     el_loot(e);
     wwhd_log("multiplayer: an elite enemy exploded");
 }
@@ -399,23 +440,26 @@ static void el_sparks(el_actor* e, const fopAc_ac_c* a, double dt) {
 /* A shock for the local Link, given in its execute (mod.c el_link_step). */
 static int el_shock_pending;
 static f32 el_shock_amount;
-static cXyz el_shock_from;
 
-/* daPy_lk_c (d_a_player_main_03.cpp): setDamagePoint 023F51D0 (this, f32), setDamageElecEmitter
- * 023F9340 (this), procElecDamage_init 023F95F4 (this, const cXyz*): what the damage check does
- * for an electric hit (checkDamage: damage, sparks on Link, the paralysed animation). */
-WWHD_GAME_FUNC(0x023F51D0, s32, el_set_damage_point, (u32 self, f32 amount));
+/* daPy_lk_c (d_a_player_main_03.cpp, signatures in wwhd/bindings.h): setDamagePointWait 023F9D1C
+ * (this, f32: when Link is not already in his damage wait, the damage, a 30-frame wait, his hurt
+ * voice and sound) and setDamageElecEmitter 023F9340 (this: the sparks on Link). What the game's
+ * damage check does when Link touches an electrified floor (attribute 0x16, outside a rope or the
+ * water): no proc change, no event. */
+WWHD_GAME_FUNC(0x023F9D1C, void, el_set_damage_point_wait, (u32 self, f32 amount));
 WWHD_GAME_FUNC(0x023F9340, void, el_set_elec_emitter, (u32 self));
-WWHD_GAME_FUNC(0x023F95F4, s32, el_proc_elec_damage, (u32 self, u32 from));
 
+/* The shock, like an electric barrier: Link keeps control. 0.2.50-0.2.55 used the paralysis
+ * (procElecDamage_init 023F95F4), which orders a compulsory event and changes Link's proc: soft
+ * locks in some modes even with the guards, and a fall on his back with a source position. Called
+ * for the local Link only (mod.c, never a puppet; as_link is only set while the actors sync). */
 static void el_link_step(void* link) {
-    if (!el_shock_pending || !link || (u32)link != as_link) return;
+    if (!link || !el_shock_pending) return;
     el_shock_pending = 0;
     const u8* play = wwhd_play_get();
     if (!play || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
-    el_set_damage_point((u32)link, -el_shock_amount);
+    el_set_damage_point_wait((u32)link, -el_shock_amount);
     el_set_elec_emitter((u32)link);
-    el_proc_elec_damage((u32)link, (u32)&el_shock_from);
     wwhd_log("multiplayer: an electric elite shocked Link");
 }
 
@@ -435,14 +479,16 @@ static void el_summon(el_actor* e, const fopAc_ac_c* a) {
 }
 
 static void el_faculty(el_actor* e, const fopAc_ac_c* a, double dt) {
-    if (e->ability == EL_ABILITY_ELECTRIC) el_sparks(e, a, dt);
     if (e->ability == EL_ABILITY_NONE) return;
     const fopAc_ac_c* link = (const fopAc_ac_c*)as_link;
     const u8* play = wwhd_play_get();
-    if (!link || !play || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
+    if (!link || !play) return;
     f32 dx = link->current.pos.x - a->current.pos.x, dz = link->current.pos.z - a->current.pos.z;
     f32 dy = link->current.pos.y - a->current.pos.y;
     f32 d2 = dx * dx + dz * dz + dy * dy;
+    /* the sparks only within 10 m (1000 units), like the crown and the names */
+    if (e->ability == EL_ABILITY_ELECTRIC && d2 < EL_CROWN_HIDE * EL_CROWN_HIDE) el_sparks(e, a, dt);
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
     f32 range = e->ability == EL_ABILITY_BOMBS ? EL_BOMB_RANGE
               : e->ability == EL_ABILITY_SUMMON ? EL_SUMMON_RANGE : EL_SHOCK_RANGE;
     if (d2 > range * range) return;
@@ -453,7 +499,7 @@ static void el_faculty(el_actor* e, const fopAc_ac_c* a, double dt) {
         /* near the local Link, a random place 60 to 180 units around, from above */
         f32 r = 60.0f + el_random01() * 120.0f, sine, cosine = el_cos(el_random01() * 6.2831853f, &sine);
         el_make_bomb(EL_BOMB_LIT, link->current.pos.x + r * cosine, link->current.pos.y + 220.0f,
-                     link->current.pos.z + r * sine, link->current.roomNo);
+                     link->current.pos.z + r * sine, link->current.roomNo, 1);
     } else if (e->ability == EL_ABILITY_SUMMON) {
         e->ability_clock = EL_SUMMON_MIN + (double)el_random01() * EL_SUMMON_SPREAD;
         if (e->owned && e->summons < EL_SUMMON_MAX) el_summon(e, a); /* rare: a few per fight */
@@ -461,9 +507,6 @@ static void el_faculty(el_actor* e, const fopAc_ac_c* a, double dt) {
         e->ability_clock = EL_SHOCK_MIN + (double)el_random01() * EL_SHOCK_SPREAD;
         el_shock_pending = 1;
         el_shock_amount = EL_SHOCK_DAMAGE * el_damage_factor(e);
-        el_shock_from.x = a->current.pos.x;
-        el_shock_from.y = a->current.pos.y;
-        el_shock_from.z = a->current.pos.z;
     }
 }
 
@@ -472,11 +515,13 @@ static void el_faculty(el_actor* e, const fopAc_ac_c* a, double dt) {
 static el_actor* el_execute_begin(void* actor) {
     el_actor* e = el_find(actor);
     el_fast = e && e->elite;
+    el_growing = el_fast;
     return e;
 }
 
 static void el_execute_end(el_actor* e) {
     el_fast = 0;
+    el_growing = 0;
     if (!e) return;
     fopAc_ac_c* a = (fopAc_ac_c*)e->actor;
     e->last_pos[0] = a->current.pos.x;
@@ -498,17 +543,6 @@ static void el_execute_end(el_actor* e) {
         }
     }
     if (!e->elite) return;
-    if (!e->has_grown || a->scale.x != e->grown[0] || a->scale.y != e->grown[1] || a->scale.z != e->grown[2]) {
-        if (a->scale.x > 0.0f && a->scale.y > 0.0f && a->scale.z > 0.0f) {
-            a->scale.x *= EL_ELITE_SIZE;
-            a->scale.y *= EL_ELITE_SIZE;
-            a->scale.z *= EL_ELITE_SIZE;
-            e->grown[0] = a->scale.x;
-            e->grown[1] = a->scale.y;
-            e->grown[2] = a->scale.z;
-            e->has_grown = 1;
-        }
-    }
     if (a->health <= 0) {
         e->dead_clock += dt;
         if (e->dead_clock >= EL_DEATH_WAIT) el_explode(e);
@@ -585,7 +619,10 @@ WWHD_REPLACE(0x027F2BF8, s32, el_frame_pass, (u32 self, f32 pass_frame)) {
 
 #define EL_ARENA_SPAN 0x10000u       /* TUNIC_ADDRESS_SPAN */
 #define EL_ARENA_RUNS 512
-#define EL_SETS 12
+#define EL_SETS 24
+#define EL_SET_IDLE 90       /* logic steps (3 s) unused before a set may be replaced */
+#define EL_FAILS 8
+#define EL_FAIL_STEPS 600    /* a set that did not fit is not tried again for 20 s */
 #define EL_SET_TEXTURES 24
 #define EL_PLANS 24
 #define EL_TABLE_MAX 64
@@ -792,41 +829,67 @@ static int el_build_set(el_set* s, u32 model_data, u8 seed) {
     return 1;
 }
 
-/* The recoloured copies of a model for an elite's hue, made the first time. */
-static el_set* el_set_for(u32 model_data, u8 seed) {
-    unsigned long long step = wwhd_logic_step();
-    el_set* free_set = 0;
+typedef struct el_fail {
+    u32 model_data;
+    u8 seed;
+    unsigned long long step;
+} el_fail;
+
+static el_fail el_fails[EL_FAILS];
+static u32 el_fail_next;
+static unsigned long long el_build_step = ~0ull;
+
+/* The longest unused set, if unused for EL_SET_IDLE steps (never one drawn lately). */
+static el_set* el_idle_set(unsigned long long step, const el_set* keep) {
     el_set* oldest = 0;
     for (u32 i = 0; i != EL_SETS; ++i) {
-        el_set* s = &el_sets[i];
-        if (s->used && s->model_data == model_data && s->seed == seed) {
-            s->last_step = step;
-            return s;
+        el_set* o = &el_sets[i];
+        if (o == keep || !o->used || step - o->last_step < EL_SET_IDLE) continue;
+        if (!oldest || o->last_step < oldest->last_step) oldest = o;
+    }
+    return oldest;
+}
+
+/* The recoloured copies of a model for an elite's hue, made the first time. A build copies and
+ * recolours whole textures: at most one a logic step, a set only replaces one unused for 3 s, and
+ * one that did not fit waits 20 s. More elites in sight than the sets hold keep their own colours
+ * (0.2.40-0.2.53 replaced the set of the step before at every step: with several elites side by
+ * side - Keese, Magtails, Boko Babas - the sets were rebuilt over and over, down to 3 fps). */
+static el_set* el_set_for(u32 model_data, u8 seed) {
+    unsigned long long step = wwhd_logic_step();
+    el_set* s = 0;
+    for (u32 i = 0; i != EL_SETS; ++i) {
+        el_set* o = &el_sets[i];
+        if (o->used && o->model_data == model_data && o->seed == seed) {
+            o->last_step = step;
+            return o;
         }
-        if (!s->used && !free_set) free_set = s;
-        if (s->used && s->last_step != step && (!oldest || s->last_step < oldest->last_step)) oldest = s;
+        if (!o->used && !s) s = o;
     }
-    el_set* s = free_set;
-    if (!s && oldest) {
-        el_set_free(oldest);
-        s = oldest;
+    if (el_build_step == step) return 0;
+    for (u32 i = 0; i != EL_FAILS; ++i)
+        if (el_fails[i].model_data == model_data && el_fails[i].seed == seed && step - el_fails[i].step < EL_FAIL_STEPS)
+            return 0;
+    if (!s) {
+        s = el_idle_set(step, 0);
+        if (!s) return 0;
+        el_set_free(s);
     }
-    if (!s) return 0;
+    el_build_step = step;
     for (int attempt = 0; attempt != 2; ++attempt) {
         if (el_build_set(s, model_data, seed)) {
             s->last_step = step;
             return s;
         }
         el_set_free(s);
-        /* arena full: the longest unused set goes, then once more */
-        el_set* victim = 0;
-        for (u32 i = 0; i != EL_SETS; ++i) {
-            el_set* o = &el_sets[i];
-            if (o != s && o->used && o->last_step != step && (!victim || o->last_step < victim->last_step)) victim = o;
-        }
+        el_set* victim = el_idle_set(step, s); /* arena full: an unused set goes, then once more */
         if (!victim) break;
         el_set_free(victim);
     }
+    el_fail* f = &el_fails[el_fail_next++ % EL_FAILS];
+    f->model_data = model_data;
+    f->seed = seed;
+    f->step = step;
     static int full_logged;
     if (!full_logged++) wwhd_log("multiplayer: elite colour arena full, an elite keeps its colour");
     return 0;
@@ -856,8 +919,8 @@ static const char* const el_color_names[EL_COLOR_NAMES] = {
     "konst0", "konst1", "konst2", "konst3",
 };
 #define EL_ENTRY_BYTES 0x3C
-#define EL_INSTANCES 8
-#define EL_INSTANCE_COLORS 128
+#define EL_INSTANCES 32
+#define EL_INSTANCE_COLORS 96
 
 WWHD_GAME_FUNC(0x027DF9B0, s32, el_find_param, (u32 dictionary, u32 name));
 
@@ -866,8 +929,18 @@ typedef struct el_color_slot {
     f32 original[3], written[3];
 } el_color_slot;
 
+/* Where a colour parameter of the model is: its material entry, the resource's table, its index
+ * and the second one marked, its offset in the entry's uniform data (+0x28, read at each draw). */
+typedef struct el_spot {
+    u32 entry, table;
+    u16 index, second, offset;
+} el_spot;
+
 typedef struct el_instance {
     u32 model;
+    u32 base, materials, resource; /* what the spots were found with (resource: material 0's) */
+    u32 spots;
+    el_spot spot[EL_INSTANCE_COLORS];
     u32 count;
     el_color_slot slot[EL_INSTANCE_COLORS];
     unsigned long long step;
@@ -883,8 +956,39 @@ static el_instance* el_instance_for(u32 model) {
         if (el_instances[i].step < oldest->step) oldest = &el_instances[i];
     }
     oldest->model = model;
+    oldest->base = 0;
+    oldest->materials = 0;
+    oldest->spots = 0;
     oldest->count = 0;
     return oldest;
+}
+
+/* The model's colour parameters, looked up by name once per model (11 names in every material's
+ * dictionary at every draw were most of an elite's cost). */
+static void el_find_spots(el_instance* in, u32 base, u32 count) {
+    in->base = base;
+    in->materials = count;
+    in->resource = count ? *(const volatile u32*)base : 0;
+    in->spots = 0;
+    in->count = 0;
+    for (u32 i = 0; i != count; ++i) {
+        u32 entry = base + i * EL_ENTRY_BYTES;
+        u32 resource = *(const volatile u32*)entry;
+        if (!resource || (resource & 3)) continue;
+        s32 names = (s32)*(const volatile u32*)(resource + 0x38), colors = (s32)*(const volatile u32*)(resource + 0x34);
+        if (!names || !colors) continue;
+        u32 dictionary = resource + 0x38 + (u32)names, table = resource + 0x34 + (u32)colors;
+        for (u32 k = 0; k != EL_COLOR_NAMES && in->spots != EL_INSTANCE_COLORS; ++k) {
+            s32 index = el_find_param(dictionary, (u32)el_color_names[k]);
+            if (index < 0) continue;
+            el_spot* p = &in->spot[in->spots++];
+            p->entry = entry;
+            p->table = table;
+            p->index = (u16)index;
+            p->second = *(const volatile u16*)(table + (u32)index * 0x14 + 0x0C);
+            p->offset = *(const volatile u16*)(table + (u32)index * 0x14 + 2);
+        }
+    }
 }
 
 static void el_mark_param(u32 entry, u32 table, u32 index) {
@@ -895,7 +999,7 @@ static void el_mark_param(u32 entry, u32 table, u32 index) {
 }
 
 typedef struct el_found {
-    u32 address, entry, table, index;
+    u32 address, entry, table, index, second;
     f32 original[3];
 } el_found;
 
@@ -906,45 +1010,41 @@ static void el_paint_instance(u32 model, u32 seed) {
     if (count > EL_MAT_MAX) count = EL_MAT_MAX;
     el_instance* in = el_instance_for(model);
     in->step = wwhd_logic_step();
+    if (in->base != base || in->materials != count || (count && in->resource != *(const volatile u32*)base))
+        el_find_spots(in, base, count);
     static el_found found[EL_INSTANCE_COLORS];
     u32 n = 0;
     static ec_hist h;
     ec_hist_clear(&h);
-    for (u32 i = 0; i != count; ++i) {
-        u32 entry = base + i * EL_ENTRY_BYTES;
-        u32 resource = *(const volatile u32*)entry, data = *(const volatile u32*)(entry + 0x28);
-        if (!resource || !data || (resource & 3)) continue;
-        s32 names = (s32)*(const volatile u32*)(resource + 0x38), colors = (s32)*(const volatile u32*)(resource + 0x34);
-        if (!names || !colors) continue;
-        u32 dictionary = resource + 0x38 + (u32)names, table = resource + 0x34 + (u32)colors;
-        for (u32 k = 0; k != EL_COLOR_NAMES && n != EL_INSTANCE_COLORS; ++k) {
-            s32 index = el_find_param(dictionary, (u32)el_color_names[k]);
-            if (index < 0) continue;
-            u32 address = data + *(const volatile u16*)(table + (u32)index * 0x14 + 2);
-            if (address & 3) continue;
-            el_found* f = &found[n];
-            volatile f32* c = (volatile f32*)address;
-            for (u32 j = 0; j != 3; ++j) f->original[j] = c[j];
-            for (u32 s = 0; s != in->count; ++s) { /* our own colour of last time: its original */
-                const el_color_slot* o = &in->slot[s];
-                if (o->address == address && o->written[0] == f->original[0] && o->written[1] == f->original[1] &&
-                    o->written[2] == f->original[2]) {
-                    for (u32 j = 0; j != 3; ++j) f->original[j] = o->original[j];
-                    break;
-                }
+    for (u32 i = 0; i != in->spots; ++i) {
+        const el_spot* p = &in->spot[i];
+        u32 data = *(const volatile u32*)(p->entry + 0x28);
+        if (!data) continue;
+        u32 address = data + p->offset;
+        if (address & 3) continue;
+        el_found* f = &found[n];
+        volatile f32* c = (volatile f32*)address;
+        for (u32 j = 0; j != 3; ++j) f->original[j] = c[j];
+        for (u32 s = 0; s != in->count; ++s) { /* our own colour of last time: its original */
+            const el_color_slot* o = &in->slot[s];
+            if (o->address == address && o->written[0] == f->original[0] && o->written[1] == f->original[1] &&
+                o->written[2] == f->original[2]) {
+                for (u32 j = 0; j != 3; ++j) f->original[j] = o->original[j];
+                break;
             }
-            f->address = address;
-            f->entry = entry;
-            f->table = table;
-            f->index = (u32)index;
-            tc_u32 rgb;
-            f32 scale;
-            if (el_slot_rgb((u32)f->original, &rgb, &scale)) {
-                tc_hsb px = tc_rgb_to_hsb(rgb);
-                if (px.s >= EC_SATURATION_MIN && px.b >= EC_BRIGHTNESS_MIN) ec_hist_rgb(&h, rgb);
-            }
-            ++n;
         }
+        f->address = address;
+        f->entry = p->entry;
+        f->table = p->table;
+        f->index = p->index;
+        f->second = p->second;
+        tc_u32 rgb;
+        f32 scale;
+        if (el_slot_rgb((u32)f->original, &rgb, &scale)) {
+            tc_hsb px = tc_rgb_to_hsb(rgb);
+            if (px.s >= EC_SATURATION_MIN && px.b >= EC_BRIGHTNESS_MIN) ec_hist_rgb(&h, rgb);
+        }
+        ++n;
     }
     ec_plan plan = ec_dominant(&h);
     if (plan.mode != EC_HUE) return; /* no coloured material: the textures carry its colour */
@@ -960,8 +1060,7 @@ static void el_paint_instance(u32 model, u32 seed) {
         c[1] = (f32)((out >> 8) & 0xFF) / 255.0f * scale;
         c[2] = (f32)(out & 0xFF) / 255.0f * scale;
         el_mark_param(f->entry, f->table, f->index);
-        u32 second = *(const volatile u16*)(f->table + f->index * 0x14 + 0x0C);
-        el_mark_param(f->entry, f->table, second);
+        el_mark_param(f->entry, f->table, f->second);
         el_color_slot* o = &in->slot[in->count++];
         o->address = f->address;
         for (u32 j = 0; j != 3; ++j) {
@@ -1026,10 +1125,46 @@ WWHD_HOOK_RETURN(0x025E2BF4, el_draw_model_end, (u32 model, u32 supplied)) {
 static el_actor* el_draw_begin(void* actor) {
     el_actor* e = el_find(actor);
     el_drawing = e && e->elite ? e : 0;
+    el_growing = el_drawing != 0;
     return el_drawing;
 }
 
-static void el_draw_end(void) { el_drawing = 0; }
+static void el_draw_end(void) {
+    el_drawing = 0;
+    el_growing = 0;
+}
+
+/* ---------------------------------------------------------------- bigger models */
+
+#define EL_MDL_JOINTS 0x2C   /* J3DModel -> joint matrix block (runtime interp.cpp kMdlJoints) */
+#define EL_JNT_MTX 0x10      /* block -> world matrices, 3x4 row-major */
+#define EL_JNT_NUM 0x2C      /* block -> u16 count */
+#define EL_JNT_MAX 256
+
+/* J3DModel::calc (027F4D5C) of a model of an elite: its world matrices, just rebuilt, scaled by
+ * EL_ELITE_SIZE around its root joint (matrix 0's translation, the model's base). */
+WWHD_HOOK_RETURN(0x027F4D5C, el_model_calc, (u32 model)) {
+    if (!el_growing || !model || (model & 3)) return;
+    u32 block = *(const volatile u32*)(model + EL_MDL_JOINTS);
+    if (!block || (block & 3)) return;
+    u32 mtx = *(const volatile u32*)(block + EL_JNT_MTX);
+    u32 n = *(const volatile u16*)(block + EL_JNT_NUM);
+    if (!mtx || (mtx & 3) || !n || n > EL_JNT_MAX) return;
+    volatile f32* m = (volatile f32*)mtx;
+    f32 px = m[3], py = m[7], pz = m[11];
+    if (!(px == px && py == py && pz == pz)) return; /* NaN */
+    const f32 k = EL_ELITE_SIZE;
+    for (u32 j = 0; j != n; ++j, m += 12) {
+        for (u32 c = 0; c != 3; ++c) {
+            m[c] *= k;
+            m[4 + c] *= k;
+            m[8 + c] *= k;
+        }
+        m[3] = px + (m[3] - px) * k;
+        m[7] = py + (m[7] - py) * k;
+        m[11] = pz + (m[11] - pz) * k;
+    }
+}
 
 /* ---------------------------------------------------------------- crowns */
 

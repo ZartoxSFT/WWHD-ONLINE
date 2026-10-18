@@ -116,7 +116,28 @@ static u32 skin_key_for(u32 name) {
     return (u32)a->key;
 }
 
+/* "Link" resources that Link shares with another actor's model, always taken from "Link": the
+ * bomb model (dRes_INDEX_LINK_BDL_BOMB_e 0x3C, d_a_bomb.h) and its brk (0x51). daBomb_c::createHeap
+ * builds the bomb from "Link" 0x3C outside any Link's code, and daBomb_c::draw_norm (020C4398)
+ * plays the local Link's brk (+0x44D4) on it; Link binds that brk to its own 0x3C in phase_2
+ * (d_a_player_main_01.cpp initBrkAnm). Taken from a skin, it was bound to the skin's bomb and the
+ * game's bomb drew unbound: crash in J3DModel::viewCalc (027F55FC) reading null + 0x3C as soon as a
+ * bomb showed (an elite's bombs, crash-20261018-*.log). */
+/* The same for every model of that loop of Link's creation (d_a_player_main_01.cpp, anmLines: the
+ * model, then the animations Link binds to it): 0x3C bomb (brk 0x51), 0x42 (brk 0x55, btk 0x63),
+ * 0x37 (btk 0x68), 0x38 (btk 0x65), 0x40 (btk 0x61), 0x41 (btk 0x62). 0x42 is the bomb's water
+ * column, GWP00 (dRes_INDEX_LINK_BDL_GWP00_e, d_wpillar.cpp: dWpillar_c built from "Link" 0x42 for
+ * a bomb exploding over water): the same crash at 15:49 and 15:53 in dWpillar_c::draw (025D24B0)
+ * after an elite's explosion (crash-20261018-1549*.log, -155303.log). */
+static int skin_shared_res(u32 index) {
+    static const u8 shared[] = {0x3C, 0x51, 0x42, 0x55, 0x63, 0x37, 0x68, 0x38, 0x65, 0x40, 0x61, 0x41, 0x62};
+    for (u32 i = 0; i != sizeof(shared); ++i)
+        if (index == shared[i]) return 1;
+    return 0;
+}
+
 WWHD_REPLACE(0x026066C4, u32, skin_get_res, (u32 self, u32 name, u32 index)) {
+    if (skin_shared_res(index)) return skin_get_res_original(self, name, index);
     return skin_get_res_original(self, skin_key_for(name), index);
 }
 

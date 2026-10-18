@@ -1,0 +1,36 @@
+hero_custom_colors:
+  Clothes: ffffff
+
+hero_color_presets:
+  Unfunny Cook:
+    Clothes: 88a8c8
+
+  Money Green:
+    Clothes: 58c000
+
+  SAGE Blue:
+    Clothes: 30a8f8
+
+  Blood Red:
+    Clothes: e03000
+
+  TV Purple:
+    Clothes: 9850f8
+
+  Garish Cook:
+    Clothes: e85098
+
+  Mooney Orange:
+    Clothes: f87018
+
+  Golden God:
+    Clothes: e09000
+
+
+has_colored_eyebrows: false
+eyebrow_color_name: None
+hero_mouth_color_name: None
+casual_mouth_color_name: None
+disable_casual_clothes: true
+author: mariocraft31
+comment: pepino! pepino di novo!

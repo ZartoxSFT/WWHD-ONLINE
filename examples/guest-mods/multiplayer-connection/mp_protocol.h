@@ -241,6 +241,9 @@ typedef struct mp_session {
     mp_u32 server_world;            /* WWHD extension (ActorFilter): the world clock and weather */
     mp_u32 client_save_update;      /* SaveServer: values this player's save changed */
     mp_u32 client_save_merge;       /* WWHD extension (SaveServer): all of them, once connected */
+    mp_u32 client_world;            /* WWHD extension (ActorFilter): a sailing player's clock and weather */
+    mp_u32 client_player_revive;    /* WWHD extension (WWClient): revive a dead player of the directory */
+    mp_u32 server_player_revive;    /* WWHD extension: another player revived us */
     /* the SaveServer initializer's map (SaveServer.writeMap): runs of {type, length in bytes} */
     mp_u32 save_map_count;
     mp_u8 save_map_type[MP_SAVE_MAP_MAX];
@@ -487,7 +490,8 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->server_player_directory = s->client_player_directory = MP_NO_ID;
     s->server_player_summon = s->client_player_summon = MP_NO_ID;
     s->server_save_update = s->server_save_from = s->server_world = MP_NO_ID;
-    s->client_save_update = s->client_save_merge = MP_NO_ID;
+    s->client_save_update = s->client_save_merge = s->client_world = MP_NO_ID;
+    s->client_player_revive = s->server_player_revive = MP_NO_ID;
     s->save_map_count = 0;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
@@ -515,6 +519,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_SAVE_UPDATE", &s->server_save_update);
         mp_assign_id(name, n, i, "SERVER_SAVE_FROM", &s->server_save_from);
         mp_assign_id(name, n, i, "SERVER_WORLD", &s->server_world);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_REVIVE", &s->server_player_revive);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -529,6 +534,8 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_PLAYER_SUMMON", &s->client_player_summon);
         mp_assign_id(name, n, i, "CLIENT_SAVE_UPDATE", &s->client_save_update);
         mp_assign_id(name, n, i, "CLIENT_SAVE_MERGE", &s->client_save_merge);
+        mp_assign_id(name, n, i, "CLIENT_WORLD", &s->client_world);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_REVIVE", &s->client_player_revive);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
@@ -606,6 +613,14 @@ typedef struct mp_ship_state {
  * server keeps and forwards it (ActorPlayerSync.java skin). */
 #define MP_SKIN_MAX 12
 
+/* Protocol extension (WWHD, after the skin, optional the same way): the player's death (death.h).
+ * u8 flags, bit 7 clear; with MP_DEATH_GHOST (dead, walking as a ghost until another player of the
+ * stage revives it), then VLQ the player's directory id (where a revive is sent: CLIENT_PLAYER_REVIVE),
+ * f32 x, y, z and u16 rotation y of its body. The Java server keeps and forwards it
+ * (ActorPlayerSync.java death*). */
+#define MP_DEATH_GHOST 0x01
+#define MP_DEATH_FLAGS 0x7F
+
 typedef struct mp_player_look {
     mp_u16 item;
     mp_u32 proc;
@@ -615,6 +630,10 @@ typedef struct mp_player_look {
     mp_ship_state ship;
     mp_u8 extras; /* MP_EXTRA_* */
     char skin[MP_SKIN_MAX + 1]; /* "" for Link */
+    mp_u8 death;                /* MP_DEATH_* */
+    mp_u32 death_dir;           /* with MP_DEATH_GHOST: its directory id */
+    float corpse[3];            /* with MP_DEATH_GHOST: its body */
+    mp_s16 corpse_angle;
 } mp_player_look;
 
 static inline mp_player_look mp_player_look_default(void) {
@@ -642,6 +661,10 @@ static inline mp_player_look mp_player_look_default(void) {
     l.ship.neck_pitch = l.ship.neck_turn = 0;
     l.extras = 0;
     for (int i = 0; i != MP_SKIN_MAX + 1; ++i) l.skin[i] = 0;
+    l.death = 0;
+    l.death_dir = 0;
+    l.corpse[0] = l.corpse[1] = l.corpse[2] = 0.0f;
+    l.corpse_angle = 0;
     return l;
 }
 
@@ -1113,6 +1136,27 @@ static inline int mp_same_ship(const mp_ship_state* a, const mp_ship_state* b) {
     return 1;
 }
 
+static inline void mp_write_death(mp_writer* w, const mp_player_look* l) {
+    mp_u8 flags = (mp_u8)(l->death & MP_DEATH_FLAGS);
+    mp_write_u8(w, flags);
+    if (!(flags & MP_DEATH_GHOST)) return;
+    mp_write_vlq(w, l->death_dir);
+    for (int i = 0; i != 3; ++i) mp_write_f32(w, l->corpse[i]);
+    mp_write_u16(w, (mp_u16)l->corpse_angle);
+}
+
+/* The death block, the same way as the extensions before it: a byte with bit 7 clear, else none. */
+static inline void mp_read_death(mp_reader* r, mp_player_look* l) {
+    l->death = 0;
+    l->death_dir = 0;
+    if (!(r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80))) return;
+    l->death = (mp_u8)(mp_read_u8(r) & MP_DEATH_FLAGS);
+    if (!(l->death & MP_DEATH_GHOST)) return;
+    l->death_dir = mp_read_vlq(r);
+    for (int i = 0; i != 3; ++i) l->corpse[i] = mp_read_f32(r);
+    l->corpse_angle = (mp_s16)mp_read_u16(r);
+}
+
 /* ActorPlayerSync::write; events may be null (all eight lists empty). */
 static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l, const mp_anim_events* e) {
     mp_write_u16(w, l->item);
@@ -1128,6 +1172,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
         mp_write_strikes(w, 0);
         mp_write_particles(w, 0);
         mp_write_string(w, l->skin);
+        mp_write_death(w, l);
         return;
     }
     mp_write_vlq(w, e->move_count);
@@ -1167,6 +1212,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     mp_write_strikes(w, e);
     mp_write_particles(w, e);
     mp_write_string(w, l->skin);
+    mp_write_death(w, l);
 }
 
 static inline void mp_write_player(mp_writer* w, const mp_player_look* l) {
@@ -1243,6 +1289,7 @@ static inline void mp_read_player_events(mp_reader* r, mp_player_look* l, mp_ani
     mp_u32 skin_length = 0;
     const char* skin = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? mp_read_string(r, &skin_length) : "";
     mp_set_skin(l, skin, skin_length);
+    mp_read_death(r, l); /* then the death, the same way */
     if (!r->ok) mp_anim_events_clear(e);
 }
 
@@ -1813,6 +1860,26 @@ static inline int mp_read_summon(const mp_u8* payload, mp_u32 size, mp_u8* creat
     return 1;
 }
 
+/* ------------------------------------------------------------------ revive */
+
+/* WWHD extension: a player who held A by a dead player's body for its time (death.h) revives it.
+ * CLIENT_PLAYER_REVIVE: VLQ the dead player's directory id (its death block), string the reviver's
+ * name. SERVER_PLAYER_REVIVE (WWClient.java, to that player only): string the reviver's name. */
+static inline void mp_write_revive_request(mp_writer* w, mp_u32 target, const char* reviver) {
+    mp_write_vlq(w, target);
+    mp_write_string(w, reviver);
+}
+
+/* SERVER_PLAYER_REVIVE; 0 when malformed (reviver: MP_NAME_MAX + 1 bytes, printable). */
+static inline int mp_read_revive(const mp_u8* payload, mp_u32 size, char* reviver) {
+    mp_reader r = mp_reader_make(payload, size);
+    mp_u32 n;
+    const char* text = mp_read_string(&r, &n);
+    if (!r.ok || r.pos != r.size) return 0;
+    mp_copy_text(reviver, MP_NAME_MAX + 1, text, n);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ save sync */
 
 /* The SaveServer (save/SaveServer.java, the GameCube client's SaveServer.cpp): the shared save is
@@ -1934,5 +2001,15 @@ static inline int mp_read_world(const mp_u8* payload, mp_u32 size, mp_world* w) 
     if (!r.ok || r.pos != r.size || (w->flags & ~MP_WORLD_FLAGS) || w->weather > MP_WEATHER_MAX) return 0;
     if (!(w->time >= 0.0f && w->time < 360.0f)) return 0;
     return 1;
+}
+
+/* CLIENT_WORLD (WWHD, ActorFilter.java): the same body, from a player sailing where time passes
+ * (world_sync.h): flags MP_WORLD_TIME, and MP_WORLD_WEATHER with the weather its dice made. The
+ * server follows one such player at a time and sends the world to the others. */
+static inline void mp_write_world(mp_writer* w, const mp_world* world) {
+    mp_write_u8(w, world->flags);
+    mp_write_f32(w, world->time);
+    mp_write_u16(w, world->day);
+    mp_write_u8(w, world->weather);
 }
 

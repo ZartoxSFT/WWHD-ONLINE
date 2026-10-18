@@ -38,14 +38,17 @@ static f32 sense_distance2(const fopAc_ac_c* a, const fopAc_ac_c* b) {
     return dx * dx + dy * dy + dz * dz;
 }
 
-/* The puppet nearer to the actor than the local Link, 0 when the local Link is the nearest. */
+/* The puppet nearer to the actor than the local Link, 0 when the local Link is the nearest. The
+ * dead are nobody's prey (death.h): bodies and ghosts are left out, and a local ghost is as far as
+ * can be, so the actors go for a living player when there is one. */
 static u32 sense_nearest_puppet(const fopAc_ac_c* actor, u32 local) {
     if (!puppet_enabled || puppet_disabled_by_error) return 0;
-    f32 best = sense_distance2(actor, (const fopAc_ac_c*)local);
+    f32 best = puppet_local_ghost ? 3.0e38f : sense_distance2(actor, (const fopAc_ac_c*)local);
     u32 found = 0;
     for (int i = 0; i != PUPPET_MAX; ++i) {
         u32 p = puppet_slots[i].used ? puppet_slots[i].actor : 0;
         if (!p || !puppet_is((const void*)p)) continue;
+        if (puppet_slots[i].ghost || (puppet_slots[i].uid & PUPPET_BODY_UID)) continue;
         const daPy_lk_c* l = (const daPy_lk_c*)p;
         if (!l->mpCLModel) continue; /* not built yet */
         f32 d = sense_distance2(actor, (const fopAc_ac_c*)p);

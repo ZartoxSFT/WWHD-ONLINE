@@ -31,7 +31,7 @@
 #include "mp_protocol.h"
 
 #define WD_SAVE_TIME (0x20 + 0x24)
-#define WD_SAVE_DATE (0x20 + 0x28) /* not written: see wd_step */
+#define WD_SAVE_DATE (0x20 + 0x28) /* read for CLIENT_WORLD, not written: see wd_step */
 #define WD_TIME_PASS 0x101EBFD8
 #define WD_ENV 0x10475A68
 #define WD_DICE_TIME 0xFC4
@@ -82,10 +82,45 @@ WWHD_REPLACE(0x0255D128, s32, wd_ky_execute, (void)) {
     return result;
 }
 
+/* A player sailing where time passes sends its clock, and its dice's weather when it is its own (not
+ * a weather the server forces), every WD_REPORT_STEPS (CLIENT_WORLD): the server follows one sailor
+ * and sends that world to the other players (ActorFilter.java). */
+#define WD_REPORT_STEPS 60 /* 2 s */
+static int wd_send_world(const mp_world* w); /* mod.c */
+static u32 wd_report_counter;
+
+static void wd_report(const u8* play, u32 save, const u8* env, int sea) {
+    if (!sea || !WWHD_GAME_DATA(WD_TIME_PASS, u8) || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) {
+        wd_report_counter = 0;
+        return;
+    }
+    if (++wd_report_counter < WD_REPORT_STEPS) return;
+    wd_report_counter = 0;
+    static const u8 weathers[6] = {1, 2, 3, 4, 5, 5}; /* DICE_MODE (d_kankyo_4.h) -> MP weather */
+    mp_world w;
+    w.flags = MP_WORLD_TIME;
+    w.time = *(const volatile f32*)(save + WD_SAVE_TIME);
+    w.day = *(const volatile u16*)(save + WD_SAVE_DATE);
+    w.weather = 0;
+    u8 mode = env[WD_DICE_MODE];
+    if (!wd_weather_forced && mode < 6) {
+        w.flags |= MP_WORLD_WEATHER;
+        w.weather = weathers[mode];
+    }
+    if (!(w.time >= 0.0f && w.time < 360.0f)) return;
+    wd_send_world(&w);
+}
+
 /* Every step of the local Link. */
 static void wd_step(const u8* play) {
     u32 save = WWHD_GAME_DATA(0x101F84DC, u32);
-    if (!wd_have || !save || !play) return;
+    if (!save || !play) return;
+    {
+        const u8* stage = play + WWHD_PLAY_START_STAGE_NAME_OFFSET;
+        int at_sea = stage[0] == 's' && stage[1] == 'e' && stage[2] == 'a' && stage[3] == 0;
+        wd_report(play, save, (const u8*)&WWHD_GAME_DATA(WD_ENV, u8), at_sea);
+    }
+    if (!wd_have) return;
     volatile f32* time = (volatile f32*)(save + WD_SAVE_TIME);
     if (wd_apply_time && !play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) {
         f32 now = *time, want = wd_world.time;
