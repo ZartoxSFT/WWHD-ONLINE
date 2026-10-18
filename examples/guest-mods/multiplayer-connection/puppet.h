@@ -425,10 +425,15 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
         draw_link = outer_link;
         return 1;
     }
-    /* a dead player's ghost (death.h): nearly invisible, a flicker of one logic step in two */
-    if (puppet_slots[slot].ghost && (wwhd_logic_step() & 1)) {
-        draw_link = outer_link;
-        return 1;
+    /* a dead player's ghost (death.h): semi-transparent by very fast flicker creating the optical
+     * illusion of ~40% opacity. SDK J3DModel does not expose alpha modification, so this approximates
+     * the transparency effect by skipping render on a pattern. */
+    if (puppet_slots[slot].ghost) {
+        /* visible 40% of the time with a rapid flicker (every 5 steps): visible 2 / 5 */
+        if (((u32)wwhd_logic_step() % 5) > 1) {
+            draw_link = outer_link;
+            return 1;
+        }
     }
     volatile u32* list_p0 = (volatile u32*)(play + PLAY_OPA_LIST_P0);
     volatile u32* list_p1 = (volatile u32*)(play + PLAY_XLU_LIST_P1);
