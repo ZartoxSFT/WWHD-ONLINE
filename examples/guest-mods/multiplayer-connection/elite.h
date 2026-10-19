@@ -1123,10 +1123,25 @@ WWHD_HOOK_RETURN(0x025E2BF4, el_draw_model_end, (u32 model, u32 supplied)) {
     el_swap_count = 0;
 }
 
+static int bonus_yellow_item(const void* actor); /* bonus.h: a yellow heart or magic on the ground */
+static u32 bonus_elemental_of(const void* actor); /* bonus.h: an elemental arrow pack, its type */
+static void bonus_elemental_fx(const void* actor); /* bonus.h: its element's particles */
+#define EL_YELLOW_SEED 2 /* ec_palette's gold */
+static const u8 el_elemental_seeds[4] = {0, 0 /* fire: crimson */, 7 /* ice: azure */, 16 /* light: white */};
+static el_actor el_yellow_paint; /* the colours of the elites' recolouring, nothing else of an elite */
+
 static el_actor* el_draw_begin(void* actor) {
     el_actor* e = el_find(actor);
     el_drawing = e && e->elite ? e : 0;
     el_growing = el_drawing != 0;
+    u32 elemental = el_drawing ? 0 : bonus_elemental_of(actor);
+    if (elemental) bonus_elemental_fx(actor);
+    if (!el_drawing && (elemental || bonus_yellow_item(actor))) {
+        el_yellow_paint.elite = 1;
+        el_yellow_paint.seed = elemental ? el_elemental_seeds[elemental & 3] : EL_YELLOW_SEED;
+        el_drawing = &el_yellow_paint; /* recoloured in gold (el_draw_model_begin), not bigger */
+        el_growing = 0;
+    }
     return el_drawing;
 }
 

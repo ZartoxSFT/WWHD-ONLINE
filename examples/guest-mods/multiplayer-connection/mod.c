@@ -364,6 +364,8 @@ static mp_player_look current_look(const daPy_lk_c* link) {
     look.ship = ship_local_state();
     look.extras = (*(const volatile u32*)((const u8*)link + PUPPET_NO_RESET_FLG0) & PUPPET_HEAVY_BOOTS) ? MP_EXTRA_HEAVY_BOOTS : 0;
     if (outfit_is_casual((u32)link)) look.extras |= MP_EXTRA_CASUAL;
+    /* the Mirror Shield sends light back (daPyRFlg0_LIGHT_REFLECT, puppet.h puppet_light) */
+    if (*(const volatile u32*)((const u8*)link + PUPPET_RESET_FLG0) & PUPPET_LIGHT_REFLECT) look.extras |= MP_EXTRA_LIGHT;
     /* the skin the local Link wears (bound at its creation, skin.h): a new choice shows at the
      * next area, for everybody at once */
     int skin = skin_of((u32)link);
@@ -1478,7 +1480,19 @@ static void teleport_stage_step(const u8* play) {
  * read): yellow heart and yellow magic (bonus.h), 75 rupees each; the long hookshot (5 Blue Chu
  * Jelly, 5 Knight's Crests, 1000 rupees) and the golden pig (5 Golden Feathers, 100 rupees) are
  * shown by the launcher but not made yet ("soon", nothing paid). players.txt "bonus=" gives the
- * yellow quarter hearts, the yellow magic, and 1 when each is at its maximum. */
+ * yellow quarter hearts, the yellow magic, and 1 when each is at its maximum.
+ * Utilities made in front of Link, staying there (summoned actors, synchronised like the creatures):
+ *  - a bomb flower, 5 bombs and 20 rupees: "BFlower" (process 0x128, the game's name table read in
+ *    the EU binary), parameters 0xFF0F, the most common in the game's stages (ACTR, local
+ *    analysis): daBFlower_c::CreateHeap (d_a_bflower.cpp) reads its state in bits 4-7 (0: grown)
+ *    and its switch in bits 8-15 (0xFF: none). The bombs are paid as the game takes them, through
+ *    dComIfG_play_c::mItemBombNumCount (play + 0x12A0 + 0x48CC, s16) next to the save's
+ *    mItemRecord2.mBombNum (save + 0x20 + 0x6A, u8, d_save.h); players.txt "bombs=" gives them;
+ *  - a beam, 30 rupees: the light falling from above that the Mirror Shield sends back
+ *    (daTagLight, d_a_tag_light.cpp, process 0x1D5, name "LTag1"), parameters 0x00FF03FD as in the
+ *    game's stages: type 1 the visible cone (PRM_TYPE bits 0-1), no switch (bits 2-9 and 16-23
+ *    0xFF), any time (bits 24-31 0); its size is the block's scale (tenths, the stages use
+ *    20 x 100 x 20): 20 x 255 x 20 here, the tallest, upright on the ground in front of Link. */
 #define SHOP_SPOILS 8
 #define PLAY_ITEM_BEAST_COUNTS 0x5B70
 #define SAVE_BEAST_NUM (0x20 + 0x9C)
@@ -1508,7 +1522,15 @@ static const shop_creature shop_creatures[] = {
 };
 #define SHOP_CREATURES (sizeof(shop_creatures) / sizeof(shop_creatures[0]))
 #define SHOP_UPGRADES 8u
-enum { SHOP_YELLOW_HEART = SHOP_UPGRADES, SHOP_YELLOW_MAGIC, SHOP_LONG_HOOKSHOT, SHOP_GOLDEN_PIG, SHOP_ITEMS_END };
+enum { SHOP_YELLOW_HEART = SHOP_UPGRADES, SHOP_YELLOW_MAGIC, SHOP_LONG_HOOKSHOT, SHOP_GOLDEN_PIG, SHOP_BOMB_FLOWER,
+       SHOP_BEAM, SHOP_ITEMS_END };
+
+#define SHOP_BOMB_FLOWER_RUPEES 20
+#define SHOP_BOMB_FLOWER_BOMBS 5
+#define SHOP_BEAM_RUPEES 30
+#define SAVE_BOMBS (0x20 + 0x6A)
+#define PLAY_ITEM_BOMB_COUNT (0x12A0 + 0x48CC)
+static const u8 shop_beam_scale[3] = {20, 255, 20};
 #define SHOP_UPGRADE_RUPEES 75
 
 static char shop_text[256];
@@ -1552,9 +1574,38 @@ static int shop_summon_here(const fopAc_ac_c* link, u32 item) {
                      (s8)link->current.roomNo, c->randomized);
 }
 
+/* Bombs one has, with what the HUD has not taken yet. */
+static s32 shop_bombs(const u8* play) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    if (!save) return 0;
+    return (s32)*(const volatile u8*)(save + SAVE_BOMBS) + *(const volatile s16*)(play + PLAY_ITEM_BOMB_COUNT);
+}
+
+/* A utility made in front of the local Link, facing him; paid once made. */
+static const char* shop_try_utility(const fopAc_ac_c* link, u8* play, u32 item) {
+    s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    s32 cost = item == SHOP_BEAM ? SHOP_BEAM_RUPEES : SHOP_BOMB_FLOWER_RUPEES;
+    s32 bombs = item == SHOP_BOMB_FLOWER ? SHOP_BOMB_FLOWER_BOMBS : 0;
+    if (rupees < cost || shop_bombs(play) < bombs) return "price";
+    f32 sn, cs;
+    dmap_sincos((f32)link->shape_angle.y * (360.0f / 65536.0f), &sn, &cs);
+    f32 pos[3] = {link->current.pos.x + sn * SHOP_DISTANCE, link->current.pos.y, link->current.pos.z + cs * SHOP_DISTANCE};
+    s16 yaw = (s16)(link->shape_angle.y + 0x8000);
+    int made = item == SHOP_BEAM
+                   ? as_summon_scaled("LTag1", 0x00FF03FDu, 0, 0, pos, 0, (s8)link->current.roomNo, 0, shop_beam_scale)
+                   : as_summon("BFlower", 0x0000FF0Fu, 0, 0, pos, yaw, (s8)link->current.roomNo, 0);
+    if (!made) return "failed";
+    volatile s32* pay = (volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    *pay = *pay - cost;
+    volatile s16* pay_bombs = (volatile s16*)(play + PLAY_ITEM_BOMB_COUNT);
+    *pay_bombs = (s16)(*pay_bombs - bombs);
+    return "ok";
+}
+
 /* An upgrade for oneself: checked, then paid once given. */
-static const char* shop_try_upgrade(u8* play, u32 item) {
+static const char* shop_try_upgrade(const fopAc_ac_c* link, u8* play, u32 item) {
     if (item == SHOP_LONG_HOOKSHOT || item == SHOP_GOLDEN_PIG) return "soon";
+    if (item == SHOP_BOMB_FLOWER || item == SHOP_BEAM) return shop_try_utility(link, play, item);
     if (item != SHOP_YELLOW_HEART && item != SHOP_YELLOW_MAGIC) return "unknown";
     s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
     if (rupees < SHOP_UPGRADE_RUPEES) return "price";
@@ -1567,7 +1618,7 @@ static const char* shop_try_upgrade(u8* play, u32 item) {
 
 static const char* shop_try(const fopAc_ac_c* link, u8* play, u32 item, u32 target) {
     if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return "busy";
-    if (item >= SHOP_UPGRADES) return shop_try_upgrade(play, item);
+    if (item >= SHOP_UPGRADES) return shop_try_upgrade(link, play, item);
     if (item >= SHOP_CREATURES) return "unknown";
     const shop_creature* c = &shop_creatures[item];
     if (!shop_affordable(play, c)) return "price";
@@ -1820,6 +1871,8 @@ static void map_step(void* link_actor, double dt) {
     map_put_name(&o, me.stage, STAGE_NAME_BYTES);
     map_put(&o, "\nrupees=");
     map_put_uint(&o, map_rupees());
+    map_put(&o, "\nbombs=");
+    map_put_uint(&o, (u32)(shop_bombs(play) > 0 ? shop_bombs(play) : 0));
     map_put(&o, "\nlife=");
     map_put_uint(&o, dComIfGs_player_status_a.life);
     map_put(&o, "\nmax_life=");

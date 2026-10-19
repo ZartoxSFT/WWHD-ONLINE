@@ -33,6 +33,7 @@
 
 static int bonus_loaded;
 static u32 bonus_hearts, bonus_magic;
+static u32 bonus_arrows[4];       /* elemental arrows kept: [1] fire, [2] ice, [3] light ([0] unused) */
 /* The local Link, noted by its execute (mod.c multiplayer_daPy_Execute, not a puppet): actor_sync.h
  * as_link is only set while connected with the actors synchronised (0.2.55 drew nothing without). */
 static u32 bonus_link;
@@ -46,7 +47,7 @@ static void bonus_note_link(void* link) {
 static int bonus_link_alive(void) { return bonus_link && wwhd_logic_step() - bonus_link_step < 4; }
 static int bonus_dirty;
 static unsigned long long bonus_written_step;
-static char bonus_text[64];
+static char bonus_text[128];
 
 static u32 bonus_number(const char* text, u32 size, const char* key) {
     u32 klen = 0;
@@ -73,6 +74,11 @@ static void bonus_load(void) {
     bonus_magic = bonus_number(bonus_text, (u32)got, "magic");
     if (bonus_hearts > BONUS_HEARTS_MAX) bonus_hearts = BONUS_HEARTS_MAX;
     if (bonus_magic > BONUS_MAGIC_MAX) bonus_magic = BONUS_MAGIC_MAX;
+    bonus_arrows[1] = bonus_number(bonus_text, (u32)got, "fire");
+    bonus_arrows[2] = bonus_number(bonus_text, (u32)got, "ice");
+    bonus_arrows[3] = bonus_number(bonus_text, (u32)got, "light");
+    for (int t = 1; t != 4; ++t)
+        if (bonus_arrows[t] > 99) bonus_arrows[t] = 99;
 }
 
 static void bonus_put(char* out, u32* n, const char* key, u32 v) {
@@ -88,14 +94,78 @@ static void bonus_write(void) {
     u32 n = 0;
     bonus_put(bonus_text, &n, "hearts=", bonus_hearts);
     bonus_put(bonus_text, &n, "magic=", bonus_magic);
+    bonus_put(bonus_text, &n, "fire=", bonus_arrows[1]);
+    bonus_put(bonus_text, &n, "ice=", bonus_arrows[2]);
+    bonus_put(bonus_text, &n, "light=", bonus_arrows[3]);
     wwhd_file_write("bonus.cfg", bonus_text, n);
     bonus_dirty = 0;
     bonus_written_step = wwhd_logic_step();
 }
 
+/* ------------------------------------------------------------------ elemental arrows
+ *
+ * The bow's arrow type is l_keepType (101D5F43, u8: 0 normal, 1 fire, 2 ice, 3 light; d_a_arrow.cpp,
+ * daArrow_c::changeArrowType 0205584C, which also checks the magic and the arrows the player owns:
+ * mItems[12] 0x35 fire and ice, 0x36 light). A shot takes one arrow from the save
+ * (mItemRecord2.mArrowNum, save + 0x20 + 0x69, through mItemArrowNumCount play + 0x5B68) and the
+ * arrow's magic (arrowUseMp). Elemental arrows are kept apart (bonus.cfg fire=, ice=, light=, at most
+ * the quiver's size, save + 0x20 + 0x6F): while Link aims the bow (BOW_SUBJECT 0x94, BOW_MOVE 0x95)
+ * with an elemental type chosen, the save's arrow count holds that type's stock, so the HUD shows it
+ * and the game takes the shots from it (and the magic, as before); the normal arrows come back as
+ * soon as he stops aiming or picks the normal type, so a save never keeps elemental arrows as
+ * normal ones. A normal arrow pack picked up meanwhile goes to the normal arrows. */
+#define BONUS_KEEP_TYPE 0x101D5F43
+#define BONUS_SAVE_ARROWS (0x20 + 0x69)
+#define BONUS_SAVE_QUIVER (0x20 + 0x6F)
+#define BONUS_SAVE_BOW_SLOT (0x20 + 0x3C + 12) /* dSv_player_item_c::mItems[12] */
+#define BONUS_PLAY_ARROWS 0x5B68
+#define BONUS_PROC_BOW_SUBJECT 0x94
+#define BONUS_PROC_BOW_MOVE 0x95
+#define BONUS_BOW_FIRE_ICE 0x35
+#define BONUS_BOW_LIGHT 0x36
+static u32 bonus_arrow_shown;     /* the type whose count the save holds now (0: the normal arrows) */
+static u32 bonus_arrow_normal;    /* the normal arrows while an elemental type is shown */
+
+static u32 bonus_save_addr(void) { return WWHD_GAME_DATA(WWHD_ADDR_save_info_pointer, u32); }
+
+static int bonus_arrow_owned(u32 type) {
+    u32 save = bonus_save_addr();
+    if (!save) return 0;
+    u8 bow = *(const volatile u8*)(save + BONUS_SAVE_BOW_SLOT);
+    return type == 3 ? bow == BONUS_BOW_LIGHT : (bow == BONUS_BOW_FIRE_ICE || bow == BONUS_BOW_LIGHT);
+}
+
+static u32 bonus_quiver(void) {
+    u32 save = bonus_save_addr();
+    return save ? *(const volatile u8*)(save + BONUS_SAVE_QUIVER) : 0;
+}
+
+static void bonus_arrows_step(void) {
+    u32 save = bonus_save_addr();
+    u8* play = wwhd_play_get();
+    if (!save || !play) return;
+    u32 want = 0;
+    if (bonus_link_alive()) {
+        const daPy_lk_c* link = (const daPy_lk_c*)bonus_link;
+        u8 type = WWHD_GAME_DATA(BONUS_KEEP_TYPE, u8);
+        if ((link->mCurProc == BONUS_PROC_BOW_SUBJECT || link->mCurProc == BONUS_PROC_BOW_MOVE) && type >= 1 && type <= 3)
+            want = type;
+    }
+    if (want == bonus_arrow_shown || *(const volatile s16*)(play + BONUS_PLAY_ARROWS) != 0) return;
+    volatile u8* count = (volatile u8*)(save + BONUS_SAVE_ARROWS);
+    if (bonus_arrow_shown) bonus_arrows[bonus_arrow_shown] = *count; /* what the shots left */
+    else bonus_arrow_normal = *count;
+    *count = (u8)(want ? bonus_arrows[want] : bonus_arrow_normal);
+    bonus_arrow_shown = want;
+    bonus_dirty = 1;
+}
+
 /* The local Link's step (mod.c map_step): what was spent, written now and then. */
+static void bonus_fx_step(void);
 static void bonus_tick(void) {
     bonus_load();
+    bonus_arrows_step();
+    bonus_fx_step();
     if (bonus_dirty && wwhd_logic_step() - bonus_written_step >= BONUS_WRITE_STEPS) bonus_write();
 }
 
@@ -130,6 +200,359 @@ static const char* bonus_buy_magic(void) {
 
 static int bonus_heart_full(void) { bonus_load(); return bonus_hearts + BONUS_HEART_STEP > BONUS_HEARTS_MAX; }
 static int bonus_magic_full(void) { bonus_load(); return bonus_magic + BONUS_MAGIC_STEP > BONUS_MAGIC_MAX; }
+
+/* ------------------------------------------------------------------ yellow loot
+ *
+ * A loot (decomp, verified: fopAcM_createItemFromTable 025D8120 for pots, grass, stones and flowers,
+ * d_a_tsubo_dmg.cpp, d_grass.cpp, d_a_stone.cpp, d_flower.cpp; fopAcM_createIball 025D9154 for a
+ * dying enemy's item ball, d_a_disappear.cpp, f_op_actor_mng_4.cpp) that made an item comes, very
+ * rarely, with a yellow heart (BONUS_DROP_HEART per thousand) or a yellow magic jar
+ * (BONUS_DROP_MAGIC per thousand), whatever the life: a heart
+ * (dItemNo_HEART_e 0x00) or small magic (0x09) item made at the same place with
+ * fopAcM_createItem (025D8870, as d_a_disappear makes its heart: bit -1, action 4). The game leaves
+ * hearts out of its tables at full life (getItemNoByLife): the yellow one comes whatever the life,
+ * the yellow magic whatever the magic (only with the magic meter); neither when that bonus is at
+ * its maximum. Made outside any synchronisation context (as_context NONE): each game rolls its own
+ * and keeps them (another player's game neither gets nor removes them).
+ * The game picks an item up in daItem_c::itemGetExecute (0217DE18, d_a_item.cpp: its sound, then
+ * execItemGet(m_itemNo), 0254DA38): for a yellow one, execItemGet gives the yellow heart or magic
+ * (bonus_buy_*) instead of the red heart or the magic. Drawn recoloured in gold like an elite
+ * (elite.h el_draw_begin: the heart's red, the jar's main colour). */
+#define BONUS_DROP_HEART 4          /* per thousand loots that dropped something (0.2.83: 3 % of
+                                     * every call: cutting grass gave many) */
+#define BONUS_DROP_MAGIC 4
+#define BONUS_ITEM_HEART 0x00
+#define BONUS_ITEM_MAGIC 0x09
+#define BONUS_YELLOW_ITEMS 16
+#define BONUS_ITEM_ARROW_10 0x10   /* dItemNo_ARROW_10/20/30_e: 0x10..0x12 */
+#define BONUS_ITEM_ARROW_30 0x12
+#define BONUS_ELEMENTAL_PERCENT 40  /* of the arrow packs a loot drops (0.2.86-0.2.88: 15) */
+#define BONUS_PROC_ITEM 0xFF        /* fpcNm_ITEM_e */
+#define BONUS_PROC_NAME 0x08
+static u32 bonus_elemental_ids[BONUS_YELLOW_ITEMS];
+static u8 bonus_elemental_types[BONUS_YELLOW_ITEMS];
+static u32 bonus_elemental_next;
+static u32 bonus_picking_type;      /* an elemental pack is being picked up: its type */
+#define BONUS_PROCESS_ID 0x04       /* base_process_class id (wwhd/objects.h WWHD_OFFSET_actor_process_id) */
+#define BONUS_ITEM_NO 0x74E         /* daItemBase_c::m_itemNo (d_a_itembase.h) */
+WWHD_GAME_ORIGINAL(0x025D9154, u32, bonus_iball_original, (u32 pos, u32 table, u32 room, u32 angle, u32 bit));
+WWHD_GAME_ORIGINAL(0x0217DE18, void, bonus_item_get_original, (void* self));
+WWHD_GAME_ORIGINAL(0x0254DA38, void, bonus_exec_item_get_original, (u32 item));
+
+static u32 bonus_yellow_ids[BONUS_YELLOW_ITEMS];
+static u32 bonus_yellow_next;
+static int bonus_drop_depth;
+static int bonus_picking;           /* a yellow item is being picked up */
+static u32 bonus_rng = 0x6D2B79F5u;
+
+static u32 bonus_random(void) { /* xorshift32, stirred by the step */
+    bonus_rng ^= (u32)wwhd_logic_step() * 2654435761u;
+    bonus_rng ^= bonus_rng << 13;
+    bonus_rng ^= bonus_rng >> 17;
+    bonus_rng ^= bonus_rng << 5;
+    return bonus_rng;
+}
+
+static int bonus_yellow_item(const void* actor) {
+    if (!actor) return 0;
+    u32 id = *(const volatile u32*)((const u8*)actor + BONUS_PROCESS_ID);
+    if (id == 0 || id == 0xFFFFFFFFu) return 0;
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS; ++i)
+        if (bonus_yellow_ids[i] == id) return 1;
+    return 0;
+}
+
+/* Loots (0.2.87). Every item a loot makes goes through one of the game's item makers, which take its
+ * number: fopAcM_fastCreateItem2 (025D7F20: the item tables of pots, grass, stones, flowers) and
+ * fopAcM_fastCreateItem (025D8AB0: an enemy's table, the crystal ball's items when it breaks,
+ * daIball_c::createItem 0217BF6C, d_a_ib.cpp) return the actor; fopAcM_createItem (025D8870: a
+ * dying enemy's puff, d_a_disappear.cpp, action 4) returns its process id. A loot window is open
+ * while fopAcM_createItemFromTable (025D8120, actor_sync.h), fopAcM_createIball (025D9154) or
+ * daIball_c::createItem runs, and a puff's item is a loot of its own: each arrow pack made there may
+ * turn elemental (BONUS_ELEMENTAL_PERCENT, a type the player owns), and each loot that made at least
+ * one item may bring a yellow heart or magic (per thousand). 0.2.83-0.2.86 rolled only after the
+ * table and ball calls, on what they returned: the crystal ball returns the ball, its items come
+ * when it breaks: Darknuts and the like never gave elemental arrows. */
+WWHD_GAME_ORIGINAL(0x025D7F20, u32, bonus_fast_item2_original,
+                   (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale));
+WWHD_GAME_ORIGINAL(0x025D8AB0, u32, bonus_fast_item_original,
+                   (u32 pos, u32 item, u32 room, u32 angle, u32 scale, f32 speed_f, f32 speed_y, f32 gravity, u32 bit,
+                    u32 create_func));
+WWHD_GAME_ORIGINAL(0x025D8870, u32, bonus_create_item_original,
+                   (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale));
+WWHD_GAME_ORIGINAL(0x0217BF6C, s32, bonus_ball_items_original, (void* self));
+static u32 bonus_window_items;    /* items the open loot made */
+static int bonus_making;          /* this mod makes a yellow item: not a loot */
+#define BONUS_PUFF_ACTION 4       /* fopAcM_createItem's action from a dying enemy's puff */
+
+static void bonus_drop_begin(void) {
+    if (bonus_drop_depth++ == 0) bonus_window_items = 0;
+}
+
+/* The elemental type of an arrow pack on the ground, 0 for none. */
+static u32 bonus_elemental_of(const void* actor) {
+    if (!actor) return 0;
+    u32 id = *(const volatile u32*)((const u8*)actor + BONUS_PROCESS_ID);
+    if (id == 0 || id == 0xFFFFFFFFu) return 0;
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS; ++i)
+        if (bonus_elemental_ids[i] == id) return bonus_elemental_types[i];
+    return 0;
+}
+
+/* An item a loot made (its process id and number): an arrow pack sometimes turns elemental. */
+static void bonus_loot_item(u32 id, u32 item) {
+    if (id == 0 || id == 0xFFFFFFFFu) return;
+    ++bonus_window_items;
+    if (item < BONUS_ITEM_ARROW_10 || item > BONUS_ITEM_ARROW_30 || !bonus_arrow_owned(1)) return;
+    if (bonus_random() % 100u >= BONUS_ELEMENTAL_PERCENT) return;
+    u32 types = bonus_arrow_owned(3) ? 3u : 2u;
+    u32 type = 1u + bonus_random() % types;
+    bonus_elemental_ids[bonus_elemental_next] = id;
+    bonus_elemental_types[bonus_elemental_next] = (u8)type;
+    bonus_elemental_next = (bonus_elemental_next + 1) % BONUS_YELLOW_ITEMS;
+    wwhd_log_int("multiplayer: elemental arrows dropped, type", (int)type);
+}
+
+/* Its element on an elemental pack (0.2.90): the glow of a nocked elemental arrow, the actor
+ * daArrow_Lighteff (process 0x1DA, d_a_arrow_lighteff.cpp, parameter = the arrow type): the burning
+ * tip, its model from the "Link" archive (GARWFI00 fire, GARWFI01 ice, GARWG00 light) with its btk
+ * and brk, its particles (fire ID_IT_JN_ARWF_HINOKO00 0x299; ice ARWI_KIRAKIRA00 0x29C and REIKI00
+ * 0x29D; light ARWG_TSUBU00 0x29F and FLASH00 0x2A0, following its tip) and its point light. One is
+ * made per elemental pack at its first draw (fopAcM_create, no synchronisation context). Its own
+ * execute (02057930) follows a parent arrow and deletes itself without one: for these, it is replaced
+ * by this mod's (bonus_glow_execute): the btk played (mDoExt_baseAnm::play 025E742C on +0x448), the
+ * brk frame raised to its end (+0x4BC, brk at +0x3D0: frame +4, end +0xA), the actor upright under
+ * the pack (angle x -0x4000: set_mtx 02056EB8 without a parent moves the model 62 units along its
+ * facing), the tip (+0x3B8, where the particles and the light are) at the pack, setPointLight
+ * (0205777C) and set_mtx; when the pack is no longer drawn (picked up, gone) it deletes itself, ending
+ * its particles the game's way. 0.2.89 made only the particles, 0.2.88 the hit particles. */
+#define BONUS_PROC_LIGHTEFF 0x1DA
+#define BONUS_GLOW_GONE_STEPS 3
+#define BONUS_GLOW_TOP 0x3B8
+#define BONUS_GLOW_BRK 0x3D0
+#define BONUS_GLOW_BTK 0x448
+#define BONUS_GLOW_BRK_FRAME 0x4BC
+#define BONUS_GLOW_LIFT 62.0f
+WWHD_GAME_ORIGINAL(0x02057930, s32, bonus_glow_execute_original, (void* self));
+WWHD_GAME_FUNC(0x025E742C, s32, bonus_anm_play, (u32 anm));
+WWHD_GAME_FUNC(0x0205777C, void, bonus_glow_point_light, (void* self));
+WWHD_GAME_FUNC(0x02056EB8, void, bonus_glow_set_mtx, (void* self));
+typedef struct bonus_glow {
+    u32 item, effect;             /* the pack's and the glow's process ids */
+    cXyz pos;                     /* the pack, at its last draw */
+    unsigned long long seen;
+    u8 used;
+} bonus_glow;
+static bonus_glow bonus_glows[BONUS_YELLOW_ITEMS];
+static cXyz bonus_glow_pos;
+static csXyz bonus_glow_angle;
+
+static void bonus_elemental_fx(const void* actor) {
+    u32 id = *(const volatile u32*)((const u8*)actor + BONUS_PROCESS_ID);
+    u32 type = 0;
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS; ++i)
+        if (bonus_elemental_ids[i] == id) type = bonus_elemental_types[i] & 3u;
+    if (!type) return;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
+    bonus_glow* g = 0;
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS && !g; ++i)
+        if (bonus_glows[i].used && bonus_glows[i].item == id) g = &bonus_glows[i];
+    if (!g) {
+        for (u32 i = 0; i != BONUS_YELLOW_ITEMS && !g; ++i)
+            if (!bonus_glows[i].used) g = &bonus_glows[i];
+        if (!g) return;
+        bonus_glow_pos.x = a->current.pos.x;
+        bonus_glow_pos.y = a->current.pos.y;
+        bonus_glow_pos.z = a->current.pos.z;
+        bonus_glow_angle.x = -0x4000;
+        bonus_glow_angle.y = 0;
+        bonus_glow_angle.z = 0;
+        u8 saved = as_context;
+        as_context = AS_CTX_NONE; /* this game's own */
+        u32 effect = wwhd_fopAcM_create(BONUS_PROC_LIGHTEFF, type, (u32)&bonus_glow_pos, (s32)a->current.roomNo,
+                                        (u32)&bonus_glow_angle, 0, 0xFFFFFFFFu, 0);
+        as_context = saved;
+        if (effect == 0 || effect == 0xFFFFFFFFu) return;
+        g->used = 1;
+        g->item = id;
+        g->effect = effect;
+    }
+    g->pos.x = a->current.pos.x;
+    g->pos.y = a->current.pos.y;
+    g->pos.z = a->current.pos.z;
+    g->seen = wwhd_logic_step();
+}
+
+/* daArrow_Lighteff_c::_execute: a glow of this mod follows its pack. */
+WWHD_REPLACE(0x02057930, s32, bonus_glow_execute, (void* self)) {
+    u32 id = self ? *(const volatile u32*)((const u8*)self + BONUS_PROCESS_ID) : 0;
+    bonus_glow* g = 0;
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS && !g; ++i)
+        if (bonus_glows[i].used && bonus_glows[i].effect == id) g = &bonus_glows[i];
+    if (!g) return bonus_glow_execute_original(self);
+    u8* e = (u8*)self;
+    if (wwhd_logic_step() - g->seen > BONUS_GLOW_GONE_STEPS) {
+        g->used = 0;
+        wwhd_fopAcM_delete_actor((u32)self);
+        return 1;
+    }
+    bonus_anm_play((u32)(e + BONUS_GLOW_BTK));
+    volatile f32* brk_frame = (volatile f32*)(e + BONUS_GLOW_BRK_FRAME);
+    f32 end = (f32)*(const volatile s16*)(e + BONUS_GLOW_BRK + 0xA);
+    if (*brk_frame < end) *brk_frame = *brk_frame + 1.0f > end ? end : *brk_frame + 1.0f;
+    *(volatile f32*)(e + BONUS_GLOW_BRK + 4) = *brk_frame;
+    fopAc_ac_c* a = (fopAc_ac_c*)self;
+    a->current.pos.x = g->pos.x;
+    a->current.pos.y = g->pos.y - BONUS_GLOW_LIFT + 20.0f; /* the tip 20 units above the pack */
+    a->current.pos.z = g->pos.z;
+    a->current.angle.x = -0x4000;
+    a->current.angle.y = 0;
+    volatile f32* top = (volatile f32*)(e + BONUS_GLOW_TOP);
+    top[0] = g->pos.x;
+    top[1] = g->pos.y + 20.0f;
+    top[2] = g->pos.z;
+    bonus_glow_point_light(self);
+    bonus_glow_set_mtx(self);
+    return 1;
+}
+
+/* Every step: a glow whose stage is gone (no execute any more) frees its entry. */
+static void bonus_fx_step(void) {
+    unsigned long long step = wwhd_logic_step();
+    for (u32 i = 0; i != BONUS_YELLOW_ITEMS; ++i)
+        if (bonus_glows[i].used && step - bonus_glows[i].seen > 120) bonus_glows[i].used = 0;
+}
+
+static u32 bonus_actor_id(u32 actor) { return actor ? *(const volatile u32*)(actor + BONUS_PROCESS_ID) : 0; }
+
+/* A loot that made something: sometimes a yellow heart or magic at its place. */
+static void bonus_yellow_roll(u32 pos, u32 room) {
+    if (!pos || !bonus_save_ready()) return;
+    bonus_load();
+    u32 roll = bonus_random() % 1000u, item;
+    if (roll < BONUS_DROP_HEART && !bonus_heart_full()) {
+        item = BONUS_ITEM_HEART;
+    } else if (roll >= BONUS_DROP_HEART && roll < BONUS_DROP_HEART + BONUS_DROP_MAGIC && bonus_max_magic() &&
+               !bonus_magic_full()) {
+        item = BONUS_ITEM_MAGIC;
+    } else {
+        return;
+    }
+    u8 saved = as_context;
+    as_context = AS_CTX_NONE; /* this game's own */
+    bonus_making = 1;
+    u32 id = wwhd_fopAcM_createItem(pos, item, 0xFFFFFFFFu, room, 0, 0, BONUS_PUFF_ACTION, 0);
+    bonus_making = 0;
+    as_context = saved;
+    if (id == 0 || id == 0xFFFFFFFFu) return;
+    bonus_yellow_ids[bonus_yellow_next] = id;
+    bonus_yellow_next = (bonus_yellow_next + 1) % BONUS_YELLOW_ITEMS;
+    wwhd_log(item == BONUS_ITEM_HEART ? "multiplayer: a yellow heart dropped" : "multiplayer: a yellow magic jar dropped");
+}
+
+/* The loot window closes (the outermost call). */
+static void bonus_drop_end(u32 pos, u32 room, u32 made) {
+    (void)made;
+    if (--bonus_drop_depth != 0 || !bonus_window_items) return;
+    bonus_yellow_roll(pos, room);
+}
+
+WWHD_REPLACE(0x025D7F20, u32, bonus_fast_item2,
+             (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale)) {
+    u32 actor = bonus_fast_item2_original(pos, item, bit, room, type, angle, action, scale);
+    if (bonus_drop_depth) bonus_loot_item(bonus_actor_id(actor), item);
+    return actor;
+}
+
+WWHD_REPLACE(0x025D8AB0, u32, bonus_fast_item,
+             (u32 pos, u32 item, u32 room, u32 angle, u32 scale, f32 speed_f, f32 speed_y, f32 gravity, u32 bit,
+              u32 create_func)) {
+    u32 actor = bonus_fast_item_original(pos, item, room, angle, scale, speed_f, speed_y, gravity, bit, create_func);
+    if (bonus_drop_depth) bonus_loot_item(bonus_actor_id(actor), item);
+    return actor;
+}
+
+WWHD_REPLACE(0x025D8870, u32, bonus_create_item,
+             (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale)) {
+    u32 id = bonus_create_item_original(pos, item, bit, room, type, angle, action, scale);
+    if (bonus_making) return id;
+    if (bonus_drop_depth) {
+        bonus_loot_item(id, item);
+    } else if (action == BONUS_PUFF_ACTION && id != 0 && id != 0xFFFFFFFFu) { /* a puff's own loot */
+        bonus_drop_begin();
+        bonus_loot_item(id, item);
+        bonus_drop_end(pos, room, id);
+    }
+    return id;
+}
+
+/* daIball_c::createItem: the crystal ball breaks into its items. */
+WWHD_REPLACE(0x0217BF6C, s32, bonus_ball_items, (void* self)) {
+    const fopAc_ac_c* ball = (const fopAc_ac_c*)self;
+    bonus_drop_begin();
+    s32 result = bonus_ball_items_original(self);
+    bonus_drop_end(self ? (u32)&ball->current.pos : 0, self ? (u32)(s32)ball->current.roomNo : 0, 1);
+    return result;
+}
+
+/* fopAcM_createIball: a dying enemy's loot (its table, or the ball that keeps it). */
+WWHD_REPLACE(0x025D9154, u32, bonus_iball, (u32 pos, u32 table, u32 room, u32 angle, u32 bit)) {
+    bonus_drop_begin();
+    u32 result = bonus_iball_original(pos, table, room, angle, bit);
+    bonus_drop_end(pos, room, result);
+    return result;
+}
+
+/* daItem_c::itemGetExecute: a yellow item gives its bonus. */
+WWHD_REPLACE(0x0217DE18, void, bonus_item_get, (void* self)) {
+    u32 elemental = bonus_elemental_of(self);
+    if (elemental) {
+        bonus_picking_type = elemental;
+        bonus_item_get_original(self);
+        bonus_picking_type = 0;
+        return;
+    }
+    if (!bonus_yellow_item(self)) {
+        bonus_item_get_original(self);
+        return;
+    }
+    bonus_picking = 1;
+    bonus_item_get_original(self);
+    bonus_picking = 0;
+}
+
+/* execItemGet: the yellow heart or magic instead of the red heart or the magic. */
+WWHD_REPLACE(0x0254DA38, void, bonus_exec_item_get, (u32 item)) {
+    if (item >= BONUS_ITEM_ARROW_10 && item <= BONUS_ITEM_ARROW_30 && (bonus_picking_type || bonus_arrow_shown)) {
+        u32 count = (item - BONUS_ITEM_ARROW_10 + 1u) * 10u, quiver = bonus_quiver();
+        u32 type = bonus_picking_type;
+        bonus_picking_type = 0;
+        bonus_load();
+        if (type) { /* elemental: half the pack, to that type's stock */
+            count /= 2u;
+            u8* play = wwhd_play_get();
+            if (type == bonus_arrow_shown && play) { /* shown now: the game counts it */
+                volatile s16* pending = (volatile s16*)(play + BONUS_PLAY_ARROWS);
+                *pending = (s16)(*pending + (s16)count);
+            } else {
+                bonus_arrows[type] = bonus_arrows[type] + count > quiver ? quiver : bonus_arrows[type] + count;
+            }
+            bonus_dirty = 1;
+            wwhd_log_int("multiplayer: elemental arrows picked up, type", (int)type);
+        } else { /* normal arrows while an elemental stock is shown */
+            bonus_arrow_normal = bonus_arrow_normal + count > quiver ? quiver : bonus_arrow_normal + count;
+        }
+        return;
+    }
+    if (!bonus_picking) {
+        bonus_exec_item_get_original(item);
+        return;
+    }
+    bonus_picking = 0;
+    const char* result = item == BONUS_ITEM_HEART ? bonus_buy_heart() : bonus_buy_magic();
+    wwhd_log(item == BONUS_ITEM_HEART ? "multiplayer: yellow heart picked up" : "multiplayer: yellow magic picked up");
+    if (result[0] != 'o') wwhd_log(result); /* at its maximum meanwhile: nothing more */
+}
 
 /* daPy_lk_c::setDamagePoint (023F51D0, this and f32 amount: wwhd/bindings.h, d_a_player_main_03.cpp)
  * of the local Link: what it added to the pending life (hero mode and invincibility included) is

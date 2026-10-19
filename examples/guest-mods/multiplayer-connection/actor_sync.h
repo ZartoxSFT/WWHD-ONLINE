@@ -1786,11 +1786,14 @@ static void as_summon_create(const char* name, u32 block) {
 
 /* A creature of name next to a place: 1 when requested. */
 #define AS_SUMMON_SEED 0x5E /* the "copy number" of a summoned creature's variants */
-static int as_summon(const char* name, u32 params, s16 angle_x, s16 angle_z, const f32* pos, s16 yaw, s8 room,
-                     int randomized) {
+/* As as_summon, with the block's scale (fopAcM_prm_class +0x18, three u8 in tenths) when given. */
+static int as_summon_scaled(const char* name, u32 params, s16 angle_x, s16 angle_z, const f32* pos, s16 yaw, s8 room,
+                            int randomized, const u8* scale) {
     u32 b = wwhd_fopAcM_CreateAppend();
     if (!b) return 0;
     *(volatile u32*)b = params;
+    if (scale)
+        for (u32 c = 0; c != 3; ++c) *(volatile u8*)(b + AS_PRM_SCALE + c) = scale[c];
     for (u32 c = 0; c != 3; ++c) *(volatile f32*)(b + AS_PRM_POSITION + c * 4) = pos[c];
     *(volatile s16*)(b + AS_PRM_ANGLE) = angle_x;
     *(volatile s16*)(b + AS_PRM_ANGLE + 2) = yaw;
@@ -1806,6 +1809,11 @@ static int as_summon(const char* name, u32 params, s16 angle_x, s16 angle_z, con
     wwhd_log("multiplayer: creature summoned:");
     wwhd_log(name);
     return 1;
+}
+
+static int as_summon(const char* name, u32 params, s16 angle_x, s16 angle_z, const f32* pos, s16 yaw, s8 room,
+                     int randomized) {
+    return as_summon_scaled(name, params, angle_x, angle_z, pos, yaw, room, randomized, 0);
 }
 
 /* Another player's summoned creature this game does not have: made from its block, once. */
@@ -2399,11 +2407,19 @@ WWHD_HOOK(0x024CC004, as_pot_damaged, (void* self, s32 action, void* poly, u32 e
     if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) s->broken = 1;
 }
 
-/* fopAcM_createItemFromTable: nothing while a copy breaks for another game's break. */
+/* bonus.h: a rare yellow heart or yellow magic with a loot */
+static void bonus_drop_begin(void);
+static void bonus_drop_end(u32 pos, u32 room, u32 made);
+
+/* fopAcM_createItemFromTable: nothing while a copy breaks for another game's break; a loot of a
+ * pot, grass, a stone, a flower may come with a yellow heart or magic (bonus.h). */
 WWHD_REPLACE(0x025D8120, u32, as_item_from_table,
              (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale)) {
     if (as_breaking_copy) return 0;
-    return as_item_from_table_original(pos, item, bit, room, type, angle, action, scale);
+    bonus_drop_begin();
+    u32 result = as_item_from_table_original(pos, item, bit, room, type, angle, action, scale);
+    bonus_drop_end(pos, room, result);
+    return result;
 }
 
 static void as_break_pot(as_slot* s, fopAc_ac_c* a) {

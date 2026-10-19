@@ -789,6 +789,65 @@ static void puppet_item_points(daPy_lk_c* link) {
     if (hand) puppet_point(hand, &WWHD_GAME_DATA(0x10035B24, f32), (volatile f32*)((u32)link + PUPPET_HOOKSHOT_ROOT));
 }
 
+/* Light sent back by another player's Mirror Shield (0.2.85). daPy_lk_c::checkLightHit (0240584C,
+ * d_a_player_main_04.cpp) sets daPyRFlg0_LIGHT_REFLECT (mResetFlg0 +0x3C0, 0x200000) while Link
+ * stands in a registered light (a daTagLight cone, play + 0x5A20) or while his mLightCyl takes a
+ * light attack facing the shield; setCollision (024076CC) then places mFanLightCps (+0x8128): from
+ * the shield's base matrix (mpEquippedShieldModel, +0xE80, model + 0xC8) times l_ms_light_local_start
+ * (10034FD8), along it times l_ms_light_local_vec (10034FE4), cut by the scenery, and registers it
+ * with the collision space (dCcS::Set 0200E240, play + 0x26A4) and the mass manager (02516C14, play +
+ * 0x4EF8). That light attack hits mirrors, light switches, Medli and another Link's mLightCyl, which
+ * then sends it on: the passes. A puppet runs neither: its owner's game sends MP_EXTRA_LIGHT, and its
+ * puppet's own mFanLightCps (made by the game's create like any Link's) is placed and registered the
+ * same way, so this game's Link, mirrors and switches take the other player's light; the flag also
+ * lets the puppet's draw show its shield's light. Not cut by the scenery here (the owner's game is). */
+#define PUPPET_RESET_FLG0 0x3C0
+#define PUPPET_LIGHT_REFLECT 0x200000u
+#define PUPPET_SHIELD_MODEL 0xE80
+#define PUPPET_MODEL_BASE_MTX 0xC8
+#define PUPPET_FAN_LIGHT_CPS 0x8128
+#define PUPPET_CPS_SHAPE 0x118     /* dCcD_Cps::mCps (cM3dGCps) */
+#define PUPPET_CPS_AT_VEC 0x7C     /* mGObjAt (0x50) + mVec (0x2C) */
+#define PUPPET_PLAY_CCS 0x26A4
+#define PUPPET_PLAY_MASS 0x4EF8
+WWHD_GAME_FUNC(0x02018808, void, puppet_cps_start_end, (u32 shape, const f32* start, const f32* end));
+WWHD_GAME_FUNC(0x0200E240, void, puppet_ccs_set, (u32 ccs, u32 obj));
+WWHD_GAME_FUNC(0x02516138, void, puppet_reset_at_hit, (u32 obj));
+
+static void puppet_light(void* link, u8 extras) {
+    u32 l = (u32)link;
+    volatile u32* reset = (volatile u32*)(l + PUPPET_RESET_FLG0);
+    u32 cps = l + PUPPET_FAN_LIGHT_CPS;
+    u32 shield = *(const volatile u32*)(l + PUPPET_SHIELD_MODEL);
+    u8* play = wwhd_play_get();
+    if (!(extras & MP_EXTRA_LIGHT) || !shield || !play) {
+        if (*reset & PUPPET_LIGHT_REFLECT) {
+            *reset &= ~PUPPET_LIGHT_REFLECT;
+            puppet_reset_at_hit(cps);
+            *(volatile u32*)cps &= ~1u; /* the attack is off */
+        }
+        return;
+    }
+    *reset |= PUPPET_LIGHT_REFLECT;
+    const volatile f32* m = (const volatile f32*)(shield + PUPPET_MODEL_BASE_MTX);
+    const volatile f32* from = &WWHD_GAME_DATA(0x10034FD8, f32);
+    const volatile f32* along = &WWHD_GAME_DATA(0x10034FE4, f32);
+    f32 start[3], end[3], vec[3];
+    for (int r = 0; r != 3; ++r) {
+        start[r] = m[r * 4] * from[0] + m[r * 4 + 1] * from[1] + m[r * 4 + 2] * from[2] + m[r * 4 + 3];
+        vec[r] = m[r * 4] * along[0] + m[r * 4 + 1] * along[1] + m[r * 4 + 2] * along[2];
+        end[r] = start[r] + vec[r];
+    }
+    puppet_cps_start_end(cps + PUPPET_CPS_SHAPE, start, end);
+    volatile f32* at_vec = (volatile f32*)(cps + PUPPET_CPS_AT_VEC);
+    at_vec[0] = vec[0];
+    at_vec[1] = vec[1];
+    at_vec[2] = vec[2];
+    *(volatile u32*)cps |= 1u; /* OnAtSetBit */
+    puppet_ccs_set((u32)(play + PUPPET_PLAY_CCS), cps);
+    wwhd_mass_set((void*)(play + PUPPET_PLAY_MASS), (void*)cps, 1);
+}
+
 static int puppet_item_has_model(mp_u16 item) {
     switch (item) {
     case 0x20: case 0x21: case 0x22: case 0x23: case 0x26: case 0x27: case 0x35: case 0x36: case 0x33: case 0x50:
@@ -920,6 +979,8 @@ static s32 puppet_execute(void* i_this) {
     puppet_follow_head(link->mpKatsuraModel, head);
     puppet_follow_head(link->mpYamuModel, head);
     wwhd_daPy_lk_c__setItemModel(i_this);
+    int light_slot = puppet_slot_of_actor((u32)i_this);
+    if (light_slot >= 0) puppet_light(i_this, puppet_slots[light_slot].remote_extras); /* its Mirror Shield's light */
     const f32* eye = puppet_anm_mtx(link->mpCLModel, CL_JNT_EYE);
     if (eye) {
         actor->eyePos.x = eye[3];

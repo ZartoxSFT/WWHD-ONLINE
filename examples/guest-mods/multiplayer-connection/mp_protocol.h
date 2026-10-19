@@ -588,6 +588,7 @@ static inline void mp_read_base(mp_reader* r, mp_transform* t) {
  * MP_EXTRA_HEAVY_BOOTS when the iron boots are on (daPy_lk_c::mNoResetFlg0 0x2000000). */
 #define MP_EXTRA_HEAVY_BOOTS 0x01
 #define MP_EXTRA_CASUAL 0x02      /* casual clothes worn (outfit.h) */
+#define MP_EXTRA_LIGHT 0x04       /* the Mirror Shield sends light back (puppet.h puppet_light) */
 #define MP_EXTRAS 0x7F
 #define MP_SHIP_PRESENT 0x01 /* the player's stage has its ship */
 #define MP_SHIP_RIDING 0x02  /* Link is on it */
