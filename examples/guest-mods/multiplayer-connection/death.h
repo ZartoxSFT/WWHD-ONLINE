@@ -11,16 +11,24 @@
  *    after a fall into the void or lava (startRestartRoom 023FD4E4, dProcLavaDamage_init 023FE6B8), it
  *    goes back to its body. Enemies go for a living player rather than a ghost (puppet_sense.h).
  *  - The other players see its body (a puppet in the death animation, ANM_DIELONG 0x62) and the ghost
- *    nearly invisible (puppet.h: drawn one logic step in two). The death block of ActorPlayerSync
+ *    translucent, as it sees itself (puppet.h ghost_model_drawn). The death block of ActorPlayerSync
  *    (mp_protocol.h MP_DEATH_GHOST) carries the body's place and the dead player's directory id.
  *  - A living player by a body holds A for DH_REVIVE_SECONDS (a prompt and a gauge): CLIENT_PLAYER_REVIVE
  *    goes to the dead player (WWClient.java), whose Link gets DH_REVIVE_LIFE quarter hearts back and
- *    stands on its body again.
+ *    stands on its body again. The life is given the game's way, as the pending life the meter adds
+ *    (mItemLifeCount, d_meter_01.cpp), not written into the save: the meter's own count of the hearts
+ *    shown (mCurrHP) only follows that path, and the game reads it back as play.mItemNowLife
+ *    (+0x5BAC), which turns off the exits (checkFallCode, d_a_player_main_03.cpp) and every event
+ *    order but priority 1 (EventControl::order 0253EC0C, d_event.cpp: doors, talks) while it is 0.
+ *    (0.2.67-0.2.68 wrote the save's life: the revived player could open no door and take no exit.)
  *  - When no living player is left in the stage (or the connection is lost), the ghost dies as the
- *    game would have let it (changeDeadProc's own course): the game over. */
+ *    game would have let it (changeDeadProc's own course): the game over. A player who dies the
+ *    game's way (no other survivor, or a ghost dying) sends MP_DEATH_DOWN while its life is 0 with no
+ *    fairy in a bottle: it is no survivor for the ghosts of its stage, which then die too. */
 #pragma once
 #include "wwhd_guest.h"
 #include "wwhd/save.h"
+#include "wwhd/objects.h" /* WWHD_ADDR_Link_debug_* */
 
 #define DH_REVIVE_SECONDS 6.0
 #define DH_REVIVE_RADIUS 150.0f   /* a body within 1.5 m, horizontally */
@@ -36,12 +44,21 @@
 #define DH_LINK_ITEM_TRIGGER 0x690D
 #define DH_LINK_ITEM_BUTTON 0x690E
 #define DH_PLAY_LIFE 0x5B44         /* the pending life, f32 quarter hearts (bonus.h) */
+#define DH_REVIVE_WAIT_STEPS 150    /* the meter adds the pending life at its next execute */
+#define DH_PROC_DEMO_DEAD 0xB2      /* daPyProc_DEMO_DEAD_e (dProcDead_init, d_a_player_main_03.cpp) */
+#define DH_DEATH_ANIM_SECONDS 4.0   /* ANM_DIELONG: Link has fallen (its voice at frame 129) */
+#define DH_FAIRY_LINK_DOWN 5        /* daNpc_Fa1_c::Type_LINK_DOWN_e (d_a_npc_fa1.h) */
+#define DH_REVIVE_CLAMP_SECONDS 3.0 /* the fairy's own 10 hearts are cut to the revive's life */
 #define DH_BUTTON_A 0x8000u         /* wwhd_input_state buttons (VPAD) */
 
 static mp_player_look current_look(const daPy_lk_c* link); /* mod.c */
 static u32 format_label(char* out, mp_u32 uid);             /* mod.c */
 
 static int dh_ghost, dh_dying;
+static int dh_reviving;               /* steps left for the meter to give the revive's life */
+static int dh_dying_anim;             /* the death animation plays, then the ghost (or the game over) */
+static double dh_dying_time, dh_clamp_time;
+static cXyz dh_fairy_pos;             /* passed to the game by address: in mod memory */
 static u32 dh_link;
 static mp_transform dh_body;
 static mp_u32 dh_target = MP_NO_ID;   /* the remote body the local Link stands by */
@@ -59,12 +76,13 @@ WWHD_GAME_ORIGINAL(0x024076CC, void, dh_set_collision_original, (void* self));
 WWHD_GAME_ORIGINAL(0x023FD4E4, s32, dh_restart_room_original, (void* self, u32 mode, s32 info, f32 damage, s32 point));
 WWHD_GAME_ORIGINAL(0x023FE6B8, s32, dh_lava_original, (void* self));
 WWHD_GAME_ORIGINAL(0x025C38B8, s32, dh_exit_original, (u32 ground, f32 speed, s32 type, s32 room));
+WWHD_GAME_ORIGINAL(0x02422104, s32, dh_proc_dead_original, (void* self));
 
 static void dh_note_link(void* link) { dh_link = (u32)link; }
 
 static int dh_is_local(void* self) { return self && (u32)self == dh_link && !puppet_is(self); }
 
-static int dh_damage_blocked(u32 self) { return dh_ghost && self == dh_link; }
+static int dh_damage_blocked(u32 self) { return (dh_ghost || dh_reviving || dh_dying_anim) && self == dh_link; }
 
 static void dh_set_notice(const char* a, const char* b) {
     u32 n = 0;
@@ -78,25 +96,47 @@ static void dh_set_notice(const char* a, const char* b) {
 static int dh_alive_others(void) {
     int n = 0;
     for (int i = 0; i != MAX_REMOTES; ++i)
-        if (remotes[i].active && (!remotes[i].has_look || !(remotes[i].look.death & MP_DEATH_GHOST))) ++n;
+        if (remotes[i].active &&
+            (!remotes[i].has_look || !(remotes[i].look.death & (MP_DEATH_GHOST | MP_DEATH_DOWN))))
+            ++n;
     return n;
 }
 
 static int dh_shared(void) { return state == READY && local_uid != MP_NO_ID && dh_alive_others() > 0; }
 
+/* daPy_lk_c::execute starts by putting back the position and angles it kept at its end
+ * (d_a_player_main_04.cpp: current.pos = l_debug_keep_pos, l_debug_shape_angle,
+ * l_debug_current_angle; written back at the end of execute): a position written between two
+ * executes (the revive, received after Link's execute) was undone. The kept copies are written too,
+ * as setPlayerPosAndAngle does (02443A28, lk_setDebugKeep, d_a_player_main_08.cpp). */
 static void dh_place(void* self, const mp_transform* t) {
     fopAc_ac_c* a = (fopAc_ac_c*)self;
     a->current.pos.x = a->old.pos.x = t->pos[0];
     a->current.pos.y = a->old.pos.y = t->pos[1];
     a->current.pos.z = a->old.pos.z = t->pos[2];
     a->speed.x = a->speed.y = a->speed.z = 0.0f;
+    a->speedF = 0.0f;
     a->shape_angle.y = a->current.angle.y = t->rot[1];
+    volatile f32* keep = &WWHD_GAME_DATA(WWHD_ADDR_Link_debug_position, f32);
+    keep[0] = t->pos[0];
+    keep[1] = t->pos[1];
+    keep[2] = t->pos[2];
+    volatile s16* shape = &WWHD_GAME_DATA(WWHD_ADDR_Link_debug_shape_angle, s16);
+    volatile s16* angle = &WWHD_GAME_DATA(WWHD_ADDR_Link_debug_current_angle, s16);
+    shape[0] = a->shape_angle.x;
+    shape[1] = a->shape_angle.y;
+    shape[2] = a->shape_angle.z;
+    angle[0] = a->current.angle.x;
+    angle[1] = a->current.angle.y;
+    angle[2] = a->current.angle.z;
     wwhd_daPy_lk_c__procWait_init(self);
 }
 
 /* daPy_lk_c::changeDeadProc: the local Link's death becomes a ghost while the stage has a living player. */
 WWHD_REPLACE(0x023F7820, s32, dh_change_dead, (void* self)) {
     if (!dh_is_local(self)) return dh_change_dead_original(self);
+    if (dh_reviving) return 0; /* revived: the meter gives the life at its next execute */
+    if (dh_dying_anim) return 1; /* falling down (dh_step turns it into a ghost) */
     if (dh_ghost) {
         if (!dh_dying) return 0;
         dh_ghost = puppet_local_ghost = 0; /* the game's own death now: the game over */
@@ -116,11 +156,35 @@ WWHD_REPLACE(0x023F7820, s32, dh_change_dead, (void* self)) {
     dh_body.pos[2] = a->current.pos.z;
     dh_body.rot[0] = dh_body.rot[2] = 0;
     dh_body.rot[1] = a->shape_angle.y;
+    /* the game's death animation first, as dProcDead_init does (commonProcInit 0xB2, ANM_DIELONG,
+     * d_a_player_main_03.cpp) without its compulsory event: no game over object, music or camera */
+    wwhd_daPy_lk_c__commonProcInit(self, DH_PROC_DEMO_DEAD);
+    wwhd_daPy_lk_c__setSingleMoveAnime(self, DH_ANM_DIELONG, 1.0f, 0.0f, -1, 2.0f);
+    dh_dying_anim = 1;
+    dh_dying_time = 0;
+    wwhd_log("multiplayer: the local Link died: the death animation, then a ghost");
+    return 1;
+}
+
+/* daPy_lk_c::dProcDead (02422104, d_a_player_main_05.cpp): during our death animation the game's
+ * course (game over object, its fade, the restart) is not run; the animation plays on. */
+WWHD_REPLACE(0x02422104, s32, dh_proc_dead, (void* self)) {
+    if (dh_dying_anim && dh_is_local(self)) return 1;
+    return dh_proc_dead_original(self);
+}
+
+/* The death animation is over: a ghost on its body, or the game over when no one lives here now. */
+static void dh_after_death_anim(void* link) {
+    dh_dying_anim = 0;
+    wwhd_daPy_lk_c__procWait_init(link);
+    if (!dh_shared()) { /* the next changeDeadProc runs the game's own death */
+        wwhd_log("multiplayer: no living player left in the stage: the game's death (game over)");
+        return;
+    }
     dh_ghost = puppet_local_ghost = 1;
     dh_dying = 0;
     dh_set_notice("You died: a friend can revive you", 0);
-    wwhd_log("multiplayer: the local Link died, a ghost until a player revives it");
-    return 0;
+    wwhd_log("multiplayer: the local Link is a ghost until a player revives it");
 }
 
 /* daPy_lk_c::setStickData: a ghost's buttons do nothing; by a body, A only revives. */
@@ -171,10 +235,25 @@ static void dh_revived(const mp_u8* body, mp_u32 length) {
     }
     if (!dh_ghost || dh_dying || !dh_link) return;
     u8* play = wwhd_play_get();
-    if (play) *(volatile f32*)(play + DH_PLAY_LIFE) = 0.0f;
-    u16 life = dComIfGs_player_status_a.max_life;
-    dComIfGs_player_status_a.life = life < DH_REVIVE_LIFE ? life : DH_REVIVE_LIFE;
+    u16 max = dComIfGs_player_status_a.max_life;
+    u16 life = max < DH_REVIVE_LIFE ? max : DH_REVIVE_LIFE;
+    if (play) {
+        *(volatile f32*)(play + DH_PLAY_LIFE) = (f32)life; /* the meter adds it to the save's 0 */
+        dh_reviving = DH_REVIVE_WAIT_STEPS;
+    } else {
+        dComIfGs_player_status_a.life = life;
+    }
     dh_place((void*)dh_link, &dh_body);
+    /* the fairy of a bottle on a fallen Link (changeDeadProc: makeFairy 023F73B8, type LINK_DOWN):
+     * it circles the local Link, now on its body; its own 10 hearts (item_func_recover_faily,
+     * d_item.cpp) are cut back to the revive's life for DH_REVIVE_CLAMP_SECONDS (dh_step) */
+    dh_fairy_pos.x = dh_body.pos[0];
+    dh_fairy_pos.y = dh_body.pos[1];
+    dh_fairy_pos.z = dh_body.pos[2];
+    if (!wwhd_daPy_lk_c__makeFairy((void*)dh_link, &dh_fairy_pos, DH_FAIRY_LINK_DOWN))
+        wwhd_log("multiplayer: revive: the fairy was not made");
+    dh_clamp_time = DH_REVIVE_CLAMP_SECONDS;
+    if (play) *(volatile f32*)(play + DH_PLAY_LIFE) = (f32)life;
     dh_ghost = puppet_local_ghost = 0;
     puppet_remove(DH_LOCAL_BODY);
     dh_set_notice(reviver[0] ? reviver : "A friend", " revived you!");
@@ -183,8 +262,20 @@ static void dh_revived(const mp_u8* body, mp_u32 length) {
 }
 
 /* The death block of the local player's ActorPlayerSync (mod.c current_look). */
+static int dh_down(void) {
+    if (!dh_link || dh_reviving || dComIfGs_player_status_a.life != 0) return 0;
+    u32 save = WWHD_GAME_DATA(0x101F84DC, u32);
+    return !(save && dh_check_bottle(save + DH_SAVE_ITEMS, DH_BOTTLE_FAIRY)); /* a fairy revives it */
+}
+
+/* Dead for the others (the directory's MP_DIR_DEAD: the launcher's skull, no teleport to us). */
+static int dh_local_dead(void) { return dh_ghost || dh_down(); }
+
 static void dh_fill_look(mp_player_look* look) {
-    if (!dh_ghost) return;
+    if (!dh_ghost) {
+        if (state == READY && dh_down()) look->death = MP_DEATH_DOWN; /* the game's death: no survivor */
+        return;
+    }
     look->death = MP_DEATH_GHOST;
     look->death_dir = directory_valid ? directory.self : 0;
     for (int i = 0; i != 3; ++i) look->corpse[i] = dh_body.pos[i];
@@ -309,12 +400,30 @@ static void dh_revive_step(const fopAc_ac_c* link, double dt) {
 
 /* Every step of the local Link, connected or not. */
 static void dh_step(void* link, double dt) {
+    if (dh_dying_anim && (dh_dying_time += dt) >= DH_DEATH_ANIM_SECONDS) dh_after_death_anim(link);
+    if (dh_clamp_time > 0) { /* the revive's life, not the fairy's */
+        dh_clamp_time -= dt;
+        u8* play = wwhd_play_get();
+        u16 max = dComIfGs_player_status_a.max_life;
+        s32 want = max < DH_REVIVE_LIFE ? max : DH_REVIVE_LIFE, have = dComIfGs_player_status_a.life;
+        if (play && (f32)have + *(volatile f32*)(play + DH_PLAY_LIFE) > (f32)want)
+            *(volatile f32*)(play + DH_PLAY_LIFE) = (f32)(want > have ? want - have : 0);
+    }
     if (dh_ghost && !dh_dying && !dh_shared()) {
         dh_dying = 1;
         puppet_remove(DH_LOCAL_BODY);
         wwhd_log("multiplayer: no living player left in the stage: the ghost dies (game over)");
     }
     if (!dh_ghost) dh_dying = 0;
+    if (dh_reviving) {
+        if (dComIfGs_player_status_a.life != 0) {
+            dh_reviving = 0;
+        } else if (--dh_reviving == 0) { /* the meter did not run (logged, not hidden) */
+            u16 max = dComIfGs_player_status_a.max_life;
+            dComIfGs_player_status_a.life = max < DH_REVIVE_LIFE ? max : DH_REVIVE_LIFE;
+            wwhd_log("multiplayer: revive: the meter gave no life, the save's life was written (doors may stay shut)");
+        }
+    }
     if (dh_notice_steps > 0) --dh_notice_steps;
     if (state == READY) dh_bodies_step((const daPy_lk_c*)link);
     dh_revive_step((const fopAc_ac_c*)link, dt);

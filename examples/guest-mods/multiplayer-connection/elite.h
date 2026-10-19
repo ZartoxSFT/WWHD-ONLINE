@@ -1083,6 +1083,7 @@ WWHD_HOOK(0x027F53CC, el_model_animated, (u32 model, u32 a1, u32 a2, u32 a3)) {
 /* mDoExt_drawModel (025E2BF4, model and draw data), before it draws: an elite's colours. */
 WWHD_HOOK(0x025E2BF4, el_draw_model_begin, (u32 model, u32 supplied)) {
     (void)supplied;
+    ghost_model_drawn(model, supplied); /* a ghost Link's model: translucent (puppet.h) */
     el_swap_table = 0;
     el_swap_count = 0;
     el_draw_model = el_drawing ? model : 0;

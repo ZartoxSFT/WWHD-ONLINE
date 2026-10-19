@@ -158,7 +158,10 @@
  *  - Darknut (d_a_tn.cpp): bits 0-3 the behaviour, kept unless roaming (0) or guarding (4)
  *    (d_a_tn.h BehaviorType), bits 4-7 the armour colour (0-5, clamped there);
  *  - Keese (d_a_ki.cpp): bit 15 fire damage (mDamageType);
- *  - Octorok (d_a_oq.cpp): bits 8-15 the projectile (0, 1; 0xFF means 0).
+ *  - Octorok (d_a_oq.cpp): bits 8-15 the projectile (0, 1; 0xFF means 0);
+ *  - Pig ("Pig", d_a_kb.cpp daKb_Create, useHeapInit): bits 0-3 the shape, a body model per shape
+ *    (kb_bdl_idx[shape & 3]: four colours 0-3); only the pigs whose bits 8-15 are 0xFF (Outset's
+ *    big pig candidates, mbCanBeBigPig, keep theirs: its quest picks them by shape).
  * A field changes only when the original's value is one of its list (a scripted variant, a boss
  * flag, a special behaviour stays). The pick is a hash of the original parameter block and the
  * copy number, not the game's random generator: every client makes the same copy, so the copies'
@@ -304,6 +307,7 @@ typedef struct as_slot {
     u8 deleting;         /* removed by the server, deletion requested */
     u8 has_target, has_display, has_net_health, has_sent;
     u8 replayed;         /* a received hit was replayed on it lately */
+    u8 broken;           /* a pot broken in this game (as_pot_damaged): removed for everyone */
     u8 kind;             /* AS_KIND_* */
     u8 cls;              /* spawned: AS_CLS_* */
     u8 replica;          /* spawned: created from the network */
@@ -477,6 +481,8 @@ static const as_enemy_variants as_variants[] = {
     {"keeth", 0, 0, 1, {{AS_WORD_PARAMS, 15, 2, 0x1, {0, 1}}}},
     {"Fkeeth", 0, 0, 1, {{AS_WORD_PARAMS, 15, 2, 0x1, {0, 1}}}},
     {"Oq", 0, 0, 1, {{AS_WORD_PARAMS, 8, 3, 0xFF, {0, 1, 0xFF}}}},
+    /* the pig's colour (d_a_kb.cpp), not Outset's big pig candidates */
+    {"Pig", 0x0000FF00, 0x0000FF00, 1, {{AS_WORD_PARAMS, 0, 4, 0xF, {0, 1, 2, 3}}}},
     /* the regular Mothula (d_a_gm.cpp create): parameter byte 2 1 on the ground without wings
      * ("gmos_g", wing flags 15, health 2), 2 flying ("gmos_f"); 0 and 0xFF are the mini-boss and
      * byte 1 not 0 (0xFF counts as 0) a larva on a wall: those are left as placed */
@@ -1190,6 +1196,10 @@ static void as_on_deleted(as_slot* s, s8 health) {
     if (s->state != AS_SYNCED || s->uid == MP_NO_ID || !as_session) return;
     int died = s->group == AS_GROUP_ENEMY && s->max_health > 0 && health <= 0;
     int responsible = (as_local_uid != MP_NO_ID && s->owner == as_local_uid) || s->local_hit;
+    if (s->broken) { /* a pot broken here: every game breaks its copy (as_pot_damaged) */
+        as_send_uid(as_session->client_remove, s->uid);
+        return;
+    }
     if (!died || !responsible) return;
     as_send_uid(as_session->client_remove, s->uid);
     if (!as_removed_logged++) wwhd_log("multiplayer: a synchronised enemy died, removed for everyone");
@@ -1224,10 +1234,40 @@ static int as_follows_owner(const as_slot* s) {
            s->has_display && s->age < AS_STALE && !(s->local_hit && s->hit_clock < AS_HIT_GRACE);
 }
 
+/* An actor its owner carries sits between the hands of the owner's puppet, where
+ * daPy_lk_c::setGrabItemPos puts it (d_a_player_main_04.cpp: the middle of mLeftHandPos and
+ * mRightHandPos, joints 8 and 12 of mpCLModel), not at its smoothed network place: it moves with
+ * the puppet as a puppet moves with its ship. 0 without the puppet (then the network place). */
+#define AS_JNT_LEFT_HAND 8
+#define AS_JNT_RIGHT_HAND 12
+static int as_carried_place(const as_slot* s, f32* out) {
+    int carried = s->kind == AS_KIND_PLACED ? s->has_net_health && (s->net_status & 0x2000u)
+                                            : s->replica && (s->spawn.variant & 1);
+    if (!carried || !s->owner) return 0;
+    puppet_slot* p = puppet_slot_for(s->owner, 0);
+    if (!p || !p->actor) return 0;
+    const daPy_lk_c* link = (const daPy_lk_c*)p->actor;
+    if (!link->mpCLModel) return 0;
+    const f32* l = puppet_anm_mtx(link->mpCLModel, AS_JNT_LEFT_HAND);
+    const f32* r = puppet_anm_mtx(link->mpCLModel, AS_JNT_RIGHT_HAND);
+    if (!l || !r) return 0;
+    out[0] = (l[3] + r[3]) * 0.5f;
+    out[1] = (l[7] + r[7]) * 0.5f;
+    out[2] = (l[11] + r[11]) * 0.5f;
+    return 1;
+}
+
 static void as_place(const as_slot* s, fopAc_ac_c* a) {
-    a->current.pos.x = s->display.pos[0];
-    a->current.pos.y = s->display.pos[1];
-    a->current.pos.z = s->display.pos[2];
+    f32 hands[3];
+    if (as_carried_place(s, hands)) {
+        a->current.pos.x = a->old.pos.x = hands[0];
+        a->current.pos.y = a->old.pos.y = hands[1];
+        a->current.pos.z = a->old.pos.z = hands[2];
+    } else {
+        a->current.pos.x = s->display.pos[0];
+        a->current.pos.y = s->display.pos[1];
+        a->current.pos.z = s->display.pos[2];
+    }
     a->shape_angle.x = s->display.rot[0];
     a->shape_angle.y = s->display.rot[1];
     a->shape_angle.z = s->display.rot[2];
@@ -1275,10 +1315,54 @@ static void as_boomerang_params(as_slot* s, fopAc_ac_c* a) {
     if (logged++ < 3) wwhd_log_int("multiplayer: boomerang copy given its owner's parameters", (int)s->spawn.params);
 }
 
+/* Push blocks and crates (daObjMovebox, proc 0x2B: Kkiba, osiBLK0/1, DBLK0/1, MpwrB, Hbox1/2,
+ * Hjump1, Hseki2/7, Mmrr, MkieBB, Ecube, d_a_obj_movebox.h). Their execute puts them back on their
+ * grid cell every step (mode_wait, d_a_obj_movebox.cpp: home, turned by home.angle.y, plus m628 and
+ * m62C cells of the type's attribute m0C, M_attr 101CB424 + type * 0x9C + 0xC; m628 at +0x740, m62C
+ * at +0x744 with mType +0x710 and mSmokeCbs +0x768, decomp verify units): a network place written
+ * over current.pos was undone. A copy that follows its owner takes the owner's cell instead (the
+ * owner's place brought into the block's frame); it then stands on that cell as the owner's block
+ * does, a cell at a time (the push between two cells is not shown). */
+#define AS_PROC_MOVEBOX 0x2B
+#define AS_MOVEBOX_TYPE 0x710
+#define AS_MOVEBOX_CELL_X 0x740
+#define AS_MOVEBOX_CELL_Z 0x744
+#define AS_MOVEBOX_ATTR 0x101CB424u
+#define AS_MOVEBOX_ATTR_SIZE 0x9C
+#define AS_MOVEBOX_CELL_SIZE 0x0C
+#define AS_MOVEBOX_TYPES 13
+
+/* sine of a game angle (0x10000 a turn), within 1e-4: no libm in the guest */
+static f32 as_sin(s16 angle) {
+    f32 x = (f32)angle * (3.14159265f / 32768.0f); /* -pi..pi */
+    if (x > 1.5707963f) x = 3.14159265f - x;
+    else if (x < -1.5707963f) x = -3.14159265f - x;
+    f32 x2 = x * x;
+    return x * (1.0f - x2 / 6.0f * (1.0f - x2 / 20.0f * (1.0f - x2 / 42.0f * (1.0f - x2 / 72.0f))));
+}
+
+static s32 as_round(f32 v) { return v < 0.0f ? -(s32)(-v + 0.5f) : (s32)(v + 0.5f); }
+
+static void as_movebox_cell(const as_slot* s, fopAc_ac_c* a) {
+    if (*(const volatile s16*)((const u8*)a + AS_PROC_NAME) != AS_PROC_MOVEBOX) return;
+    u32 type = *(const volatile u32*)((const u8*)a + AS_MOVEBOX_TYPE);
+    if (type >= AS_MOVEBOX_TYPES) return;
+    f32 cell = *(const volatile f32*)(AS_MOVEBOX_ATTR + type * AS_MOVEBOX_ATTR_SIZE + AS_MOVEBOX_CELL_SIZE);
+    if (!(cell > 1.0f)) return;
+    f32 dx = s->display.pos[0] - a->home.pos.x, dz = s->display.pos[2] - a->home.pos.z;
+    s16 turn = a->home.angle.y;
+    f32 sn = as_sin(turn), cs = as_sin((s16)(turn + 0x4000));
+    /* mDoMtx YrotM(turn) then transM(m628 * cell, 0, m62C * cell): world = R * local */
+    f32 lx = cs * dx - sn * dz, lz = sn * dx + cs * dz;
+    *(volatile s32*)((u8*)a + AS_MOVEBOX_CELL_X) = as_round(lx / cell);
+    *(volatile s32*)((u8*)a + AS_MOVEBOX_CELL_Z) = as_round(lz / cell);
+}
+
 static void as_before_execute(as_slot* s, fopAc_ac_c* a) {
     as_boomerang_params(s, a);
     if (as_follows_owner(s)) {
         as_place(s, a);
+        as_movebox_cell(s, a);
         as_apply_carry(s, a);
         if (s->has_net_health && s->net_tag) el_adopt(a, s->net_tag); /* the owner's elite draw */
         /* a missed hit only: never heals a copy that was hit first, never touches a dying one */
@@ -2128,7 +2212,7 @@ static void as_reset_network(void) {
         s->owner = 0;
         s->ticket = 0xFF;
         s->has_target = s->has_display = s->has_net_health = s->has_sent = 0;
-        s->exclusive = s->local_hit = s->deleting = s->replayed = 0;
+        s->exclusive = s->local_hit = s->deleting = s->replayed = s->broken = 0;
     }
     as_local_uid = MP_NO_ID;
     as_strike_count = 0;
@@ -2258,6 +2342,47 @@ static void as_step_replica(as_slot* s, double dt) {
     s->request_id = id;
     s->requested = 1;
     s->pending_clock = 0;
+}
+
+/* Pots (daTsubo: kotubo, ootubo1, Kmtub, Ptubo... in the server's list). A pot breaks in
+ * daTsuboDamage::Act_c::damaged (024CC004, d_a_tsubo_dmg.cpp: this, item action, ground polygon,
+ * effects, place): the item of its parameters (fopAcM_createItemFromTable 025D8120), its break
+ * effect and sound; its execute then deletes it. A synchronised pot broken in this game (a hit,
+ * a throw, a fall) is marked, and its deletion sends CLIENT_ACTOR_SYNC_REMOVE (as_on_deleted); the
+ * other games break their copy the same way, effects and sound, but without making the item a
+ * second time (the breaker's game made it), then delete it. Before 0.2.77 only dead enemies were
+ * removed for the others: a pot broken in one game stayed whole in the others. */
+#define AS_PROC_TSUBO 0x1C5 /* fpcNm_TSUBO_e (gc_api/f_op/f_op_actor_mng.h) */
+WWHD_GAME_FUNC(0x024CC004, void, as_pot_damaged_call, (void* self, s32 action, void* poly, u32 effects, void* pos));
+WWHD_GAME_ORIGINAL(0x025D8120, u32, as_item_from_table_original,
+                   (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale));
+static int as_breaking_copy;
+
+WWHD_HOOK(0x024CC004, as_pot_damaged, (void* self, s32 action, void* poly, u32 effects, void* pos)) {
+    (void)action;
+    (void)poly;
+    (void)effects;
+    (void)pos;
+    if (as_breaking_copy || !self) return;
+    as_slot* s = as_find(self);
+    if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) s->broken = 1;
+}
+
+/* fopAcM_createItemFromTable: nothing while a copy breaks for another game's break. */
+WWHD_REPLACE(0x025D8120, u32, as_item_from_table,
+             (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale)) {
+    if (as_breaking_copy) return 0;
+    return as_item_from_table_original(pos, item, bit, room, type, angle, action, scale);
+}
+
+static void as_break_pot(as_slot* s, fopAc_ac_c* a) {
+    as_breaking_copy = 1;
+    as_pot_damaged_call(a, 1, 0, 1, &a->current.pos);
+    as_breaking_copy = 0;
+    s->deleting = 1;
+    wwhd_fopAcM_delete_actor((u32)a);
+    static u32 logged;
+    if (!logged++) wwhd_log("multiplayer: a pot broken in another game broke here");
 }
 
 /* A copy dead at its owner but alive here gets a lethal replayed hit (see the header). */
@@ -2405,6 +2530,11 @@ static void as_step(double dt, mp_u32 local_uid, const fopAc_ac_c* link) {
             s->spawn_ready = 1;
         }
         as_step_kill(s, a, dt);
+        if (s->state == AS_REMOVED && !s->deleting && s->kind == AS_KIND_PLACED &&
+            *(const volatile s16*)((const u8*)a + AS_PROC_NAME) == AS_PROC_TSUBO) {
+            as_break_pot(s, (fopAc_ac_c*)(u32)a); /* broken in another game */
+            continue;
+        }
         if (s->state == AS_REMOVED) {
             /* dead at its owner: ours dies of the replayed hits, else it goes after a while */
             s->remove_clock += dt;

@@ -1110,8 +1110,18 @@ static void test_directory(void) {
     mp_write_vlq(&w, 1); mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
     mp_dir_entry bad = b;
     mp_write_dir_entry(&w, &bad);
-    w.data[w.size - 1] = 0x02; /* the flags byte (no sea place follows) */
+    w.data[w.size - 1] = 0x04; /* the flags byte (no sea place follows) */
     assert(!mp_read_directory(w.data, w.size, &d));
+    /* dead (MP_DIR_DEAD): no field, kept with the sea place */
+    w.data[w.size - 1] = MP_DIR_DEAD;
+    assert(mp_read_directory(w.data, w.size, &d) && d.count == 1 && d.entry[0].flags == MP_DIR_DEAD);
+    mp_dir_entry dead = a;
+    dead.flags = MP_DIR_SEA | MP_DIR_DEAD;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&w, 1); mp_write_vlq(&w, 1); mp_write_vlq(&w, 1);
+    mp_write_dir_entry(&w, &dead);
+    assert(w.data[w.size - 9] == 0x03 && mp_read_directory(w.data, w.size, &d));
+    assert(d.entry[0].flags == (MP_DIR_SEA | MP_DIR_DEAD) && d.entry[0].sea[0] == 10.0f);
     /* more players than kept: read through, the first MP_DIR_MAX kept */
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_vlq(&w, 1); mp_write_vlq(&w, MP_DIR_MAX + 2);
@@ -1281,6 +1291,14 @@ static void test_death(void) {
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_player(&w, &l);
     assert(w.ok && buffer[w.size - 1] == 0x00 && buffer[w.size - 2] == 0x00); /* no skin, alive */
+    /* down (the game's death, no ghost): the flags byte alone, read back as it is */
+    l.death = MP_DEATH_DOWN;
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_player(&w, &l);
+    assert(w.ok && buffer[w.size - 1] == 0x02 && buffer[w.size - 2] == 0x00);
+    r = mp_reader_make(buffer, w.size);
+    mp_read_player(&r, &got);
+    assert(r.ok && r.pos == r.size && got.death == MP_DEATH_DOWN && got.death_dir == 0);
 
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_revive_request(&w, 7, "Medli");

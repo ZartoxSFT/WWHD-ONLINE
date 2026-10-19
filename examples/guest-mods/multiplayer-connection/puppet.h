@@ -125,7 +125,7 @@ typedef struct puppet_slot {
     mp_u8 remote_extras;     /* MP_EXTRA_* */
     mp_u16 shown_item;       /* the item the puppet holds now (PUPPET_ITEM_NONE: nothing) */
     char skin[MP_SKIN_MAX + 1]; /* the owner's skin (skin.h), "" for Link */
-    int ghost;               /* the owner is dead (death.h): drawn one logic step in two */
+    int ghost;               /* the owner is dead (death.h): drawn translucent (ghost_model_drawn) */
     u32 posed;               /* a body (death.h): the actor its death animation was given to */
 } puppet_slot;
 
@@ -367,6 +367,214 @@ static volatile u32* puppet_camera_status(const u8* play, const void* link) {
     return (volatile u32*)(play + PUPPET_CAMERA_STATUS + (u32)idx * PUPPET_CAMERA_STRIDE);
 }
 
+/* A ghost (death.h) is drawn translucent, its sword, shield and every other model of its draw too:
+ *  - 027F58E0(model, 1) flags each of the J3DModel's material entries translucent (+0xA0 of the
+ *    0xAC-byte entries, count +0x128, array +0x12C; d_a_tornado.h, m_Do_ext_invisible.h): the
+ *    translucent draw order;
+ *  - each material of the model data (0x39C each, count +0xC, array +0x10) blends with a constant
+ *    alpha set in its render state (below), depth written.
+ * The HD renderer draws a model at once in mDoExt_drawModel (025E2BF4, elite.h): the ghost's
+ * models are changed there while its daPy_lk_c::draw runs, and everything is put back when that
+ * draw returns (model data is shared by every Link). One pass, depth written (0.2.68 wrote none:
+ * Link's back showed through his front; 0.2.74's depth-only first pass of the same model flickered). The eyes and brows are drawn
+ * apart (J3DJoint::entryIn of the eye and mayu joints, without depth test, d_a_player_main_01.cpp
+ * draw): not drawn for a ghost. 0.2.68-0.2.73 used mDoLib_setMaterialColor 025F0AD0 (the Deku
+ * Leaf fade: konst 3 alpha): Link stayed opaque. */
+#define GHOST_ALPHA 0.42f            /* the veil's opacity */
+/* The material's render state (resource + 0x20 relative: the BFRES FMAT's render state, read in
+ * the game's Link.bfres: 152 materials, local analysis): +0 mode flags (opaque 0x01, translucent
+ * 0x13: mode 3, colour blend 0x10), +8 depth control (0x49749736 test and write, 0x...32 test only),
+ * +0x14 colour control (bit 0x100: blending on target 0, off on every opaque material), +0x18 the
+ * blend control (target, then +0x1C the factors: opaque ONE/ZERO 0x20010001, translucent
+ * SRC_ALPHA/INV_SRC_ALPHA 0x25040504), +0x20 the blend constant colour (4 floats, 0 everywhere).
+ * Link's shaders give alpha 1 (the konst 3 alpha of 0.2.68-0.2.73 changed nothing on him, and with
+ * the opaque materials' blending off nothing blended at all): the ghost blends with the CONSTANT
+ * alpha (GX2 blend factors 19 / 20, runtime gfx/vulkan/draw.cpp table, VK_BLEND_FACTOR_CONSTANT_ALPHA;
+ * the constant comes from the game's GX2SetBlendConstantColorReg, import_args.tsv), whatever the
+ * shader computes. Setters the game uses on that state (d_a_saku.cpp matAlphaAnim,
+ * d_a_bgn_draw.cpp): 027E212C mode, 027E19B4 / 027E19C4 / 027E19E4 / 027E19F4 colour source /
+ * colour destination / alpha source / alpha destination factors (on +0x18), 027E18F8 depth write
+ * (on +8). */
+#define GHOST_STATE_FLAGS 0x00
+#define GHOST_STATE_DEPTH 0x08
+#define GHOST_STATE_COLOR 0x14
+#define GHOST_STATE_BLEND 0x18
+#define GHOST_STATE_BLEND_COLOR 0x20
+#define GHOST_MODE_TRANSLUCENT 3
+#define GHOST_FLAG_COLOR_BLEND 0x10u
+#define GHOST_COLOR_BLEND_TARGET0 0x100u
+#define GX2_BLEND_CONSTANT_ALPHA 19
+#define GX2_BLEND_ONE_MINUS_CONSTANT_ALPHA 20
+#define GHOST_MODELS 24
+#define GHOST_ENTRIES 64             /* material entries of one model */
+#define GHOST_MATERIALS 192
+#define GHOST_STATE_BYTES 0x40       /* the render state's bytes kept (blend +8, alpha state +0x18) */
+#define GHOST_MODEL_ENTRY_COUNT 0x128
+#define GHOST_MODEL_ENTRIES 0x12C
+#define GHOST_ENTRY_SIZE 0xAC
+#define GHOST_ENTRY_XLU 0xA0
+#define GHOST_MATERIAL_SIZE 0x39C
+#define GHOST_RESOURCE_STATE 0x20
+#define GHOST_TEV_BLOCK 0x18
+#define GHOST_TEV_VTABLE 0x04
+#define GHOST_MODEL_DATA 0xAC
+#define GHOST_UNIFORMS 0xA0
+#define GHOST_SLOT_K3 10
+
+WWHD_GAME_FUNC(0x027F58E0, void, ghost_set_model_xlu, (u32 model, u32 xlu));
+WWHD_GAME_FUNC(0x027E212C, void, ghost_state_mode, (u32 state, s32 mode));
+WWHD_GAME_FUNC(0x027E19B4, void, ghost_blend_color_src, (u32 blend, s32 factor));
+WWHD_GAME_FUNC(0x027E19C4, void, ghost_blend_color_dst, (u32 blend, s32 factor));
+WWHD_GAME_FUNC(0x027E18F8, void, ghost_depth_write, (u32 depth, s32 on));
+WWHD_GAME_FUNC(0x027F9F0C, u32, ghost_uniform_slot, (u32 uniforms, s32 index));
+WWHD_GAME_ORIGINAL(0x027F583C, void, ghost_entry_in_original, (u32 model, u32 joint));
+#define GHOST_JOINT_SIZE 0x1C
+#define GHOST_JNT_EYE 0x13          /* CL_JNT_CL_EYE_e, d_a_player_main_01.h */
+#define GHOST_JNT_MAYU 0x15         /* CL_JNT_CL_MAYU_e */
+
+typedef u32 (*ghost_kcolor_get)(u32 tev, u32 index);
+typedef void (*ghost_kcolor_set)(u32 tev, u32 index, u32 color);
+
+typedef struct ghost_model_saved {
+    u32 model, entries, count;
+    u32 xlu[GHOST_ENTRIES];
+} ghost_model_saved;
+
+typedef struct ghost_material_saved {
+    u32 material, state, k3;
+    u32 flags;
+    u32 slot[4];
+    u8 bytes[GHOST_STATE_BYTES];
+} ghost_material_saved;
+
+static int ghost_drawing;            /* a ghost's daPy_lk_c::draw runs */
+static ghost_model_saved ghost_models[GHOST_MODELS];
+static ghost_material_saved ghost_materials[GHOST_MATERIALS];
+static u32 ghost_model_count, ghost_material_count;
+static int ghost_logged;
+
+static inline u32 ghost_ld32(u32 a) { return *(const volatile u32*)a; }
+
+static u32 ghost_k3(u32 material) {
+    u32 tev = ghost_ld32(material + GHOST_TEV_BLOCK);
+    u32 vtable = tev ? ghost_ld32(tev + GHOST_TEV_VTABLE) : 0;
+    if (!vtable) return 0;
+    return ((ghost_kcolor_get)ghost_ld32(vtable + 0x4C))(tev, 3);
+}
+
+/* The materials of a model as they are now, kept once per ghost draw (put back by ghost_restore). */
+static void ghost_save_model(u32 model) {
+    for (u32 i = 0; i != ghost_model_count; ++i)
+        if (ghost_models[i].model == model) return;
+    u32 data = ghost_ld32(model + GHOST_MODEL_DATA);
+    u32 entries = ghost_ld32(model + GHOST_MODEL_ENTRIES), count = ghost_ld32(model + GHOST_MODEL_ENTRY_COUNT);
+    if (!data || (data & 3) || ghost_model_count == GHOST_MODELS || count > GHOST_ENTRIES || (count && !entries)) return;
+    u32 materials = ghost_ld32(data + 0x10), n = ghost_ld32(data + 0xC);
+    if (n && !materials) return;
+    ghost_model_saved* m = &ghost_models[ghost_model_count++];
+    m->model = model;
+    m->entries = entries;
+    m->count = count;
+    for (u32 i = 0; i != count; ++i) m->xlu[i] = ghost_ld32(entries + i * GHOST_ENTRY_SIZE + GHOST_ENTRY_XLU);
+    for (u32 i = 0; i != n && ghost_material_count != GHOST_MATERIALS; ++i) {
+        u32 material = materials + i * GHOST_MATERIAL_SIZE;
+        int seen = 0;
+        for (u32 j = 0; j != ghost_material_count && !seen; ++j) seen = ghost_materials[j].material == material;
+        if (seen) continue;
+        u32 resource = ghost_ld32(material);
+        u32 offset = resource ? ghost_ld32(resource + GHOST_RESOURCE_STATE) : 0;
+        u32 k3 = ghost_k3(material);
+        u32 slot = ghost_uniform_slot(material + GHOST_UNIFORMS, GHOST_SLOT_K3);
+        if (!offset || !k3 || !slot) continue; /* 025F0AD0 would write through a null state */
+        ghost_material_saved* s = &ghost_materials[ghost_material_count++];
+        s->material = material;
+        s->state = resource + GHOST_RESOURCE_STATE + offset;
+        s->k3 = ghost_ld32(k3);
+        s->flags = ghost_ld32(material + GHOST_UNIFORMS);
+        for (u32 k = 0; k != 4; ++k) s->slot[k] = ghost_ld32(slot + k * 4);
+        for (u32 k = 0; k != GHOST_STATE_BYTES; ++k) s->bytes[k] = *(const volatile u8*)(s->state + k);
+    }
+}
+
+/* Every kept material of this model's data at an alpha, depth written. */
+static u32 ghost_alpha_model(u32 model, f32 alpha) {
+    u32 data = ghost_ld32(model + GHOST_MODEL_DATA), done = 0;
+    u32 materials = ghost_ld32(data + 0x10), n = ghost_ld32(data + 0xC);
+    for (u32 j = 0; j != ghost_material_count; ++j) {
+        const ghost_material_saved* m = &ghost_materials[j];
+        if (m->material < materials || m->material >= materials + n * GHOST_MATERIAL_SIZE) continue;
+        u32 state = m->state;
+        ghost_state_mode(state, GHOST_MODE_TRANSLUCENT);
+        *(volatile u32*)(state + GHOST_STATE_FLAGS) |= GHOST_FLAG_COLOR_BLEND;
+        *(volatile u32*)(state + GHOST_STATE_COLOR) |= GHOST_COLOR_BLEND_TARGET0;
+        ghost_blend_color_src(state + GHOST_STATE_BLEND, GX2_BLEND_CONSTANT_ALPHA);
+        ghost_blend_color_dst(state + GHOST_STATE_BLEND, GX2_BLEND_ONE_MINUS_CONSTANT_ALPHA);
+        /* the picture's alpha stays the material's own (0.2.74 blended it too: darker, black flashes) */
+        ghost_depth_write(state + GHOST_STATE_DEPTH, 1);
+        volatile f32* constant = (volatile f32*)(state + GHOST_STATE_BLEND_COLOR);
+        constant[0] = constant[1] = constant[2] = 0.0f;
+        constant[3] = alpha;
+        ++done;
+    }
+    return done;
+}
+
+/* mDoExt_drawModel during a ghost's draw (elite.h el_draw_model_begin): the depth pass now, the
+ * veil when the game draws it after this hook. */
+static void ghost_model_drawn(u32 model, u32 supplied) {
+    if (!ghost_drawing || !model || (model & 3)) return;
+    ghost_save_model(model);
+    int kept = 0;
+    for (u32 i = 0; i != ghost_model_count && !kept; ++i) kept = ghost_models[i].model == model;
+    if (!kept) return;
+    (void)supplied;
+    ghost_set_model_xlu(model, 1);
+    /* one pass: a second draw of the same model in a frame with another state flickered (0.2.74),
+     * the model's own copy of its materials not following a change made between two draws */
+    u32 done = ghost_alpha_model(model, GHOST_ALPHA);
+    if (!ghost_logged) {
+        ghost_logged = 1;
+        wwhd_log_int("multiplayer: ghost drawn translucent (depth pass first), materials of its first model", (int)done);
+    }
+}
+
+/* J3DJoint::entryIn (027F583C, model and joint, J3DGraph.h): a ghost's eyes and brows are not
+ * drawn (their passes have no depth test: they would float over the veil). */
+WWHD_REPLACE(0x027F583C, void, ghost_entry_in, (u32 model, u32 joint)) {
+    if (ghost_drawing && model && !(model & 3)) {
+        u32 data = ghost_ld32(model + GHOST_MODEL_DATA);
+        u32 joints = data ? ghost_ld32(data + 8) : 0, count = data ? ghost_ld32(data + 4) : 0;
+        if (joints && count > GHOST_JNT_MAYU &&
+            (joint == joints + GHOST_JNT_EYE * GHOST_JOINT_SIZE || joint == joints + GHOST_JNT_MAYU * GHOST_JOINT_SIZE))
+            return;
+    }
+    ghost_entry_in_original(model, joint);
+}
+
+/* After a ghost's draw: the models and materials as they were. */
+static void ghost_restore(void) {
+    for (u32 i = ghost_material_count; i-- != 0;) {
+        const ghost_material_saved* s = &ghost_materials[i];
+        for (u32 k = 0; k != GHOST_STATE_BYTES; ++k) *(volatile u8*)(s->state + k) = s->bytes[k];
+        u32 k3 = ghost_k3(s->material);
+        if (k3) {
+            *(volatile u32*)k3 = s->k3;
+            u32 tev = ghost_ld32(s->material + GHOST_TEV_BLOCK);
+            ((ghost_kcolor_set)ghost_ld32(ghost_ld32(tev + GHOST_TEV_VTABLE) + 0x3C))(tev, 3, k3);
+        }
+        u32 slot = ghost_uniform_slot(s->material + GHOST_UNIFORMS, GHOST_SLOT_K3);
+        if (slot)
+            for (u32 k = 0; k != 4; ++k) *(volatile u32*)(slot + k * 4) = s->slot[k];
+        *(volatile u32*)(s->material + GHOST_UNIFORMS) = s->flags;
+    }
+    for (u32 i = 0; i != ghost_model_count; ++i) {
+        const ghost_model_saved* m = &ghost_models[i];
+        for (u32 j = 0; j != m->count; ++j) *(volatile u32*)(m->entries + j * GHOST_ENTRY_SIZE + GHOST_ENTRY_XLU) = m->xlu[j];
+    }
+    ghost_material_count = ghost_model_count = 0;
+    ghost_drawing = 0;
+}
+
 /* A model without model data is not drawn, and logged: daPy_lk_c::draw then mDoExt_modelEntryDL /
  * mDoExt_modelUpdateDL (025E2E5C (model) / 025E2DE0 (model, data), decomp m_Do_ext_heap_model.cpp)
  * read null + 0x3C in J3DModel::viewCalc (crashes 16:19 and 16:22, 0.2.61, crash-20261018-161947.log
@@ -393,11 +601,22 @@ static void draw_guard_log(const void* model) {
     wwhd_log_int("multiplayer:   its skin (-1: Link)", draw_link ? skin_of(draw_link) : -1);
 }
 
+/* A ghost (death.h) shows its body only: its sword, shield, scabbard, held item, boots and the
+ * other models its daPy_lk_c::draw enters are left out; the body, hands and hair stay (SDK
+ * daPy_lk_c mpCLModel +0x448, mpKatsuraModel +0x44C, mpHandsModel +0xCF4). */
+static int ghost_skips(const void* model) {
+    if (!ghost_drawing || !draw_link) return 0;
+    u32 m = (u32)model;
+    const daPy_lk_c* link = (const daPy_lk_c*)draw_link;
+    return m != link->mpCLModel && m != link->mpKatsuraModel && m != link->mpHandsModel;
+}
+
 WWHD_REPLACE(0x025E2E5C, void, draw_entry_dl, (void* model)) {
     if (!draw_model_ok(model)) {
         draw_guard_log(model);
         return;
     }
+    if (ghost_skips(model)) return;
     draw_entry_dl_original(model);
 }
 
@@ -406,6 +625,7 @@ WWHD_REPLACE(0x025E2DE0, void, draw_update_dl, (void* model, void* data)) {
         draw_guard_log(model);
         return;
     }
+    if (ghost_skips(model)) return;
     draw_update_dl_original(model, data);
 }
 
@@ -414,7 +634,9 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     draw_link = (u32)i_this;
     if (!puppet_is(i_this)) {
         int skin = skin_enter((u32)i_this);
+        ghost_drawing = puppet_local_ghost; /* the local Link is a ghost (death.h) */
         s32 result = puppet_draw_original(i_this);
+        ghost_restore();
         skin_leave(skin);
         draw_link = outer_link;
         return result;
@@ -424,16 +646,6 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     if (slot < 0 || !play) { /* not followed yet, or an orphan about to delete itself: not drawn */
         draw_link = outer_link;
         return 1;
-    }
-    /* a dead player's ghost (death.h): semi-transparent by very fast flicker creating the optical
-     * illusion of ~40% opacity. SDK J3DModel does not expose alpha modification, so this approximates
-     * the transparency effect by skipping render on a pattern. */
-    if (puppet_slots[slot].ghost) {
-        /* visible 40% of the time with a rapid flicker (every 5 steps): visible 2 / 5 */
-        if (((u32)wwhd_logic_step() % 5) > 1) {
-            draw_link = outer_link;
-            return 1;
-        }
     }
     volatile u32* list_p0 = (volatile u32*)(play + PLAY_OPA_LIST_P0);
     volatile u32* list_p1 = (volatile u32*)(play + PLAY_XLU_LIST_P1);
@@ -451,7 +663,9 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     volatile u32* camera = puppet_camera_status(play, i_this);
     u32 camera_saved = camera ? *camera : 0;
     if (camera) *camera = camera_saved & ~PUPPET_CAMERA_CLOSE;
+    ghost_drawing = puppet_slots[slot].ghost; /* a dead player's ghost: translucent */
     s32 result = puppet_draw_original(i_this);
+    ghost_restore();
     if (camera) *camera = camera_saved;
     puppet_drawing = -1;
     skin_leave(skin);

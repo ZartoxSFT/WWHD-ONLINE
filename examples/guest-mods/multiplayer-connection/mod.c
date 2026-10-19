@@ -86,6 +86,7 @@ typedef struct marker {
     u32 rgb;              /* primary tunic colour 0xRRGGBB */
     char label[MP_NAME_MAX + 1];
     u32 label_bytes;
+    int dead;             /* a ghost (death.h): the skull instead of the name */
 } marker;
 
 /* 1 MiB transport payload limit plus its VLQ length prefix. */
@@ -465,9 +466,18 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
                                          r->look.item, r->look.extras, r->look.skin);
         if (!view || screen_w <= 0.0f || screen_h <= 0.0f) continue;
 
-        f32 dx = r->display.pos[0] - local->current.pos.x;
-        f32 dy = r->display.pos[1] - local->current.pos.y;
-        f32 dz = r->display.pos[2] - local->current.pos.z;
+        /* the name follows the puppet itself (riding its ship, carried along), else the place */
+        f32 at[3] = {r->display.pos[0], r->display.pos[1], r->display.pos[2]};
+        puppet_slot* body = puppet_slot_for(r->uid, 0);
+        if (body && body->actor) {
+            const fopAc_ac_c* pa = (const fopAc_ac_c*)body->actor;
+            at[0] = pa->current.pos.x;
+            at[1] = pa->current.pos.y;
+            at[2] = pa->current.pos.z;
+        }
+        f32 dx = at[0] - local->current.pos.x;
+        f32 dy = at[1] - local->current.pos.y;
+        f32 dz = at[2] - local->current.pos.z;
         f32 distance2 = dx * dx + dy * dy + dz * dz;
         if (!(distance2 < NAME_HIDE_DISTANCE * NAME_HIDE_DISTANCE)) continue;
         f32 opacity = 1.0f;
@@ -476,9 +486,9 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
             opacity = (NAME_HIDE_DISTANCE - distance) / (NAME_HIDE_DISTANCE - NAME_FADE_START);
         }
 
-        project_in.x = r->display.pos[0];
-        project_in.y = r->display.pos[1] + MARKER_HEIGHT;
-        project_in.z = r->display.pos[2];
+        project_in.x = at[0];
+        project_in.y = at[1] + MARKER_HEIGHT;
+        project_in.z = at[2];
         wwhd_mDoLib_pos2camera((u32)&project_in, (u32)&project_out);
         f32 depth = -project_out.z; /* the GX view looks down -Z */
         if (depth < 20.0f) continue;
@@ -494,7 +504,8 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         m->x = x;
         m->y = y;
         m->scale = scale;
-        m->opacity = r->has_look && (r->look.death & MP_DEATH_GHOST) ? opacity * 0.35f : opacity; /* a ghost */
+        m->dead = r->has_look && (r->look.death & MP_DEATH_GHOST);
+        m->opacity = opacity;
         m->label_bytes = 0;
         if (r->has_look)
             while (m->label_bytes != MP_NAME_MAX && r->look.name[m->label_bytes]) {
@@ -819,6 +830,9 @@ static void draw_gamepad(u32 list) {
 
 /* Names above the remote players' heads (name_tag.h), baseline at the projected head point. With
  * the Pro Controller the MAP screen is on the TV: its sea chart instead (the game is in its menu). */
+static wwhd_hud_element marker_element;
+static void hv_draw(u32 list); /* heavy.h, included below */
+
 static void draw_markers(u32 list) {
     chart_view v;
     sv_draw(list); /* what the other players got, bottom left */
@@ -832,13 +846,26 @@ static void draw_markers(u32 list) {
     /* the names float over the game picture: not over the Start menu (sea_chart.h chart_menu_open:
      * items, collection, map and bag, on the TV or the GamePad) */
     dh_draw(list); /* the dead players' bodies, the revive prompt (death.h) */
+    hv_draw(list); /* the players lifting or pushing a heavy thing together (heavy.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
-    if (names_hidden || chart_menu_open()) return;
+    /* not during a cutscene or a dialogue (both are events: play's event running flag) */
+    const u8* event_play = wwhd_play_get();
+    if (names_hidden || chart_menu_open() || !event_play || event_play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const marker* m = &markers[i];
         if (!m->visible) continue;
+        u32 skull = m->dead ? sv_dead_icon() : 0;
+        if (skull) { /* a ghost: the skull (50 x 44), bottom at the name's baseline */
+            f32 h = 44.0f * m->scale * 1.3f, w = 50.0f * m->scale * 1.3f;
+            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+                                                .x = m->x - w * 0.5f, .y = m->y - h, .w = w, .h = h, .thickness = 1,
+                                                .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | (u32)(m->opacity * 255.0f),
+                                                .image = skull};
+            wwhd_hud_emit(list, &marker_element);
+            continue;
+        }
         name_draw(list, m->x, m->y, m->label, m->label_bytes, m->rgb, m->scale, m->opacity);
     }
 }
@@ -1048,12 +1075,12 @@ static void start(void) {
  * next to launcher.cfg (wwhd_file_*, flat names):
  *  - players.txt, written every MAP_PERIOD: "stage=", "rupees=", "step=", "directory=" (1: the
  *    server sends the player directory), "me=" then one "player=" per other player, each
- *    "id|x|z|heading|RRGGBB|name|stage|sea x|sea z|sea known" (x, z in that stage; the last place
+ *    "id|x|z|heading|RRGGBB|name|stage|sea x|sea z|sea known|dead" (x, z in that stage; the last place
  *    on the Great Sea for the chart; heading the s16 shape angle; the primary tunic colour; '|' and
  *    control characters of names as '?'). With the directory every player of the server is listed
  *    and the ids are the directory's; without it, the remote players of the area by actor uid. Then
  *    "teleport=id|result" for the last request (ok, loading, arrived, no_target, rupees, riding,
- *    busy, offline);
+ *    busy, offline, dead);
  *  - teleport.cfg, written by the launcher: "id=<number>" and "target=<uid>"; a new id is one
  *    request. The id found at the first read is not acted on (a request older than the game).
  * The teleport is the game's own respawn (decomp, verified): Link restarts at the save's restart
@@ -1267,6 +1294,7 @@ static void directory_send(const fopAc_ac_c* link, const u8* play) {
     e.pos[2] = link->current.pos.z;
     e.heading = link->shape_angle.y;
     e.flags = local_sea_known ? MP_DIR_SEA : 0;
+    if (dh_local_dead()) e.flags |= MP_DIR_DEAD;
     e.sea[0] = local_sea[0];
     e.sea[1] = local_sea[1];
     mp_writer body = mp_writer_make(payload, sizeof(payload));
@@ -1287,10 +1315,33 @@ static void directory_received(const mp_u8* body, mp_u32 length) {
             if (e->id == incoming_directory.self) continue;
             int known = 0;
             for (mp_u32 j = 0; j != directory.count && !known; ++j) known = directory.entry[j].id == e->id;
-            if (known) continue;
+            if (known) {
+                /* a player who died: alive in the last directory, dead in this one */
+                for (mp_u32 j = 0; j != directory.count; ++j)
+                    if (directory.entry[j].id == e->id && !(directory.entry[j].flags & MP_DIR_DEAD) &&
+                        (e->flags & MP_DIR_DEAD)) {
+                        sv_notice_died(e->name);
+                        wwhd_log("multiplayer: a player died:");
+                        wwhd_log(e->name[0] ? e->name : "(no name)");
+                    }
+                continue;
+            }
             sv_notice_joined(e->name, e->color);
             wwhd_log("multiplayer: a player joined the game:");
             wwhd_log(e->name[0] ? e->name : "(no name)");
+        }
+    }
+    /* a player who left: an id of the last directory missing from this one */
+    if (directory_valid) {
+        for (mp_u32 j = 0; j != directory.count; ++j) {
+            const mp_dir_entry* old = &directory.entry[j];
+            if (old->id == directory.self) continue;
+            int still = 0;
+            for (mp_u32 i = 0; i != incoming_directory.count && !still; ++i) still = incoming_directory.entry[i].id == old->id;
+            if (still) continue;
+            sv_notice_left(old->name, old->color);
+            wwhd_log("multiplayer: a player left the game:");
+            wwhd_log(old->name[0] ? old->name : "(no name)");
         }
     }
     directory = incoming_directory;
@@ -1344,6 +1395,7 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     const mp_dir_entry* e = directory_find(target);
     if (e) {
         if (e->id == directory.self || !e->stage[0] || e->room < 0) return "no_target";
+        if (e->flags & MP_DIR_DEAD) return "dead";
         /* on the Great Sea, or in an island's stage with its last place at sea: that square */
         int at_sea = e->stage[0] == 's' && e->stage[1] == 'e' && e->stage[2] == 'a' && !e->stage[3];
         int square = at_sea ? sea_square_of(e->pos[0], e->pos[2])
@@ -1363,6 +1415,7 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     for (int i = 0; i != MAX_REMOTES; ++i)
         if (remotes[i].active && remotes[i].has_transform && remotes[i].uid == target) r = &remotes[i];
     if (!r) return "no_target";
+    if (r->has_look && (r->look.death & (MP_DEATH_GHOST | MP_DEATH_DOWN))) return "dead";
     if (here[0] == 's' && here[1] == 'e' && here[2] == 'a' && !here[3]) {
         int square = sea_square_of(r->transform.pos[0], r->transform.pos[2]);
         if (square >= 0 && !sea_square_unlocked((u32)square)) return "locked";
@@ -1594,10 +1647,104 @@ static void map_put_entry(map_out* o, const char* key, const mp_dir_entry* e) {
     map_put_int(o, (s32)e->sea[0]);
     map_put(o, "|");
     map_put_int(o, (s32)e->sea[1]);
-    map_put(o, (e->flags & MP_DIR_SEA) ? "|1\n" : "|0\n");
+    map_put(o, (e->flags & MP_DIR_SEA) ? "|1" : "|0");
+    map_put(o, (e->flags & MP_DIR_DEAD) ? "|1\n" : "|0\n"); /* dead (launcher: the skull, no teleport) */
 }
 
 static void connect_read(void);            /* the launcher's "Connect to the server", below */
+
+/* ------------------------------------------------------------------ the launcher's Debug page
+ *
+ * debug.cfg, written by the launcher's Debug page: "id=<number>" (a new id is one request; the id
+ * found at the first read is not acted on) and any of "life=" (quarter hearts), "max_life="
+ * (quarter hearts, 4-80) and "rupees=". Each value is reached the game's own way, through what the
+ * meter adds at its next execute (d_meter_01.cpp, d_meter_02.cpp), so the HUD follows (a life
+ * written into the save alone leaves the meter's hearts, play.mItemNowLife, behind: death.h):
+ * dComIfG_play_c::mItemMaxLifeCount (play + 0x12A0 + 0x48BE, s16: the meter then fills the hearts),
+ * mItemLifeCount (+0x48A4, f32 quarter hearts, capped by the meter to the full hearts),
+ * mItemRupeeCount (+0x48A8, s32, as the teleport pays). The meter clears the pending life when it
+ * applies a new maximum: a life asked with a maximum is given at a later step. players.txt reports
+ * "life=", "max_life=" (and "rupees=", already there). */
+#define DEBUG_PLAY_MAX_LIFE (0x12A0 + 0x48BE)
+#define DEBUG_PLAY_LIFE (0x12A0 + 0x48A4)
+#define DEBUG_LIFE_MAX 80
+static char debug_text[256];
+static int debug_read_once;
+static u32 debug_last_id;
+static int debug_life_wanted = -1;   /* a life to give once the new maximum is applied */
+
+/* "key=number" in debug.cfg: 1 and the number when the key is there. */
+static int debug_cfg_value(const char* text, u32 size, const char* key, u32* value) {
+    u32 klen = 0;
+    while (key[klen]) ++klen;
+    for (u32 pos = 0; pos < size;) {
+        u32 end = pos;
+        while (end < size && text[end] != '\n') ++end;
+        if (end - pos > klen && text[pos + klen] == '=') {
+            u32 k = 0;
+            while (k != klen && text[pos + k] == key[k]) ++k;
+            if (k == klen && pos + klen + 1 < end && text[pos + klen + 1] >= '0' && text[pos + klen + 1] <= '9') {
+                u32 v = 0;
+                for (u32 i = pos + klen + 1; i < end && text[i] >= '0' && text[i] <= '9' && v < 100000u; ++i)
+                    v = v * 10 + (u32)(text[i] - '0');
+                *value = v;
+                return 1;
+            }
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+static void debug_give_life(u8* play, u32 life) {
+    u32 max = dComIfGs_player_status_a.max_life;
+    if (life > max) life = max;
+    *(volatile f32*)(play + DEBUG_PLAY_LIFE) = (f32)((s32)life - (s32)dComIfGs_player_status_a.life);
+    wwhd_log_int("multiplayer: debug: life (quarter hearts)", (int)life);
+}
+
+static void debug_step(u8* play) {
+    if (debug_life_wanted >= 0 && *(const volatile s16*)(play + DEBUG_PLAY_MAX_LIFE) == 0) {
+        debug_give_life(play, (u32)debug_life_wanted); /* the new maximum is in */
+        debug_life_wanted = -1;
+    }
+    s32 got = wwhd_file_read("debug.cfg", debug_text, sizeof(debug_text));
+    if (got < 0) {
+        debug_read_once = 1;
+        return;
+    }
+    u32 id = map_cfg_number(debug_text, (u32)got, "id");
+    if (!debug_read_once) {
+        debug_read_once = 1;
+        debug_last_id = id; /* older than this game: not acted on */
+        return;
+    }
+    if (!id || id == debug_last_id) return;
+    debug_last_id = id;
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) wwhd_log("multiplayer: debug: applied during an event");
+    u32 v;
+    int max_changed = 0;
+    if (debug_cfg_value(debug_text, (u32)got, "max_life", &v)) {
+        if (v < 4) v = 4;
+        if (v > DEBUG_LIFE_MAX) v = DEBUG_LIFE_MAX;
+        s32 delta = (s32)v - (s32)dComIfGs_player_status_a.max_life;
+        if (delta) {
+            *(volatile s16*)(play + DEBUG_PLAY_MAX_LIFE) = (s16)delta;
+            max_changed = 1;
+            wwhd_log_int("multiplayer: debug: max life (quarter hearts)", (int)v);
+        }
+    }
+    if (debug_cfg_value(debug_text, (u32)got, "life", &v)) {
+        if (v > DEBUG_LIFE_MAX) v = DEBUG_LIFE_MAX;
+        if (max_changed) debug_life_wanted = (int)v;
+        else debug_give_life(play, v);
+    }
+    if (debug_cfg_value(debug_text, (u32)got, "rupees", &v)) {
+        if (v > 9999) v = 9999;
+        *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) = (s32)v - (s32)map_rupees();
+        wwhd_log_int("multiplayer: debug: rupees", (int)v);
+    }
+}
 static const char* connection_state(void);
 
 static void map_step(void* link_actor, double dt) {
@@ -1647,6 +1794,7 @@ static void map_step(void* link_actor, double dt) {
         }
     }
     shop_read_once = 1;
+    debug_step(play);       /* the launcher's Debug page */
     connect_read(); /* the launcher's "Connect to the server" */
 
     map_out o = {map_text, 0, sizeof(map_text)};
@@ -1660,12 +1808,17 @@ static void map_step(void* link_actor, double dt) {
     me.pos[2] = link->current.pos.z;
     me.heading = link->shape_angle.y;
     me.flags = local_sea_known ? MP_DIR_SEA : 0;
+    if (dh_local_dead()) me.flags |= MP_DIR_DEAD;
     me.sea[0] = local_sea[0];
     me.sea[1] = local_sea[1];
     map_put(&o, "stage=");
     map_put_name(&o, me.stage, STAGE_NAME_BYTES);
     map_put(&o, "\nrupees=");
     map_put_uint(&o, map_rupees());
+    map_put(&o, "\nlife=");
+    map_put_uint(&o, dComIfGs_player_status_a.life);
+    map_put(&o, "\nmax_life=");
+    map_put_uint(&o, dComIfGs_player_status_a.max_life);
     map_put(&o, "\nstep=");
     map_put_uint(&o, (u32)wwhd_logic_step());
     map_put(&o, directory_valid ? "\ndirectory=1\n" : "\ndirectory=0\n");
@@ -1692,7 +1845,7 @@ static void map_step(void* link_actor, double dt) {
             e.pos[1] = r->transform.pos[1];
             e.pos[2] = r->transform.pos[2];
             e.heading = r->transform.rot[1];
-            e.flags = 0;
+            e.flags = (look.death & (MP_DEATH_GHOST | MP_DEATH_DOWN)) ? MP_DIR_DEAD : 0;
             e.sea[0] = e.sea[1] = 0.0f;
             map_put_entry(&o, "player=", &e);
         }
@@ -1868,6 +2021,8 @@ static void multiplayer_connection_step(void* link) {
     }
 }
 
+#include "heavy.h" /* heavy things take several players */
+
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
 
 /* daPy_Execute (0240EBB0): a puppet only runs its visual update; any other Link runs the game's
@@ -1886,5 +2041,6 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     skin_leave(skin);
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
+    hv_step(i_this, wwhd_logic_dt());
     return result;
 }

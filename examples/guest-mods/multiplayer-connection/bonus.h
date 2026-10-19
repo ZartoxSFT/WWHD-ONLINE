@@ -192,9 +192,11 @@ WWHD_HOOK(0x0259B698, bonus_magic_gauge, (u32 meter)) {
  * Found from hdParts_c::draw (026F8B54, this and viewport: runtime story_lyt_screen.cpp), the screen
  * whose tree has L_HeartAll_00. Each logic step the slots' matrices give the places; the textures are
  * decoded once (wwhd_hud_game_pixels), the heart's reds turned yellow and the meter's grey given a
- * yellow ramp, and drawn with HUD v2: the yellow hearts in the slots after the last heart container
- * (past the 20th, on to the right of the second row), the yellow meter as a second meter right after
- * the game's. */
+ * yellow ramp, and drawn with HUD v2: the yellow hearts in the slots right after the last heart the
+ * player has (the life the meter shows, play.mItemNowLife +0x5BAC, quarter hearts, d_meter_00.cpp:
+ * 7 hearts -> the 8th slot, 7 and a quarter or a half -> the 9th), over the empty containers and on
+ * past them (past the 20th, on to the right of the second row), the yellow meter as a second meter
+ * right after the game's. */
 
 #define BONUS_PANE_PARENT 0x0C
 #define BONUS_PANE_CHILDREN 0x14
@@ -203,6 +205,7 @@ WWHD_HOOK(0x0259B698, bonus_magic_gauge, (u32 meter)) {
 #define BONUS_PANE_ALPHA 0x45
 #define BONUS_PANE_MTX 0x48
 #define BONUS_PANE_NAME 0x80
+#define BONUS_PLAY_NOW_LIFE 0x5BAC /* dComIfG_play_c::mItemNowLife (play + 0x12A0 + 0x490C), u16 */
 #define BONUS_PICTURE_MATERIAL 0xF4
 #define BONUS_MATERIAL_TEXTURE 0x28
 #define BONUS_PARTS_LAYOUT 0x44
@@ -520,7 +523,10 @@ static void bonus_draw(u32 list) {
     }
     if (bonus_hearts) {
         f32 alpha = bonus_alpha(bonus_heart[0]);
-        u32 first = dComIfGs_player_status_a.max_life / 4u;
+        u32 first = dComIfGs_player_status_a.max_life / 4u; /* the heart containers */
+        u32 shown = *(const volatile u16*)(play + BONUS_PLAY_NOW_LIFE);
+        u32 start = (shown + 3u) / 4u; /* the first slot after the last (even partial) heart */
+        if (start > first) start = first;
         u32 count = (bonus_hearts + 3u) / 4u;
         f32 x0, y0, x1, y1, s;
         bonus_center(bonus_heart[0], &x0, &y0, &s);
@@ -542,7 +548,7 @@ static void bonus_draw(u32 list) {
         const volatile f32* heart_size = (const volatile f32*)(bonus_heart[0] + BONUS_PANE_SIZE);
         const volatile f32* base_size = (const volatile f32*)(bonus_base[0] + BONUS_PANE_SIZE);
         for (u32 i = 0; i != count; ++i) {
-            u32 slot = first + i, past = 0;
+            u32 slot = start + i, past = 0;
             if (slot >= BONUS_SLOTS) { /* past the 20th: on to the right of the last slot */
                 past = slot - (BONUS_SLOTS - 1u);
                 slot = BONUS_SLOTS - 1u;
@@ -561,8 +567,9 @@ static void bonus_draw(u32 list) {
                 bonus_emit(list, bonus_light_image, cx - lw * 0.5f, cy - lh * 0.5f, lw, lh, 1.0f, 0xFFFFFFu,
                            alpha * bonus_light_alpha);
             }
-            bonus_emit(list, bonus_base_image, cx - bw * 0.5f, cy - bh * 0.5f, bw, bh, 1.0f, 0xFFFFFFu,
-                       alpha * (200.0f / 255.0f));
+            if (start + i >= first) /* an empty container already shows the game's base */
+                bonus_emit(list, bonus_base_image, cx - bw * 0.5f, cy - bh * 0.5f, bw, bh, 1.0f, 0xFFFFFFu,
+                           alpha * (200.0f / 255.0f));
             bonus_emit_quarters(list, bonus_heart_image, cx - w * 0.5f, cy - h * 0.5f, w, h, quarters, alpha);
         }
     }

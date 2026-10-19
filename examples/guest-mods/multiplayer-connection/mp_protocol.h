@@ -617,8 +617,11 @@ typedef struct mp_ship_state {
  * u8 flags, bit 7 clear; with MP_DEATH_GHOST (dead, walking as a ghost until another player of the
  * stage revives it), then VLQ the player's directory id (where a revive is sent: CLIENT_PLAYER_REVIVE),
  * f32 x, y, z and u16 rotation y of its body. The Java server keeps and forwards it
- * (ActorPlayerSync.java death*). */
+ * (ActorPlayerSync.java death*). MP_DEATH_DOWN (no extra field): dead without a ghost, the game's
+ * own death and game over under way; such a player is not a survivor of its stage. The server
+ * forwards the flags byte as it is (DEATH_FLAGS mask), older clients only test MP_DEATH_GHOST. */
 #define MP_DEATH_GHOST 0x01
+#define MP_DEATH_DOWN 0x02
 #define MP_DEATH_FLAGS 0x7F
 
 typedef struct mp_player_look {
@@ -1736,12 +1739,16 @@ static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* mu
  *   string name, u16 colour (RGB565, primary tunic), string stage (dStage_startStage_c name),
  *   s16 start point, s8 start room, s8 start layer (how the player entered that stage: a point
  *   that exists, for a teleport there), s8 current room, f32 x, y, z, s16 heading, u8 flags,
- *   then with MP_DIR_SEA the last place on the Great Sea: f32 x, z.
+ *   then with MP_DIR_SEA the last place on the Great Sea: f32 x, z. MP_DIR_DEAD (no field): the
+ *   player is dead (a ghost, or the game's own death under way: death.h); one cannot teleport to
+ *   them. A reader before 0.2.71 refuses a directory holding that flag.
  * SERVER_PLAYER_DIRECTORY (the answer, WWClient.java): VLQ id of the receiver, VLQ count, then
  *   per player VLQ id and its entry. Ids are the server's, stable while the client is connected. */
 #define MP_DIR_MAX 24
 #define MP_DIR_STAGE 8
 #define MP_DIR_SEA 0x01 /* the last place on the Great Sea follows */
+#define MP_DIR_DEAD 0x02 /* dead: a ghost or dying */
+#define MP_DIR_FLAGS (MP_DIR_SEA | MP_DIR_DEAD)
 
 typedef struct mp_dir_entry {
     mp_u32 id;
@@ -1772,7 +1779,7 @@ static inline void mp_write_dir_entry(mp_writer* w, const mp_dir_entry* e) {
     mp_write_u8(w, (mp_u8)e->room);
     for (int i = 0; i != 3; ++i) mp_write_f32(w, e->pos[i]);
     mp_write_u16(w, (mp_u16)e->heading);
-    mp_write_u8(w, (mp_u8)(e->flags & MP_DIR_SEA));
+    mp_write_u8(w, (mp_u8)(e->flags & MP_DIR_FLAGS));
     if (e->flags & MP_DIR_SEA) {
         mp_write_f32(w, e->sea[0]);
         mp_write_f32(w, e->sea[1]);
@@ -1800,7 +1807,7 @@ static inline void mp_read_dir_entry(mp_reader* r, mp_dir_entry* e) {
     for (int i = 0; i != 3; ++i) e->pos[i] = mp_read_f32(r);
     e->heading = (mp_s16)mp_read_u16(r);
     e->flags = mp_read_u8(r);
-    if (e->flags & ~(mp_u32)MP_DIR_SEA) r->ok = 0;
+    if (e->flags & ~(mp_u32)MP_DIR_FLAGS) r->ok = 0;
     e->sea[0] = e->sea[1] = 0.0f;
     if (e->flags & MP_DIR_SEA) {
         e->sea[0] = mp_read_f32(r);
