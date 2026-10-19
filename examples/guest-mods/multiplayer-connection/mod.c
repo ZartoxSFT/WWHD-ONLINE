@@ -252,6 +252,23 @@ static u32 shop_notice_bytes;
 static int shop_notice_steps;
 static mp_directory directory; /* the server's player directory (launcher map section) */
 static int directory_valid;
+
+/* elite.h: a remote player's room, from the directory entry of the same name (the directory has no
+ * PlayerPuppet uid); 0 when unknown. */
+static int el_remote_room(const remote_player* r, s8* room) {
+    if (!directory_valid || !r->has_look || !r->look.name[0]) return 0;
+    for (mp_u32 i = 0; i != directory.count; ++i) {
+        const mp_dir_entry* e = &directory.entry[i];
+        if (e->id == directory.self) continue;
+        u32 k = 0;
+        while (k != MP_NAME_MAX && e->name[k] == r->look.name[k] && e->name[k]) ++k;
+        if (k == MP_NAME_MAX || e->name[k] == r->look.name[k]) {
+            *room = e->room;
+            return 1;
+        }
+    }
+    return 0;
+}
 #include "death.h"    /* no game over while another player of the stage lives */
 
 static void handle_frame(const unsigned char* item, u32 size) {
@@ -835,6 +852,8 @@ static void draw_gamepad(u32 list) {
 static wwhd_hud_element marker_element;
 static void hv_draw(u32 list); /* heavy.h, included below */
 static void pb_draw(u32 list); /* push_bot.h, included below */
+static void dl_draw(u32 list); /* door_lock.h, included below */
+static void gp_draw(u32 list); /* golden_pig.h, included below */
 
 static void draw_markers(u32 list) {
     chart_view v;
@@ -851,6 +870,8 @@ static void draw_markers(u32 list) {
     dh_draw(list); /* the dead players' bodies, the revive prompt (death.h) */
     hv_draw(list); /* the players lifting or pushing a heavy thing together (heavy.h) */
     pb_draw(list); /* the Debug page's bot (push_bot.h) */
+    dl_draw(list); /* the players a locked door waits for (door_lock.h) */
+    gp_draw(list); /* the Golden Pig on the HUD's D-pad (golden_pig.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
@@ -1434,6 +1455,25 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     return "loading";
 }
 
+/* The launcher's RESET THIS ROOM (debug.cfg reset_room=1): the room entered again as after a fall into
+ * the void, without the damage: dStage_restartRoom (025C3D68, d_stage_4.cpp: the current stage,
+ * start point -1, the save's restart room dSv_restart_c::mRestartRoom, then the restart param), with
+ * daPy_lk_c::startRestartRoom's mode 5 and event info 0xC9 (d_a_player_main_03.cpp). Link stands at
+ * his restart place (where he entered the room), the room's actors are made again. Not while riding
+ * the ship, during an event, a stage change or as a ghost. */
+static const char* room_reset_try(u8* play) {
+    u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
+    if (!save) return "no_save";
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_stage_wait) return "busy";
+    if (*(const volatile u32*)(play + PUPPET_PLAY_STATUS0) & PUPPET_STATUS0_RIDE) return "riding";
+    if (dh_local_dead()) return "dead";
+    s8 room = *(const volatile s8*)(save + SAVE_RESTART); /* mRestartRoom */
+    if (room < 0) return "no_room";
+    wwhd_dStage_restartRoom(((u32)(s32)room & 0x3Fu) | (TELEPORT_EVENT_INFO << 24), TELEPORT_MODE);
+    wwhd_log_int("multiplayer: room reset, restart room", (int)room);
+    return "ok";
+}
+
 /* After teleport_go: Link stands in the stage again (the reload done: at least TELEPORT_SETTLE
  * steps after the request, out of any event) -> "ok". */
 static void teleport_stage_step(const u8* play) {
@@ -1478,9 +1518,9 @@ static void teleport_stage_step(const u8* play) {
  * the same numbers, prices and icons: keep both in step.
  * Items from SHOP_UPGRADES on are the "Upgrades & Utilities", for oneself only (the target is not
  * read): yellow heart and yellow magic (bonus.h), 75 rupees each; the long hookshot (5 Blue Chu
- * Jelly, 5 Knight's Crests, 1000 rupees) and the golden pig (5 Golden Feathers, 100 rupees) are
- * shown by the launcher but not made yet ("soon", nothing paid). players.txt "bonus=" gives the
- * yellow quarter hearts, the yellow magic, and 1 when each is at its maximum.
+ * Jelly, 5 Knight's Crests, 1000 rupees: bonus.h, kept for good) and the golden pig (5 Golden Feathers,
+ * 100 rupees, one at a time: golden_pig.h) since 0.3.3. players.txt "bonus=" gives the
+ * yellow quarter hearts, the yellow magic, 1 when each is at its maximum, the Long Hookshot, a pig.
  * Utilities made in front of Link, staying there (summoned actors, synchronised like the creatures):
  *  - a bomb flower, 5 bombs and 20 rupees: "BFlower" (process 0x128, the game's name table read in
  *    the EU binary), parameters 0xFF0F, the most common in the game's stages (ACTR, local
@@ -1498,6 +1538,7 @@ static void teleport_stage_step(const u8* play) {
 #define SAVE_BEAST_NUM (0x20 + 0x9C)
 #define SHOP_DISTANCE 250.0f
 #define SHOP_QUEUE 4
+#define SHOP_TWICE_STEPS 30 /* a summon delivered twice (shop_received): about a second */
 #define SHOP_NOTICE_STEPS 120
 
 typedef struct shop_creature {
@@ -1526,6 +1567,13 @@ enum { SHOP_YELLOW_HEART = SHOP_UPGRADES, SHOP_YELLOW_MAGIC, SHOP_LONG_HOOKSHOT,
        SHOP_BEAM, SHOP_ITEMS_END };
 
 #define SHOP_BOMB_FLOWER_RUPEES 20
+#define SHOP_HOOKSHOT_RUPEES 1000
+#define SHOP_HOOKSHOT_SPOILS 5
+#define SHOP_SPOIL_BLUE_JELLY 6   /* the bag's spoils (header above): 6 Blue Chu Jelly */
+#define SHOP_SPOIL_KNIGHT_CREST 3 /* 3 Knight's Crest */
+#define SHOP_SPOIL_GOLDEN_FEATHER 2 /* 2 Golden Feather */
+#define SHOP_PIG_RUPEES 100
+#define SHOP_PIG_SPOILS 5
 #define SHOP_BOMB_FLOWER_BOMBS 5
 #define SHOP_BEAM_RUPEES 30
 #define SAVE_BOMBS (0x20 + 0x6A)
@@ -1604,7 +1652,31 @@ static const char* shop_try_utility(const fopAc_ac_c* link, u8* play, u32 item) 
 
 /* An upgrade for oneself: checked, then paid once given. */
 static const char* shop_try_upgrade(const fopAc_ac_c* link, u8* play, u32 item) {
-    if (item == SHOP_LONG_HOOKSHOT || item == SHOP_GOLDEN_PIG) return "soon";
+    if (item == SHOP_LONG_HOOKSHOT) { /* 5 Blue Chu Jelly, 5 Knight's Crests, 1000 rupees (LauncherUI) */
+        s32 have = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+        if (have < SHOP_HOOKSHOT_RUPEES || shop_spoils(play, SHOP_SPOIL_BLUE_JELLY) < SHOP_HOOKSHOT_SPOILS ||
+            shop_spoils(play, SHOP_SPOIL_KNIGHT_CREST) < SHOP_HOOKSHOT_SPOILS)
+            return "price";
+        const char* result = bonus_buy_hookshot();
+        if (result[0] != 'o') return result;
+        *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) -= SHOP_HOOKSHOT_RUPEES;
+        volatile s16* spoils = (volatile s16*)(play + PLAY_ITEM_BEAST_COUNTS);
+        spoils[SHOP_SPOIL_BLUE_JELLY] = (s16)(spoils[SHOP_SPOIL_BLUE_JELLY] - SHOP_HOOKSHOT_SPOILS);
+        spoils[SHOP_SPOIL_KNIGHT_CREST] = (s16)(spoils[SHOP_SPOIL_KNIGHT_CREST] - SHOP_HOOKSHOT_SPOILS);
+        wwhd_log("multiplayer: shop: Long Hookshot bought");
+        return "ok";
+    }
+    if (item == SHOP_GOLDEN_PIG) { /* 5 Golden Feathers, 100 rupees (LauncherUI); golden_pig.h */
+        s32 have = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+        if (have < SHOP_PIG_RUPEES || shop_spoils(play, SHOP_SPOIL_GOLDEN_FEATHER) < SHOP_PIG_SPOILS) return "price";
+        const char* result = bonus_buy_pig();
+        if (result[0] != 'o') return result;
+        *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) -= SHOP_PIG_RUPEES;
+        volatile s16* spoils = (volatile s16*)(play + PLAY_ITEM_BEAST_COUNTS);
+        spoils[SHOP_SPOIL_GOLDEN_FEATHER] = (s16)(spoils[SHOP_SPOIL_GOLDEN_FEATHER] - SHOP_PIG_SPOILS);
+        wwhd_log("multiplayer: shop: Golden Pig bought");
+        return "ok";
+    }
     if (item == SHOP_BOMB_FLOWER || item == SHOP_BEAM) return shop_try_utility(link, play, item);
     if (item != SHOP_YELLOW_HEART && item != SHOP_YELLOW_MAGIC) return "unknown";
     s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
@@ -1656,6 +1728,26 @@ static void shop_received(const mp_u8* body, mp_u32 length) {
         return;
     }
     if (g.creature >= SHOP_CREATURES || shop_gift_count == SHOP_QUEUE) return;
+    /* 0.2.99: the same summon (creature and buyer) again within SHOP_TWICE_STEPS is one request
+     * delivered twice (seen: every creature sent was made twice by its target, two "creature
+     * summoned" in a row, the buyer's game and launcher sending it once); the launcher lets no new
+     * purchase go before the last one is answered, so a real second one is never that close */
+    static unsigned long long last_step;
+    static shop_gift last;
+    static int has_last;
+    unsigned long long now = wwhd_logic_step();
+    int same = has_last && last.creature == g.creature && now - last_step < SHOP_TWICE_STEPS;
+    for (u32 k = 0; same && k != MP_NAME_MAX + 1; ++k) {
+        if (last.buyer[k] != g.buyer[k]) same = 0;
+        if (!g.buyer[k]) break;
+    }
+    last = g;
+    last_step = now;
+    has_last = 1;
+    if (same) {
+        wwhd_log("multiplayer: shop: the same summon received twice, made once");
+        return;
+    }
     shop_gifts[shop_gift_count++] = g;
 }
 
@@ -1800,6 +1892,26 @@ static void debug_step(u8* play) {
         wwhd_log_int("multiplayer: debug: rupees", (int)v);
     }
     if (debug_cfg_value(debug_text, (u32)got, "bot", &v)) pb_request(v);
+    if (debug_cfg_value(debug_text, (u32)got, "reset_room", &v) && v) { /* the launcher's RESET THIS ROOM */
+        const char* r = room_reset_try(play);
+        if (r[0] != 'o') wwhd_log("multiplayer: room not reset:");
+        if (r[0] != 'o') wwhd_log(r);
+    }
+    /* the elemental pack's glow along its arrows (bonus.h bonus_glow_execute) */
+    if (debug_cfg_value(debug_text, (u32)got, "glow_yaw", &v)) bonus_glow_yaw_deg = v % 360u;
+    if (debug_cfg_value(debug_text, (u32)got, "glow_pitch", &v)) bonus_glow_pitch_deg = v > 90 ? 90 : v;
+    if (debug_cfg_value(debug_text, (u32)got, "glow_len", &v)) bonus_glow_len = v > 300 ? 300 : v;
+    if (debug_cfg_value(debug_text, (u32)got, "glow_base", &v)) bonus_glow_base = v > 200 ? 200 : v;
+    if (debug_cfg_value(debug_text, (u32)got, "glow_fwd", &v)) bonus_glow_fwd = (s32)(v > 200 ? 200 : v) - 100;
+    if (debug_cfg_value(debug_text, (u32)got, "glow_side", &v)) bonus_glow_side = (s32)(v > 200 ? 200 : v) - 100;
+    if (debug_cfg_value(debug_text, (u32)got, "yellow_heart", &v)) { /* per thousand loots (bonus.h) */
+        bonus_drop_heart = v > 1000 ? 1000 : v;
+        wwhd_log_int("multiplayer: debug: yellow heart chance per thousand loots", (int)bonus_drop_heart);
+    }
+    if (debug_cfg_value(debug_text, (u32)got, "yellow_magic", &v)) {
+        bonus_drop_magic = v > 1000 ? 1000 : v;
+        wwhd_log_int("multiplayer: debug: yellow magic chance per thousand loots", (int)bonus_drop_magic);
+    }
 }
 static const char* connection_state(void);
 
@@ -1926,7 +2038,9 @@ static void map_step(void* link_actor, double dt) {
     map_put(&o, ",");
     map_put_uint(&o, bonus_magic);
     map_put(&o, bonus_heart_full() ? ",1" : ",0");
-    map_put(&o, bonus_magic_full() ? ",1\n" : ",0\n");
+    map_put(&o, bonus_magic_full() ? ",1" : ",0");
+    map_put(&o, bonus_long_hookshot ? ",1" : ",0"); /* the Long Hookshot (LauncherUI: owned) */
+    map_put(&o, bonus_pigs ? ",1\n" : ",0\n");      /* a Golden Pig to call */
     if (shop_result_id) {
         map_put(&o, "shop=");
         map_put_uint(&o, shop_result_id);
@@ -2081,6 +2195,8 @@ static void multiplayer_connection_step(void* link) {
 
 #include "push_bot.h" /* the Debug page's bot at a crate */
 #include "heavy.h" /* heavy things take several players */
+#include "door_lock.h" /* locked doors wait for the whole room */
+#include "golden_pig.h" /* the shop's Golden Pig, called with the D-pad's down */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
 
@@ -2097,10 +2213,13 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     dh_note_link(i_this);    /* its death and revive (death.h) */
     el_link_step(i_this); /* an electric elite's shock, given in Link's own execute (elite.h) */
     s32 result = daPy_Execute_original(i_this);
+    el_link_after(i_this); /* a cursed elite near: the hit's invincibility cut (elite.h) */
     skin_leave(skin);
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());
     pb_step(i_this);
+    dl_step(wwhd_logic_dt());
+    gp_step(i_this, wwhd_logic_dt());
     return result;
 }

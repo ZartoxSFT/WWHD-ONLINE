@@ -64,6 +64,7 @@ static mp_transform dh_body;
 static mp_u32 dh_target = MP_NO_ID;   /* the remote body the local Link stands by */
 static double dh_progress, dh_cooldown;
 static int dh_prompt;                 /* a body in reach: the prompt shows, A does nothing else */
+static int dh_cursed;                 /* 0.3.1: a cursed elite lives in the room: no revive (elite.h) */
 static char dh_target_name[MP_NAME_MAX + 1];
 static char dh_notice[48];
 static u32 dh_notice_bytes;
@@ -221,6 +222,36 @@ WWHD_REPLACE(0x023FE6B8, s32, dh_lava, (void* self)) {
     return dh_lava_original(self);
 }
 
+/* 0.3.7: a ghost opens the Start menu. The HD UI's state machine checks, before it opens a menu,
+ * player 0's mNoResetFlg1 & 0x200, no event (play + 0x5292), play + 0x5CD8 & 0x10, and the life the
+ * meter shows (play.mItemNowLife, play + 0x5BAC) not 0 (disassembled in the EU cking.rpx: functions
+ * USA 026A716C and 0270D70C (0.3.7 hooked 4 bytes after their mflr: the runtime refused the mod, "hook target 026A7874 is not a game function"), not named in the decomp; the only UI reads of + 0x5BAC). A ghost's life
+ * is 0: no menu. While those two run for a ghost, the shown life is 1, put back when they return
+ * (entry and return hooks: their arguments are left alone). Everything else still sees 0 (no exit,
+ * no event order: checkFallCode, dEvt_control_c::order). */
+#define DH_PLAY_NOW_LIFE 0x5BAC
+static int dh_menu_lifted;
+static u16 dh_menu_life;
+static void dh_menu_enter(void) {
+    u8* play = wwhd_play_get();
+    if (!dh_ghost || dh_menu_lifted || !play) return;
+    volatile u16* life = (volatile u16*)(play + DH_PLAY_NOW_LIFE);
+    dh_menu_life = *life;
+    if (dh_menu_life) return;
+    *life = 1;
+    dh_menu_lifted = 1;
+}
+static void dh_menu_leave(void) {
+    u8* play = wwhd_play_get();
+    if (!dh_menu_lifted) return;
+    dh_menu_lifted = 0;
+    if (play) *(volatile u16*)(play + DH_PLAY_NOW_LIFE) = dh_menu_life;
+}
+WWHD_HOOK(0x026A716C, dh_menu_gate_a, (void)) { dh_menu_enter(); }
+WWHD_HOOK_RETURN(0x026A716C, dh_menu_gate_a_end, (void)) { dh_menu_leave(); }
+WWHD_HOOK(0x0270D70C, dh_menu_gate_b, (void)) { dh_menu_enter(); }
+WWHD_HOOK_RETURN(0x0270D70C, dh_menu_gate_b_end, (void)) { dh_menu_leave(); }
+
 WWHD_REPLACE(0x025C38B8, s32, dh_exit, (u32 ground, f32 speed, s32 type, s32 room)) {
     if (dh_ghost && !dh_dying) return 0;
     return dh_exit_original(ground, speed, type, room);
@@ -363,6 +394,7 @@ static void dh_revive_step(const fopAc_ac_c* link, double dt) {
         dh_progress = 0;
     }
     dh_prompt = 1;
+    dh_cursed = el_cursed_in_room(link->current.roomNo);
     u32 n = 0;
     while (n != MP_NAME_MAX && best->look.name[n]) {
         dh_target_name[n] = best->look.name[n];
@@ -372,7 +404,7 @@ static void dh_revive_step(const fopAc_ac_c* link, double dt) {
     dh_target_name[n] = 0;
     wwhd_input_state input;
     wwhd_input_read(&input);
-    if (dh_cooldown > 0 || !(input.buttons & DH_BUTTON_A)) {
+    if (dh_cursed || dh_cooldown > 0 || !(input.buttons & DH_BUTTON_A)) {
         dh_progress -= dt * 2.0;
         if (dh_progress < 0) dh_progress = 0;
         return;
@@ -485,7 +517,10 @@ static void dh_draw(u32 list) {
     if (dh_ghost)
         name_draw(list, HUD_WIDTH * 0.5f, 90.0f, dh_dying ? "Game over" : "You are a ghost: wait for a friend", dh_dying ? 9 : 34,
                   0xC8D8FFu, 0.55f, 1.0f);
-    if (dh_prompt) {
+    if (dh_prompt && dh_cursed) {
+        static const char cursed[] = "A cursed elite is in the room: no revive";
+        name_draw(list, HUD_WIDTH * 0.5f, 560.0f, cursed, sizeof(cursed) - 1, 0xC890FFu, 0.5f, 1.0f);
+    } else if (dh_prompt) {
         u32 n = dh_text(text, sizeof(text), "Hold A to revive ", dh_target_name);
         name_draw(list, HUD_WIDTH * 0.5f, 560.0f, text, n, 0xFFFFFFu, 0.5f, 1.0f);
         f32 w = 300.0f, k = (f32)(dh_progress / DH_REVIVE_SECONDS);

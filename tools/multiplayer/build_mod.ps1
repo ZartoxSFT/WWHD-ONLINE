@@ -118,6 +118,18 @@ if (-not $NoCheck) {
             }
         }
         Write-Host "check  : no function that differs between builds"
+        # every hook target must be a function of the recompiled game ("hook target ... is not a game
+        # function", 0.3.7: a hook 4 bytes after a function's mflr); the runtime names each one
+        # f_<ADDRESS> in its executable
+        $exe = Join-Path $BuildDir "wwhd.exe"
+        if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $dist "data\bin\wwhd.exe" }
+        if (Test-Path -LiteralPath $exe) {
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+            $unknown = @($r.hooks | ForEach-Object { $_.target } | Sort-Object -Unique |
+                Where-Object { -not $text.Contains("f_" + ([Convert]::ToUInt32($_, 16)).ToString("X8")) })
+            if ($unknown.Count) { throw ("mod.elf hooks what is not a game function of " + $exe + ": " + ($unknown -join ", ")) }
+            Write-Host "check  : every hook target is a game function"
+        }
     } else {
         Write-Host "check  : skipped (no Python)"
     }

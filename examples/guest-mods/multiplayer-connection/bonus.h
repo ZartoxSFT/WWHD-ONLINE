@@ -33,6 +33,8 @@
 
 static int bonus_loaded;
 static u32 bonus_hearts, bonus_magic;
+static u32 bonus_long_hookshot; /* the shop's Long Hookshot, bought for good (0.3.3) */
+static u32 bonus_pigs;          /* the shop's Golden Pig: one to call (golden_pig.h), 0.3.3 */
 static u32 bonus_arrows[4];       /* elemental arrows kept: [1] fire, [2] ice, [3] light ([0] unused) */
 /* The local Link, noted by its execute (mod.c multiplayer_daPy_Execute, not a puppet): actor_sync.h
  * as_link is only set while connected with the actors synchronised (0.2.55 drew nothing without). */
@@ -77,6 +79,8 @@ static void bonus_load(void) {
     bonus_arrows[1] = bonus_number(bonus_text, (u32)got, "fire");
     bonus_arrows[2] = bonus_number(bonus_text, (u32)got, "ice");
     bonus_arrows[3] = bonus_number(bonus_text, (u32)got, "light");
+    bonus_long_hookshot = bonus_number(bonus_text, (u32)got, "hookshot") != 0;
+    bonus_pigs = bonus_number(bonus_text, (u32)got, "pig") != 0;
     for (int t = 1; t != 4; ++t)
         if (bonus_arrows[t] > 99) bonus_arrows[t] = 99;
 }
@@ -97,6 +101,8 @@ static void bonus_write(void) {
     bonus_put(bonus_text, &n, "fire=", bonus_arrows[1]);
     bonus_put(bonus_text, &n, "ice=", bonus_arrows[2]);
     bonus_put(bonus_text, &n, "light=", bonus_arrows[3]);
+    bonus_put(bonus_text, &n, "hookshot=", bonus_long_hookshot);
+    bonus_put(bonus_text, &n, "pig=", bonus_pigs);
     wwhd_file_write("bonus.cfg", bonus_text, n);
     bonus_dirty = 0;
     bonus_written_step = wwhd_logic_step();
@@ -160,11 +166,123 @@ static void bonus_arrows_step(void) {
     bonus_dirty = 1;
 }
 
+/* 0.2.99: no elemental type with no arrows of it. The bow cycles normal -> fire -> ice -> light -> normal
+ * (d_a_arrow.cpp): daArrow_c::changeArrowType (0205584C, the nocked arrow: a new arrow of the next
+ * type, the old one deleted) and changeArrowTypeNotReady (0205578C, no argument, l_keepType alone);
+ * the game checks only the magic (dSv_player_status_a_c::mMagic +0x14, d_save.h) and the arrows
+ * owned (mItems[12]): with the stock at 0 the type was taken anyway (switched while drawing the bow,
+ * and shot). The types whose stock is 0 are skipped (the normal arrows always taken). */
+#define BONUS_SAVE_MAGIC 0x14
+#define BONUS_ARROW_TYPE 0x71D /* daArrow_c::mArrowType (d_a_arrow.h, verified) */
+WWHD_GAME_ORIGINAL(0x0205584C, u32, bonus_change_arrow_original, (void* self));
+WWHD_GAME_ORIGINAL(0x0205578C, void, bonus_change_arrow_not_ready_original, (void));
+
+static u32 bonus_magic_now(void) {
+    u32 save = bonus_save_addr();
+    return save ? *(const volatile u8*)(save + WWHD_OFFSET_save_info + BONUS_SAVE_MAGIC) : 0;
+}
+
+/* The game's next type from t (changeArrowType's rules). */
+static u32 bonus_arrow_next(u32 t) {
+    u32 magic = bonus_magic_now();
+    if (t == 0 || t == 1) return magic == 0 || !bonus_arrow_owned(1) ? 0 : t + 1;
+    if (t == 2) return magic < 2 || !bonus_arrow_owned(3) ? 0 : 3;
+    return 0;
+}
+
+/* Arrows of an elemental type now (the save holds the shown type's count). */
+static u32 bonus_arrow_stock(u32 t) {
+    if (t == bonus_arrow_shown) {
+        u32 save = bonus_save_addr();
+        return save ? *(const volatile u8*)(save + BONUS_SAVE_ARROWS) : 0;
+    }
+    return bonus_arrows[t & 3];
+}
+
+/* The next type after t that has arrows (the normal ones at worst). */
+static u32 bonus_arrow_target(u32 t) {
+    u32 next = t;
+    for (int k = 0; k != 4; ++k) {
+        next = bonus_arrow_next(next);
+        if (next == 0 || bonus_arrow_stock(next)) return next;
+    }
+    return 0;
+}
+
+WWHD_REPLACE(0x0205584C, u32, bonus_change_arrow, (void* self)) {
+    if (!self) return bonus_change_arrow_original(self);
+    volatile u8* type = (volatile u8*)self + BONUS_ARROW_TYPE;
+    u32 from = *type, to = bonus_arrow_target(from);
+    if (from > 3 || bonus_arrow_next(from) == to) return bonus_change_arrow_original(self);
+    if (to == from) return (u32)self; /* nothing else to take: the arrow stays */
+    /* the game makes the type after mArrowType: it is given the one before the wanted type */
+    u32 before = to == 0 ? 3 : to - 1;
+    *type = (u8)before;
+    u32 ret = bonus_change_arrow_original(self);
+    if (ret == (u32)self) { /* not made: as it was */
+        *type = (u8)from;
+        WWHD_GAME_DATA(BONUS_KEEP_TYPE, u8) = (u8)from;
+    }
+    return ret;
+}
+
+WWHD_REPLACE(0x0205578C, void, bonus_change_arrow_not_ready, (void)) {
+    volatile u8* keep = &WWHD_GAME_DATA(BONUS_KEEP_TYPE, u8);
+    for (int k = 0; k != 4; ++k) {
+        u32 before = *keep;
+        bonus_change_arrow_not_ready_original();
+        if (*keep == before || *keep == 0 || *keep > 3 || bonus_arrow_stock(*keep)) return;
+    }
+}
+
+/* The Long Hookshot (0.3.3): its reach doubled. daHookshot_c's reach is one float constant,
+ * 1500.0f (d_a_hookshot.cpp: the sight's end 1500 units ahead, 021789B4, and the shot's return at
+ * 1500 units from the root, 02178DDC), read by lfs from 0x10011724 at both places and nowhere else
+ * (the EU cking.rpx's code scanned for lis/lfs to it; the same address in the USA build, below the
+ * first data step of tools/recomp/builds/eu.json). The recompiler translates lfs to a load from
+ * guest memory (tools/recomp/ppc2c.py), so the constant is written: 3000.0f with the upgrade. It is
+ * only written when it holds one of the two values (another build: left alone, logged). */
+#define BONUS_HOOKSHOT_REACH 0x10011724
+#define BONUS_HOOKSHOT_GAME 1500.0f
+#define BONUS_HOOKSHOT_LONG 3000.0f
+static void bonus_hookshot_step(void) {
+    volatile f32* reach = &WWHD_GAME_DATA(BONUS_HOOKSHOT_REACH, f32);
+    f32 want = bonus_long_hookshot ? BONUS_HOOKSHOT_LONG : BONUS_HOOKSHOT_GAME, now = *reach;
+    if (now == want) return;
+    if (now != BONUS_HOOKSHOT_GAME && now != BONUS_HOOKSHOT_LONG) {
+        static int logged;
+        if (!logged++) wwhd_log("multiplayer: the hookshot's reach is not at its known place, left alone");
+        return;
+    }
+    *reach = want;
+    wwhd_log_int("multiplayer: hookshot reach (units)", (int)want);
+}
+
+/* Purchase (shop_try_upgrade): "ok" once the price is checked by the caller, "full" when owned. */
+static const char* bonus_buy_hookshot(void) {
+    bonus_load();
+    if (bonus_long_hookshot) return "full";
+    bonus_long_hookshot = 1;
+    bonus_write();
+    bonus_hookshot_step();
+    return "ok";
+}
+
+/* Purchase of the Golden Pig: one at a time ("full" while one waits to be called). */
+static const char* bonus_buy_pig(void) {
+    bonus_load();
+    if (bonus_pigs) return "full";
+    bonus_pigs = 1;
+    bonus_write();
+    return "ok";
+}
+
 /* The local Link's step (mod.c map_step): what was spent, written now and then. */
 static void bonus_fx_step(void);
 static void bonus_tick(void) {
     bonus_load();
     bonus_arrows_step();
+    bonus_hookshot_step();
     bonus_fx_step();
     if (bonus_dirty && wwhd_logic_step() - bonus_written_step >= BONUS_WRITE_STEPS) bonus_write();
 }
@@ -221,6 +339,12 @@ static int bonus_magic_full(void) { bonus_load(); return bonus_magic + BONUS_MAG
 #define BONUS_DROP_HEART 4          /* per thousand loots that dropped something (0.2.83: 3 % of
                                      * every call: cutting grass gave many) */
 #define BONUS_DROP_MAGIC 4
+/* the yellow heart's chance per thousand loots: BONUS_DROP_HEART, changed for tests from the
+ * launcher's Debug page (debug.cfg yellow_heart=, 0-1000; back to the default at the next start) */
+static u32 bonus_drop_heart = BONUS_DROP_HEART;
+/* the yellow magic jar's, the same way (debug.cfg yellow_magic=); rolled apart from the heart's
+ * since 0.2.96, so each setting is its own chance (before, magic took the next values of one roll) */
+static u32 bonus_drop_magic = BONUS_DROP_MAGIC;
 #define BONUS_ITEM_HEART 0x00
 #define BONUS_ITEM_MAGIC 0x09
 #define BONUS_YELLOW_ITEMS 16
@@ -245,13 +369,19 @@ static int bonus_drop_depth;
 static int bonus_picking;           /* a yellow item is being picked up */
 static u32 bonus_rng = 0x6D2B79F5u;
 
-static u32 bonus_random(void) { /* xorshift32, stirred by the step */
-    bonus_rng ^= (u32)wwhd_logic_step() * 2654435761u;
-    bonus_rng ^= bonus_rng << 13;
-    bonus_rng ^= bonus_rng >> 17;
-    bonus_rng ^= bonus_rng << 5;
-    return bonus_rng;
+/* splitmix32 (0.2.97): a counter stepped by the golden ratio, stirred by the logic step, through a
+ * full mix. Before, a xorshift32 whose state was xored with the step at every call: its successive
+ * draws were not independent, and 15 elemental packs in a log were 11 fire, 4 light, no ice. */
+static u32 bonus_random(void) {
+    bonus_rng += 0x9E3779B9u + (u32)wwhd_logic_step();
+    u32 z = bonus_rng;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    return z ^ (z >> 16);
 }
+
+/* 0 .. n-1 from the high bits (even chances for a small n) */
+static u32 bonus_random_below(u32 n) { return (u32)(((unsigned long long)bonus_random() * n) >> 32); }
 
 static int bonus_yellow_item(const void* actor) {
     if (!actor) return 0;
@@ -306,11 +436,16 @@ static void bonus_loot_item(u32 id, u32 item) {
     if (item < BONUS_ITEM_ARROW_10 || item > BONUS_ITEM_ARROW_30 || !bonus_arrow_owned(1)) return;
     if (bonus_random() % 100u >= BONUS_ELEMENTAL_PERCENT) return;
     u32 types = bonus_arrow_owned(3) ? 3u : 2u;
-    u32 type = 1u + bonus_random() % types;
+    u32 type = 1u + bonus_random_below(types); /* a third each with the light arrows, else half */
     bonus_elemental_ids[bonus_elemental_next] = id;
     bonus_elemental_types[bonus_elemental_next] = (u8)type;
     bonus_elemental_next = (bonus_elemental_next + 1) % BONUS_YELLOW_ITEMS;
+    static u32 dropped[4];
+    ++dropped[type];
     wwhd_log_int("multiplayer: elemental arrows dropped, type", (int)type);
+    wwhd_log_int("multiplayer:   fire so far", (int)dropped[1]);
+    wwhd_log_int("multiplayer:   ice so far", (int)dropped[2]);
+    wwhd_log_int("multiplayer:   light so far", (int)dropped[3]);
 }
 
 /* Its element on an elemental pack (0.2.90): the glow of a nocked elemental arrow, the actor
@@ -337,9 +472,22 @@ WWHD_GAME_ORIGINAL(0x02057930, s32, bonus_glow_execute_original, (void* self));
 WWHD_GAME_FUNC(0x025E742C, s32, bonus_anm_play, (u32 anm));
 WWHD_GAME_FUNC(0x0205777C, void, bonus_glow_point_light, (void* self));
 WWHD_GAME_FUNC(0x02056EB8, void, bonus_glow_set_mtx, (void* self));
+/* 0.2.92: the glow at the tip of the pack's arrows, along them. The pack's models turn with the
+ * item's current.angle.y plus mHDRotY (+0x76C, s16; daItem_c::set_mtx / set_mtx_base,
+ * d_a_item.cpp, d_a_item.h). Where the tip is in the model is not in the decomp: estimated from a
+ * screenshot (arrows leaning about 40 degrees), tunable live from the launcher's Debug page
+ * (debug.cfg glow_yaw= degrees added to the pack's turn, glow_pitch= degrees above the ground,
+ * glow_len= units from the pack's place to the tip, glow_base= height of the arrows' foot). */
+#define BONUS_ITEM_HD_ROT_Y 0x76C
+static u32 bonus_glow_yaw_deg = 270, bonus_glow_pitch_deg = 40, bonus_glow_len = 40, bonus_glow_base = 15; /* set in game (0.2.95) */
+/* 0.2.94: the glow's model only (its mesh is drawn away from its origin, seen in game), from the tip
+ * where the particles and the light stay: along the arrows (forward +) and to their side (right +),
+ * in units; debug.cfg glow_fwd= and glow_side= carry the value + 100 (the file takes no sign). */
+static s32 bonus_glow_fwd = 0, bonus_glow_side = 0;
 typedef struct bonus_glow {
     u32 item, effect;             /* the pack's and the glow's process ids */
     cXyz pos;                     /* the pack, at its last draw */
+    s16 turn;                     /* the pack's models' turn (angle.y + mHDRotY) */
     unsigned long long seen;
     u8 used;
 } bonus_glow;
@@ -380,8 +528,11 @@ static void bonus_elemental_fx(const void* actor) {
     g->pos.x = a->current.pos.x;
     g->pos.y = a->current.pos.y;
     g->pos.z = a->current.pos.z;
+    g->turn = (s16)(a->current.angle.y + *(const volatile s16*)((const u8*)actor + BONUS_ITEM_HD_ROT_Y));
     g->seen = wwhd_logic_step();
 }
+
+static s16 bonus_deg(u32 deg) { return (s16)(u16)((deg % 360u) * 65536u / 360u); }
 
 /* daArrow_Lighteff_c::_execute: a glow of this mod follows its pack. */
 WWHD_REPLACE(0x02057930, s32, bonus_glow_execute, (void* self)) {
@@ -402,15 +553,31 @@ WWHD_REPLACE(0x02057930, s32, bonus_glow_execute, (void* self)) {
     if (*brk_frame < end) *brk_frame = *brk_frame + 1.0f > end ? end : *brk_frame + 1.0f;
     *(volatile f32*)(e + BONUS_GLOW_BRK + 4) = *brk_frame;
     fopAc_ac_c* a = (fopAc_ac_c*)self;
-    a->current.pos.x = g->pos.x;
-    a->current.pos.y = g->pos.y - BONUS_GLOW_LIFT + 20.0f; /* the tip 20 units above the pack */
-    a->current.pos.z = g->pos.z;
-    a->current.angle.x = -0x4000;
-    a->current.angle.y = 0;
+    /* along the arrows: yaw = the pack's turn + glow_yaw, pitch glow_pitch above the ground (angle.x
+     * negative is up: -0x4000 stood the glow upright); the tip glow_len from the arrows' foot */
+    s16 yaw = (s16)(g->turn + bonus_deg(bonus_glow_yaw_deg));
+    s16 pitch = bonus_deg(bonus_glow_pitch_deg > 90 ? 90 : bonus_glow_pitch_deg);
+    f32 up = as_sin(pitch), flat = as_sin((s16)(pitch + 0x4000));
+    f32 dir[3] = {flat * as_sin(yaw), up, flat * as_sin((s16)(yaw + 0x4000))};
+    f32 tip[3];
+    for (int k = 0; k != 3; ++k) tip[k] = (&g->pos.x)[k] + dir[k] * (f32)bonus_glow_len;
+    tip[1] += (f32)bonus_glow_base;
+    /* the model's origin: the tip moved along the arrows and to their right (horizontal, a quarter
+     * turn clockwise from the yaw seen from above); set_mtx without a parent puts the model
+     * BONUS_GLOW_LIFT units along its facing */
+    f32 right[3] = {-as_sin((s16)(yaw + 0x4000)), 0.0f, as_sin(yaw)};
+    f32 origin[3];
+    for (int k = 0; k != 3; ++k)
+        origin[k] = tip[k] + dir[k] * (f32)bonus_glow_fwd + right[k] * (f32)bonus_glow_side;
+    a->current.pos.x = origin[0] - dir[0] * BONUS_GLOW_LIFT;
+    a->current.pos.y = origin[1] - dir[1] * BONUS_GLOW_LIFT;
+    a->current.pos.z = origin[2] - dir[2] * BONUS_GLOW_LIFT;
+    a->current.angle.x = (s16)-pitch;
+    a->current.angle.y = yaw;
     volatile f32* top = (volatile f32*)(e + BONUS_GLOW_TOP);
-    top[0] = g->pos.x;
-    top[1] = g->pos.y + 20.0f;
-    top[2] = g->pos.z;
+    top[0] = tip[0];
+    top[1] = tip[1];
+    top[2] = tip[2];
     bonus_glow_point_light(self);
     bonus_glow_set_mtx(self);
     return 1;
@@ -429,11 +596,10 @@ static u32 bonus_actor_id(u32 actor) { return actor ? *(const volatile u32*)(act
 static void bonus_yellow_roll(u32 pos, u32 room) {
     if (!pos || !bonus_save_ready()) return;
     bonus_load();
-    u32 roll = bonus_random() % 1000u, item;
-    if (roll < BONUS_DROP_HEART && !bonus_heart_full()) {
+    u32 item;
+    if (bonus_random() % 1000u < bonus_drop_heart && !bonus_heart_full()) {
         item = BONUS_ITEM_HEART;
-    } else if (roll >= BONUS_DROP_HEART && roll < BONUS_DROP_HEART + BONUS_DROP_MAGIC && bonus_max_magic() &&
-               !bonus_magic_full()) {
+    } else if (bonus_random() % 1000u < bonus_drop_magic && bonus_max_magic() && !bonus_magic_full()) {
         item = BONUS_ITEM_MAGIC;
     } else {
         return;
@@ -691,10 +857,33 @@ static int bonus_save_ready(void);
 static void bonus_shrink_current(void);
 static void bonus_discover(u32 self, u32 root, u32 all);
 
+/* 0.3.5: the D-pad of the HUD's top left (Shortcut_00.szs of the game's 2D pack, read offline: the
+ * picture CrossKeyBtn_00, 58 x 58, the Wind Waker's icon P_Baton_00 above it at (8, 39), 0.6 of 118;
+ * nothing on its down arrow), found in the screen that has it while a Golden Pig waits to be called;
+ * golden_pig.h draws the pig there. The step it was last drawn: no icon over a HUD not drawn. */
+static u32 bonus_cross, bonus_cross_parts, bonus_cross_root;
+static unsigned long long bonus_cross_step;
+
+static void bonus_cross_draw(u32 self) {
+    u32 root = bonus_root_of(self);
+    if (!root) return;
+    if (!bonus_ptr(bonus_cross) || !bonus_name_is(bonus_cross, "CrossKeyBtn_00") ||
+        bonus_root_of(bonus_cross_parts) != bonus_cross_root) {
+        u32 cross = bonus_find(root, "CrossKeyBtn_00", 7);
+        if (!cross) return;
+        bonus_cross = cross;
+        bonus_cross_parts = self;
+        bonus_cross_root = root;
+        wwhd_log("multiplayer: golden pig: the HUD's D-pad found");
+    }
+    if (self == bonus_cross_parts) bonus_cross_step = wwhd_logic_step();
+}
+
 /* hdParts_c::draw (026F8B54): the HUD screen, found once (again after a state load); before the game
  * draws it, its big heart is made small while yellow hearts follow (bonus_shrink_current). */
 WWHD_HOOK(0x026F8B54, bonus_parts_draw, (u32 self, u32 viewport)) {
     (void)viewport;
+    if (bonus_pigs) bonus_cross_draw(self);
     if (!bonus_hearts && !bonus_magic && bonus_light_hidden < 0) return;
     if (!bonus_layout_valid() && (bonus_hearts || bonus_magic)) {
         u32 root = bonus_root_of(self);

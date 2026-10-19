@@ -96,6 +96,37 @@ static const u8 el_ability_odds[4] = {20, 30, 25, 25};
  * elite; 0x80 | faculty << 5 | colour (0..19) an elite. */
 #define EL_TAG_REGULAR 0x01u
 #define EL_TAG_ELITE 0x80u
+/* 0.3.1: two variants of the elites, with everything of an elite: since 0.3.3, an elite (elite
+ * chance percent of the regular enemies) is a variant EL_VARIANT_PERCENT times in a hundred, half a
+ * cursed one, half a joker (0.3.1-0.3.2: each half as likely as an elite). Their draws, in tags an
+ * older mod ignores (neither 0x01 nor 0x80):
+ *  - the cursed one: 0x20 | faculty << 3 | colour 0..7. A skull above it (assets/dead.png). Within
+ *    50 m of a living cursed one, the local Link's invincibility after a hit (daPy_py_c::
+ *    mDamageWaitTimer +0x3B0, set to 0x1E or 0x14 when hit, counted down each step:
+ *    d_a_player_main_03.cpp changeDamageProc) is three times shorter (el_link_after). Its hits on
+ *    the local Link curse him as a Blue Bubble does: daPyRFlg0_POISON_CURSE (0x100000) in
+ *    mResetFlg0 (+0x3C0, d_a_player.h), which Link's execute turns into setDamageCurseEmitter
+ *    (023DCB54: the curse, 200 frames; d_a_player_main_04.cpp, _01.cpp). While one lives in a room,
+ *    nobody there revives a friend (death.h el_cursed_in_room);
+ *  - the joker: 0x40 | faculty << 4 | target 0..14 (15: none). An eye above it (assets/eye.png),
+ *    six times an enemy's health (twice an elite's). Its owner picks a living player of its room at
+ *    random every EL_JOKER_SECONDS (at once when the target dies or leaves the room); the target is
+ *    sent as its place in the area's players sorted by PlayerPuppet uid (the local one and the
+ *    remote ones: the same list in every game). It takes the colour of the palette nearest to its
+ *    target's tunic. Only its target hurts it: a hit (cc_at_check 025192A8, d_cc_uty.cpp) from
+ *    anyone or anything else gives the health back (el_at_check). */
+#define EL_VARIANT_PERCENT 15u  /* of the elites: a cursed one or a joker */
+#define EL_TAG_CURSED 0x20u
+#define EL_TAG_JOKER 0x40u
+#define EL_JOKER_NONE 15u
+enum { EL_KIND_ELITE = 0, EL_KIND_CURSED = 1, EL_KIND_JOKER = 2 };
+#define EL_JOKER_HEALTH 6.0f
+#define EL_JOKER_SECONDS 10.0
+#define EL_CURSE_RANGE 5000.0f  /* 50 m */
+#define EL_CURSE_IFRAMES 3      /* the invincibility is divided by this */
+#define EL_PY_DAMAGE_WAIT 0x3B0 /* daPy_py_c::mDamageWaitTimer (s16) */
+#define EL_PY_RESET_FLG0 0x3C0  /* daPy_py_c::mResetFlg0 */
+#define EL_PY_POISON_CURSE 0x00100000u
 #define EL_SUMMON_RANGE 1200.0f
 #define EL_SUMMON_MIN 12.0
 #define EL_SUMMON_SPREAD 10.0
@@ -149,6 +180,9 @@ typedef struct el_actor {
     double ability_clock; /* seconds to its next bomb, summon or shock */
     double spark_clock;
     u8 crown_visible;
+    u8 kind;              /* EL_KIND_*, for an elite */
+    mp_u32 joker_target;  /* a joker: its target's PlayerPuppet uid (MP_NO_ID: none) */
+    double joker_clock;   /* a joker's owner: seconds to its next target */
     s8 base_health;
     f32 applied;          /* the health factor in its health now */
     double bomb_clock;
@@ -195,7 +229,8 @@ static int el_players(void) {
 
 static f32 el_health_factor(const el_actor* e) {
     f32 f = el_scaling() ? 1.0f + EL_HEALTH_STEP * (f32)(el_players() - 1) : 1.0f;
-    return e->elite ? f * EL_ELITE_HEALTH : f;
+    if (!e->elite) return f;
+    return f * (e->kind == EL_KIND_JOKER ? EL_JOKER_HEALTH : EL_ELITE_HEALTH);
 }
 
 static f32 el_damage_factor(const el_actor* e) {
@@ -246,6 +281,12 @@ static void el_note_create(void* actor, u32 prm) {
     el_random_state ^= h ^ (u32)wwhd_logic_step() * 2654435761u;
     e->summoned = block[AS_PRM_COPY] == AS_SUMMON;
     e->elite = !e->summoned && el_random() % 100u < as_session->elite_chance;
+    /* per 200 elites: EL_VARIANT_PERCENT cursed ones and as many jokers */
+    u32 kind_roll = el_random() % 200u;
+    e->kind = !e->elite || kind_roll >= 2u * EL_VARIANT_PERCENT ? EL_KIND_ELITE
+            : kind_roll < EL_VARIANT_PERCENT                    ? EL_KIND_CURSED
+                                                                : EL_KIND_JOKER;
+    e->joker_target = MP_NO_ID;
     u32 roll = el_random() % 100u, sum = 0;
     e->ability = EL_ABILITY_NONE;
     for (u8 k = 0; k != 4; ++k) {
@@ -255,7 +296,7 @@ static void el_note_create(void* actor, u32 prm) {
             break;
         }
     }
-    e->seed = (u8)(el_random() % EC_PALETTE);
+    e->seed = (u8)(el_random() % (e->kind == EL_KIND_CURSED ? 8u : EC_PALETTE));
     e->applied = 1.0f;
     e->owned = 1;
     e->ability_clock = 3.0 + (double)el_random01() * 4.0;
@@ -263,7 +304,8 @@ static void el_note_create(void* actor, u32 prm) {
     if (e->elite) {
         static u32 logged;
         if (logged++ < 8) {
-            wwhd_log("multiplayer: elite enemy:");
+            wwhd_log(e->kind == EL_KIND_CURSED ? "multiplayer: cursed elite enemy:"
+                     : e->kind == EL_KIND_JOKER ? "multiplayer: joker elite enemy:" : "multiplayer: elite enemy:");
             wwhd_log(name);
         }
     }
@@ -271,11 +313,71 @@ static void el_note_create(void* actor, u32 prm) {
 
 static void el_round_health(fopAc_ac_c* a, f32 ratio);
 
+/* ---- the area's players, the same list in every game (a joker's target is a place in it) ---- */
+
+/* The area's players by PlayerPuppet uid, ascending: the local one and the active remote ones. */
+static u32 el_area_players(mp_u32* out) {
+    u32 n = 0;
+    if (local_uid != MP_NO_ID) out[n++] = local_uid;
+    for (int i = 0; i != MAX_REMOTES; ++i)
+        if (remotes[i].active && n != MAX_REMOTES + 1) out[n++] = remotes[i].uid;
+    for (u32 i = 1; i < n; ++i) /* insertion sort */
+        for (u32 k = i; k && out[k - 1] > out[k]; --k) {
+            mp_u32 t = out[k];
+            out[k] = out[k - 1];
+            out[k - 1] = t;
+        }
+    return n;
+}
+
+static u32 el_player_index(mp_u32 uid) {
+    mp_u32 list[MAX_REMOTES + 1];
+    u32 n = el_area_players(list);
+    for (u32 i = 0; i != n && i != EL_JOKER_NONE; ++i)
+        if (list[i] == uid) return i;
+    return EL_JOKER_NONE;
+}
+
+static mp_u32 el_player_at(u32 index) {
+    mp_u32 list[MAX_REMOTES + 1];
+    u32 n = el_area_players(list);
+    return index < n ? list[index] : MP_NO_ID;
+}
+
+/* A player's tunic colour (RGB565, ActorPlayerSync colors[0]); the default tunic when unknown. */
+static u32 el_player_rgb(mp_u32 uid) {
+    u32 c = TUNIC_DEFAULT_PRIMARY;
+    if (uid == local_uid) c = local_look.colors[0];
+    for (int i = 0; i != MAX_REMOTES; ++i)
+        if (remotes[i].active && remotes[i].uid == uid && remotes[i].has_look) c = remotes[i].look.colors[0];
+    u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, b = c & 31u;
+    return ((r * 255u / 31u) << 16) | ((g * 255u / 63u) << 8) | (b * 255u / 31u);
+}
+
+/* The palette colour nearest to a player's tunic: a joker's colour. */
+static u8 el_player_seed(mp_u32 uid) {
+    u32 rgb = el_player_rgb(uid), best = 0, best_d = ~0u;
+    for (u32 k = 0; k != EC_PALETTE; ++k) {
+        s32 dr = (s32)((ec_palette[k] >> 16) & 0xFF) - (s32)((rgb >> 16) & 0xFF);
+        s32 dg = (s32)((ec_palette[k] >> 8) & 0xFF) - (s32)((rgb >> 8) & 0xFF);
+        s32 db = (s32)(ec_palette[k] & 0xFF) - (s32)(rgb & 0xFF);
+        u32 d = (u32)(dr * dr + dg * dg + db * db);
+        if (d < best_d) {
+            best_d = d;
+            best = k;
+        }
+    }
+    return (u8)best;
+}
+
 /* What the owner sends with the health (actor_sync.h as_read_values): 0 for no draw. */
 static u8 el_tag_of(const void* actor) {
     const el_actor* e = el_find(actor);
     if (!e) return 0;
     if (!e->elite) return (u8)EL_TAG_REGULAR;
+    if (e->kind == EL_KIND_CURSED) return (u8)(EL_TAG_CURSED | ((u32)e->ability << 3) | (e->seed & 7u));
+    if (e->kind == EL_KIND_JOKER)
+        return (u8)(EL_TAG_JOKER | ((u32)e->ability << 4) | el_player_index(e->joker_target));
     return (u8)(EL_TAG_ELITE | ((u32)e->ability << 5) | e->seed);
 }
 
@@ -283,14 +385,27 @@ static u8 el_tag_of(const void* actor) {
  * is applied): the health is rescaled at once to the new factor. */
 static void el_adopt(void* actor, u8 tag) {
     el_actor* e = el_find(actor);
-    if (!e || (tag != EL_TAG_REGULAR && !(tag & EL_TAG_ELITE))) return;
-    u8 elite = (tag & EL_TAG_ELITE) != 0;
-    u8 ability = elite ? (u8)((tag >> 5) & 3u) : e->ability;
-    u8 seed = elite ? (u8)((tag & 0x1Fu) % EC_PALETTE) : e->seed;
-    if (elite == e->elite && ability == e->ability && seed == e->seed) return;
+    if (!e || (tag != EL_TAG_REGULAR && !(tag & (EL_TAG_ELITE | EL_TAG_JOKER | EL_TAG_CURSED)))) return;
+    u8 elite = tag != EL_TAG_REGULAR;
+    u8 kind = (tag & EL_TAG_ELITE) ? EL_KIND_ELITE : (tag & EL_TAG_JOKER) ? EL_KIND_JOKER : EL_KIND_CURSED;
+    u8 ability = e->ability, seed = e->seed;
+    if (tag & EL_TAG_ELITE) {
+        ability = (u8)((tag >> 5) & 3u);
+        seed = (u8)((tag & 0x1Fu) % EC_PALETTE);
+    } else if (tag & EL_TAG_JOKER) {
+        ability = (u8)((tag >> 4) & 3u);
+        e->joker_target = (tag & 0x0Fu) == EL_JOKER_NONE ? MP_NO_ID : el_player_at(tag & 0x0Fu);
+        seed = el_player_seed(e->joker_target); /* the target's colour, as the owner shows it */
+    } else if (elite) {
+        ability = (u8)((tag >> 3) & 3u);
+        seed = (u8)(tag & 7u);
+    }
+    if (!elite) kind = e->kind;
+    if (elite == e->elite && kind == e->kind && ability == e->ability && seed == e->seed) return;
     fopAc_ac_c* a = (fopAc_ac_c*)actor;
-    if (elite != e->elite) {
+    if (elite != e->elite || kind != e->kind) {
         e->elite = elite;
+        e->kind = kind;
         if (e->based && a->health > 0) {
             f32 want = el_health_factor(e);
             el_round_health(a, want / e->applied);
@@ -510,6 +625,159 @@ static void el_faculty(el_actor* e, const fopAc_ac_c* a, double dt) {
     }
 }
 
+/* ---------------------------------------------------------------- the cursed ones and the jokers */
+
+static int el_remote_room(const remote_player* r, s8* room); /* mod.c: from the directory, 0 unknown */
+static int dh_local_dead(void);                               /* death.h */
+
+static int el_alive_variant(const el_actor* e, u8 kind) {
+    if (!e->used || !e->elite || e->kind != kind || e->exploded) return 0;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)e->actor;
+    return *(const volatile u32*)((const u8*)a + AS_PC_ID) == e->pcid && a->health > 0;
+}
+
+/* A living cursed one within range of pos. */
+static int el_cursed_near(const f32* pos, f32 range) {
+    if (!el_count) return 0;
+    for (u32 i = 0; i != EL_MAX; ++i) {
+        const el_actor* e = &el_actors[i];
+        if (!el_alive_variant(e, EL_KIND_CURSED)) continue;
+        const fopAc_ac_c* a = (const fopAc_ac_c*)e->actor;
+        f32 dx = a->current.pos.x - pos[0], dy = a->current.pos.y - pos[1], dz = a->current.pos.z - pos[2];
+        if (dx * dx + dy * dy + dz * dz <= range * range) return 1;
+    }
+    return 0;
+}
+
+/* A living cursed one in that room (death.h: no revive there). */
+static int el_cursed_in_room(s8 room) {
+    if (!el_count) return 0;
+    for (u32 i = 0; i != EL_MAX; ++i)
+        if (el_alive_variant(&el_actors[i], EL_KIND_CURSED) && ((const fopAc_ac_c*)el_actors[i].actor)->current.roomNo == room)
+            return 1;
+    return 0;
+}
+
+/* The local Link's execute done (mod.c): a hit's invincibility, newly given, is cut near a cursed one. */
+static s16 el_wait_seen;
+static void el_link_after(void* link) {
+    if (!link) return;
+    volatile s16* wait = (volatile s16*)((u8*)link + EL_PY_DAMAGE_WAIT);
+    s16 now = *wait;
+    if (now > el_wait_seen) {
+        const fopAc_ac_c* a = (const fopAc_ac_c*)link;
+        f32 pos[3] = {a->current.pos.x, a->current.pos.y, a->current.pos.z};
+        if (el_cursed_near(pos, EL_CURSE_RANGE)) {
+            now = (s16)((now + EL_CURSE_IFRAMES - 1) / EL_CURSE_IFRAMES);
+            *wait = now;
+            static u32 logged;
+            if (logged++ < 3) wwhd_log_int("multiplayer: a cursed elite near: invincibility cut to (steps)", now);
+        }
+    }
+    el_wait_seen = now;
+}
+
+/* A player of the area, living, in that room (a remote one whose room is unknown: in it). */
+static int el_player_in_room(mp_u32 uid, s8 room) {
+    if (uid == MP_NO_ID) return 0;
+    if (uid == local_uid) {
+        const fopAc_ac_c* link = (const fopAc_ac_c*)as_link;
+        return link && !dh_local_dead() && link->current.roomNo == room;
+    }
+    for (int i = 0; i != MAX_REMOTES; ++i) {
+        const remote_player* r = &remotes[i];
+        if (!r->active || r->uid != uid) continue;
+        if (r->has_look && (r->look.death & (MP_DEATH_GHOST | MP_DEATH_DOWN))) return 0;
+        s8 at;
+        return !el_remote_room(r, &at) || at == room;
+    }
+    return 0;
+}
+
+/* The joker's owner: a new target among the living players of its room every EL_JOKER_SECONDS, at
+ * once when the target is no longer one of them; the colour follows the target. */
+static void el_joker_step(el_actor* e, const fopAc_ac_c* a, double dt) {
+    if (e->kind != EL_KIND_JOKER) return;
+    if (e->owned) {
+        e->joker_clock -= dt;
+        int valid = el_player_in_room(e->joker_target, a->current.roomNo);
+        if (!valid || e->joker_clock <= 0) {
+            mp_u32 list[MAX_REMOTES + 1], pick[MAX_REMOTES + 1];
+            u32 n = el_area_players(list), m = 0;
+            for (u32 i = 0; i != n && i != EL_JOKER_NONE; ++i)
+                if (el_player_in_room(list[i], a->current.roomNo)) pick[m++] = list[i];
+            if (m) {
+                mp_u32 before = e->joker_target;
+                e->joker_target = pick[el_random() % m];
+                e->joker_clock = EL_JOKER_SECONDS;
+                if (e->joker_target != before) {
+                    static u32 logged;
+                    if (logged++ < 6) wwhd_log_int("multiplayer: a joker elite targets the player (uid)", (int)e->joker_target);
+                }
+            } else {
+                e->joker_clock = 1.0; /* nobody in its room: kept, tried again soon */
+            }
+        }
+    }
+    e->seed = el_player_seed(e->joker_target);
+}
+
+/* The player behind a hit on a joker: a strike replayed for another player (actor_sync.h as_replay:
+ * the mod's own collider, its player noted on the target's slot), the local Link, a remote Link's
+ * puppet, a weapon (the local Link's, or a copy of another player's); MP_NO_ID for anything else. */
+static mp_u32 el_hitter(u32 target, u32 obj, u32 attacker) {
+    if (obj && obj == (u32)as_ghost) {
+        const as_slot* s = as_find((const void*)target);
+        return s ? s->replay_player : MP_NO_ID;
+    }
+    if (!attacker) return MP_NO_ID;
+    if (attacker == as_link) return local_uid;
+    int ps = puppet_slot_of_actor(attacker);
+    if (ps >= 0) return puppet_slots[ps].uid;
+    const as_slot* w = as_find((const void*)attacker);
+    if (w && w->kind == AS_KIND_SPAWNED && w->cls == AS_CLS_WEAPON) return w->replica ? w->creator : local_uid;
+    return MP_NO_ID;
+}
+
+/* 0.3.5: a joker takes no hit at all but its target's (actor_sync.h as_hit, cCcSState::
+ * SetAtTgCommonHitInf 0200CFA8, d_c_cc_s.cpp: the hit is not set on either collider, so the joker
+ * neither reacts nor loses health, the weapon goes through). The player of the hit: the strike being
+ * replayed (as_replay_player_now), else the attacking collider's actor (el_hitter). */
+static int el_joker_refuses(u32 target, u32 at) {
+    if (!target || !el_count) return 0;
+    const el_actor* e = el_find((const void*)target);
+    if (!e || !e->elite || e->kind != EL_KIND_JOKER) return 0;
+    mp_u32 who = as_replay_player_now != MP_NO_ID ? as_replay_player_now : el_hitter(target, at, as_collider_actor(at));
+    if (who != MP_NO_ID && who == e->joker_target) return 0;
+    static u32 logged;
+    if (logged++ < 4) wwhd_log("multiplayer: a joker elite let a hit not from its target pass through");
+    return 1;
+}
+
+/* cc_at_check (025192A8, d_cc_uty.cpp: target, CcAtInfo {mpObj +0, mpActor +4, mDamage +8, mbDead +9}):
+ * the regular enemies take their hits there. On a joker, a hit not from its target is given back. */
+#define EL_AT_OBJ 0x00
+#define EL_AT_ACTOR 0x04
+#define EL_AT_DAMAGE 0x08
+#define EL_AT_DEAD 0x09
+WWHD_GAME_ORIGINAL(0x025192A8, u32, el_at_check_original, (u32 target, u32 at));
+WWHD_REPLACE(0x025192A8, u32, el_at_check, (u32 target, u32 at)) {
+    el_actor* e = target && at && el_count ? el_find((const void*)target) : 0;
+    if (!e || !e->elite || e->kind != EL_KIND_JOKER) return el_at_check_original(target, at);
+    fopAc_ac_c* t = (fopAc_ac_c*)target;
+    s8 health = t->health;
+    u32 obj = *(const volatile u32*)(at + EL_AT_OBJ);
+    u32 ret = el_at_check_original(target, at);
+    mp_u32 who = el_hitter(target, obj, *(const volatile u32*)(at + EL_AT_ACTOR));
+    if (who != MP_NO_ID && who == e->joker_target) return ret;
+    t->health = health;
+    *(volatile u8*)(at + EL_AT_DAMAGE) = 0;
+    *(volatile u8*)(at + EL_AT_DEAD) = 0;
+    static u32 logged;
+    if (logged++ < 4) wwhd_log("multiplayer: a joker elite ignored a hit not from its target");
+    return ret;
+}
+
 /* ---------------------------------------------------------------- the actor's execute */
 
 static el_actor* el_execute_begin(void* actor) {
@@ -552,6 +820,7 @@ static void el_execute_end(el_actor* e) {
     as_slot* slot = as_find((const void*)e->actor);
     e->owned = !slot || !as_follows_owner(slot);
     el_faculty(e, a, dt);
+    el_joker_step(e, a, dt);
 }
 
 /* fopAc_Delete: the entry, found before the deletion (el_find), and the health it had then. */
@@ -581,7 +850,13 @@ WWHD_REPLACE(0x02518670, void, el_plus_dmg, (u32 self, u32 at, u32 tg, u32 at_st
     el_plus_dmg_original(self, at, tg, at_stts, tg_stts);
     u8 after = *dmg;
     if (after <= before || !attacker || ((const fopAc_ac_c*)attacker)->group != EL_GROUP_ENEMY) return;
-    f32 f = el_damage_factor(el_find((const void*)attacker));
+    const el_actor* hitter = el_find((const void*)attacker);
+    if (hitter && hitter->elite && hitter->kind == EL_KIND_CURSED) { /* a Blue Bubble's curse */
+        *(volatile u32*)(as_link + EL_PY_RESET_FLG0) |= EL_PY_POISON_CURSE;
+        static u32 logged;
+        if (logged++ < 3) wwhd_log("multiplayer: a cursed elite cursed Link");
+    }
+    f32 f = el_damage_factor(hitter);
     if (f <= 1.0f) return;
     u32 scaled = (u32)((f32)after * f + 0.5f);
     if (scaled > 255u) scaled = 255u;
@@ -839,12 +1114,17 @@ static el_fail el_fails[EL_FAILS];
 static u32 el_fail_next;
 static unsigned long long el_build_step = ~0ull;
 
+/* 0.3.4: the shop's Golden Pig is painted first: a set not drawn in this step makes room for it, and a
+ * failure does not wait (with elites in sight the arena stayed full and the pig kept its pink). */
+static int el_paint_priority;
+
 /* The longest unused set, if unused for EL_SET_IDLE steps (never one drawn lately). */
 static el_set* el_idle_set(unsigned long long step, const el_set* keep) {
     el_set* oldest = 0;
+    unsigned long long idle = el_paint_priority ? 1 : EL_SET_IDLE;
     for (u32 i = 0; i != EL_SETS; ++i) {
         el_set* o = &el_sets[i];
-        if (o == keep || !o->used || step - o->last_step < EL_SET_IDLE) continue;
+        if (o == keep || !o->used || step - o->last_step < idle) continue;
         if (!oldest || o->last_step < oldest->last_step) oldest = o;
     }
     return oldest;
@@ -867,7 +1147,7 @@ static el_set* el_set_for(u32 model_data, u8 seed) {
         if (!o->used && !s) s = o;
     }
     if (el_build_step == step) return 0;
-    for (u32 i = 0; i != EL_FAILS; ++i)
+    for (u32 i = 0; i != EL_FAILS && !el_paint_priority; ++i)
         if (el_fails[i].model_data == model_data && el_fails[i].seed == seed && step - el_fails[i].step < EL_FAIL_STEPS)
             return 0;
     if (!s) {
@@ -1090,6 +1370,13 @@ WWHD_HOOK(0x025E2BF4, el_draw_model_begin, (u32 model, u32 supplied)) {
     if (!el_drawing || !model) return;
     u32 model_data = tunic_ld32(model + EL_MODEL_DATA);
     el_set* s = el_set_for(model_data, el_drawing->seed);
+    if (el_paint_priority) {
+        static u32 logged;
+        if (logged++ < 4) {
+            wwhd_log_int(s ? "multiplayer: golden pig: gold textures in its model" : "multiplayer: golden pig: no colour set now",
+                         s ? (int)s->count : 0);
+        }
+    }
     if (!s) return;
     u32 count, res;
     u32 table = el_table(model_data, &count, &res);
@@ -1126,6 +1413,7 @@ WWHD_HOOK_RETURN(0x025E2BF4, el_draw_model_end, (u32 model, u32 supplied)) {
 static int bonus_yellow_item(const void* actor); /* bonus.h: a yellow heart or magic on the ground */
 static u32 bonus_elemental_of(const void* actor); /* bonus.h: an elemental arrow pack, its type */
 static void bonus_elemental_fx(const void* actor); /* bonus.h: its element's particles */
+static int gp_is_golden(const void* actor);         /* golden_pig.h: the shop's Golden Pig */
 #define EL_YELLOW_SEED 2 /* ec_palette's gold */
 static const u8 el_elemental_seeds[4] = {0, 0 /* fire: crimson */, 7 /* ice: azure */, 16 /* light: white */};
 static el_actor el_yellow_paint; /* the colours of the elites' recolouring, nothing else of an elite */
@@ -1136,7 +1424,8 @@ static el_actor* el_draw_begin(void* actor) {
     el_growing = el_drawing != 0;
     u32 elemental = el_drawing ? 0 : bonus_elemental_of(actor);
     if (elemental) bonus_elemental_fx(actor);
-    if (!el_drawing && (elemental || bonus_yellow_item(actor))) {
+    el_paint_priority = !el_drawing && gp_is_golden(actor);
+    if (!el_drawing && (elemental || bonus_yellow_item(actor) || el_paint_priority)) {
         el_yellow_paint.elite = 1;
         el_yellow_paint.seed = elemental ? el_elemental_seeds[elemental & 3] : EL_YELLOW_SEED;
         el_drawing = &el_yellow_paint; /* recoloured in gold (el_draw_model_begin), not bigger */
@@ -1147,6 +1436,7 @@ static el_actor* el_draw_begin(void* actor) {
 
 static void el_draw_end(void) {
     el_drawing = 0;
+    el_paint_priority = 0;
     el_growing = 0;
 }
 
@@ -1184,7 +1474,7 @@ WWHD_HOOK_RETURN(0x027F4D5C, el_model_calc, (u32 model)) {
 
 /* ---------------------------------------------------------------- crowns */
 
-static u32 el_crown_texture;
+static u32 el_crown_texture, el_skull_texture, el_eye_texture;
 static unsigned long long el_crown_epoch = ~0ull;
 static cXyz el_project_in, el_project_out;
 
@@ -1249,17 +1539,22 @@ static void el_draw_crowns(u32 list) {
         el_crown_epoch = epoch;
         el_crown_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/crown.png");
         if (!el_crown_texture) wwhd_log("multiplayer: assets/crown.png not loaded, elites without crown");
+        el_skull_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/dead.png"); /* 50 x 44 */
+        el_eye_texture = wwhd_hud_texture(WWHD_HUD_PACKAGE, "assets/eye.png");   /* 64 x 48 */
+        if (!el_skull_texture || !el_eye_texture) wwhd_log("multiplayer: a variant elite's icon not loaded");
     }
-    if (!el_crown_texture) return;
     for (u32 i = 0; i != EL_MAX; ++i) {
         const el_actor* e = &el_actors[i];
         if (!e->used || !e->crown_visible) continue;
-        f32 w = 64.0f * e->crown_scale, h = 48.0f * e->crown_scale;
+        u32 texture = e->kind == EL_KIND_CURSED ? el_skull_texture : e->kind == EL_KIND_JOKER ? el_eye_texture : el_crown_texture;
+        if (!texture) continue;
+        f32 w = (e->kind == EL_KIND_CURSED ? 50.0f : 64.0f) * e->crown_scale;
+        f32 h = (e->kind == EL_KIND_CURSED ? 44.0f : 48.0f) * e->crown_scale;
         el_crown_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
                                               .x = e->crown_x - w * 0.5f, .y = e->crown_y - h, .w = w, .h = h,
                                               .thickness = 1, .u1 = 1, .v1 = 1,
                                               .rgba = 0xFFFFFF00u | (u32)(e->crown_alpha * 255.0f),
-                                              .image = el_crown_texture};
+                                              .image = texture};
         wwhd_hud_emit(list, &el_crown_element);
     }
 }

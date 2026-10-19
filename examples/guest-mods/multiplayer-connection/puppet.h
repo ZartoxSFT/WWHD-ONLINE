@@ -576,6 +576,50 @@ static void ghost_restore(void) {
     ghost_drawing = 0;
 }
 
+/* 0.3.5: a puppet leaves the shared models' animations to the local Link. While a Link is made,
+ * daPy_lk_c::initBrkAnm / initBtkAnm (023D4C78 / 023D4D64: this, model data, animation object, index;
+ * d_a_player_main_01.cpp) bind its own animation objects into "Link" model data every Link shares
+ * (entry: J3DModelData +0x44 brk, +0x48 btk, ArrowLightModelData in d_a_arrow_lighteff.h; the bomb
+ * 0x3C, the water column 0x42, the arrows 0x37 / 0x38, 0x40, 0x41 with objects at this + 0x44D4...
+ * + 0x4794, and the item models). A puppet's binding replaced the local Link's, and once that puppet
+ * was deleted (a dead player's body, removed when he was revived) the model data pointed into freed
+ * memory: J3DModel::viewCalc (027F55FC) called that brk's vtable, null (crash-20261019-211908.log:
+ * daPy_lk_c::draw 023D9820, entryDLSetLight 023D8DF0, mDoExt_modelEntryDL, viewCalc reading model
+ * data +0x44 and its vtable +0x34, right after "revive sent"). For a puppet, the model data's
+ * animation words (+0x38 to +0x48, those viewCalc reads) are put back after the call: its objects are
+ * set up, the shared models keep the local Link's. */
+#define PUPPET_MDATA_ANM 0x38
+#define PUPPET_MDATA_ANM_WORDS 5
+WWHD_GAME_ORIGINAL(0x023D4C78, u32, puppet_init_brk_original, (void* self, u32 data, u32 anm, u32 idx));
+WWHD_GAME_ORIGINAL(0x023D4D64, u32, puppet_init_btk_original, (void* self, u32 data, u32 anm, u32 idx));
+
+static void puppet_anm_keep(u32 data, u32* words, int save) {
+    if (!data || (data & 3)) return;
+    volatile u32* p = (volatile u32*)(data + PUPPET_MDATA_ANM);
+    for (int k = 0; k != PUPPET_MDATA_ANM_WORDS; ++k) {
+        if (save) words[k] = p[k];
+        else p[k] = words[k];
+    }
+}
+
+WWHD_REPLACE(0x023D4C78, u32, puppet_init_brk, (void* self, u32 data, u32 anm, u32 idx)) {
+    if (!puppet_is(self)) return puppet_init_brk_original(self, data, anm, idx);
+    u32 words[PUPPET_MDATA_ANM_WORDS];
+    puppet_anm_keep(data, words, 1);
+    u32 r = puppet_init_brk_original(self, data, anm, idx);
+    puppet_anm_keep(data, words, 0);
+    return r;
+}
+
+WWHD_REPLACE(0x023D4D64, u32, puppet_init_btk, (void* self, u32 data, u32 anm, u32 idx)) {
+    if (!puppet_is(self)) return puppet_init_btk_original(self, data, anm, idx);
+    u32 words[PUPPET_MDATA_ANM_WORDS];
+    puppet_anm_keep(data, words, 1);
+    u32 r = puppet_init_btk_original(self, data, anm, idx);
+    puppet_anm_keep(data, words, 0);
+    return r;
+}
+
 /* A model without model data is not drawn, and logged: daPy_lk_c::draw then mDoExt_modelEntryDL /
  * mDoExt_modelUpdateDL (025E2E5C (model) / 025E2DE0 (model, data), decomp m_Do_ext_heap_model.cpp)
  * read null + 0x3C in J3DModel::viewCalc (crashes 16:19 and 16:22, 0.2.61, crash-20261018-161947.log
@@ -587,16 +631,95 @@ static u32 draw_guard_logged;
 WWHD_GAME_ORIGINAL(0x025E2E5C, void, draw_entry_dl_original, (void* model));
 WWHD_GAME_ORIGINAL(0x025E2DE0, void, draw_update_dl_original, (void* model, void* data));
 
+/* 0.3.9: the local Link's item heaps. daPy_lk_c::setItemHeap (023DDF64, d_a_player_main.cpp) takes
+ * the other of Link's two item heaps once a step (mResetFlg0 0x4000, cleared at the top of each
+ * execute) and setAnimeHeap (023DDEA8) empties it before a new item model is built there; a model
+ * whose packets are still entered in the draw lists then trips "J3DPacket.cpp mEntryPtr == (0)"
+ * (crash-20261019-220620/-220621.log: the local Link, out of the Deku Leaf's glide, procFall_init ->
+ * commonProcInit -> setSmallFanModel -> setAnimeHeap; the mod only ran Link's own execute). Cause not
+ * found. Guard: when the heap is about to be emptied again without switching while its last model was
+ * made in an earlier step (so it may be on screen), the switch is made; every such case is logged
+ * with Link's proc and item, and the first calls of each area too, to find the cause. */
+#define ITEM_HEAP_RESET_FLG0 0x3C0
+#define ITEM_HEAP_SWITCHED 0x4000u
+WWHD_GAME_ORIGINAL(0x023DDF64, u32, item_heap_original, (void* self));
+static u32 item_heap_link;
+static unsigned long long item_heap_made[2];
+static u32 item_heap_logged;
+WWHD_REPLACE(0x023DDF64, u32, item_heap, (void* self)) {
+    if (!self || puppet_is(self)) return item_heap_original(self);
+    daPy_lk_c* l = (daPy_lk_c*)self;
+    unsigned long long step = wwhd_logic_step();
+    if ((u32)self != item_heap_link) { /* another local Link (a new area) */
+        item_heap_link = (u32)self;
+        item_heap_made[0] = item_heap_made[1] = ~0ull;
+        item_heap_logged = 0;
+    }
+    volatile u32* reset = (volatile u32*)((u8*)self + ITEM_HEAP_RESET_FLG0);
+    u32 idx = l->mCurrItemHeapIdx & 1u;
+    if ((*reset & ITEM_HEAP_SWITCHED) && item_heap_made[idx] != ~0ull && item_heap_made[idx] != step) {
+        *reset &= ~ITEM_HEAP_SWITCHED; /* switch: the heap may hold the model on screen */
+        wwhd_log_int("multiplayer: item heap: a drawn model's heap kept for a new model, switched; proc", l->mCurProc);
+        wwhd_log_int("multiplayer:   item", l->mEquipItem);
+    } else if (item_heap_logged < 6) {
+        ++item_heap_logged;
+        wwhd_log_int("multiplayer: item heap: model built, proc", l->mCurProc);
+    }
+    u32 r = item_heap_original(self);
+    item_heap_made[l->mCurrItemHeapIdx & 1u] = step;
+    return r;
+}
+
+/* 0.3.6: what J3DModel::viewCalc reads (027F55FC, disassembled in the EU cking.rpx): the model data
+ * (+0xAC), its materials (+0x10), the model's own per-material entries (+0x34), and each animation
+ * bound to the model data (+0x38 to +0x48, five words read with their vtable: brk +0x44, btk +0x48) whose vtable (+0x34) entry +0x3C it
+ * calls. Two crashes there from a Link's draw (crash-20261019-211908.log: that entry 0;
+ * -213306.log: a read at 0x2A3C in the materials' loop): a model or an animation already freed. Such
+ * a model is not drawn and the bad word is logged (draw_guard_log), instead of the crash. */
+#define DRAW_MODEL_ENTRIES 0x34
+#define DRAW_MDATA_MATERIALS 0x10
+#define DRAW_MDATA_ANM 0x38
+#define DRAW_ANM_VTABLE 0x34
+#define DRAW_VT_CALC 0x3C
+static u32 draw_bad_word, draw_bad_value;
+
+static int draw_ptr(u32 p) { return p >= 0x10000000u && p < 0x50000000u && !(p & 3u); }
+static int draw_code(u32 p) { return p >= 0x02000000u && p < 0x03000000u && !(p & 3u); }
+
 static int draw_model_ok(const void* model) {
     u32 m = (u32)model;
+    draw_bad_word = draw_bad_value = 0;
     if (!m || (m & 3)) return 0;
     u32 data = *(const volatile u32*)(m + DRAW_MODEL_DATA);
-    return data && !(data & 3);
+    if (!data || (data & 3)) return 0;
+    u32 checks[3][2] = {{m + DRAW_MODEL_DATA, data},
+                        {m + DRAW_MODEL_ENTRIES, *(const volatile u32*)(m + DRAW_MODEL_ENTRIES)},
+                        {data + DRAW_MDATA_MATERIALS, *(const volatile u32*)(data + DRAW_MDATA_MATERIALS)}};
+    for (int k = 0; k != 3; ++k)
+        if (!draw_ptr(checks[k][1])) {
+            draw_bad_word = checks[k][0];
+            draw_bad_value = checks[k][1];
+            return 0;
+        }
+    for (u32 k = 0; k != 5; ++k) {
+        u32 anm = *(const volatile u32*)(data + DRAW_MDATA_ANM + 4 * k);
+        if (!anm) continue;
+        u32 vt = draw_ptr(anm) ? *(const volatile u32*)(anm + DRAW_ANM_VTABLE) : 0;
+        u32 fn = draw_ptr(vt) ? *(const volatile u32*)(vt + DRAW_VT_CALC) : 0;
+        if (!draw_code(fn)) {
+            draw_bad_word = data + DRAW_MDATA_ANM + 4 * k;
+            draw_bad_value = anm;
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static void draw_guard_log(const void* model) {
     if (draw_guard_logged++ >= 8) return;
-    wwhd_log_hex("multiplayer: a model without model data was not drawn, model", (u32)model);
+    wwhd_log_hex("multiplayer: a model not fit to draw was left out, model", (u32)model);
+    wwhd_log_hex("multiplayer:   bad word at", draw_bad_word);
+    wwhd_log_hex("multiplayer:   its value", draw_bad_value);
     wwhd_log_hex("multiplayer:   drawn by Link", draw_link);
     wwhd_log_int("multiplayer:   that Link is a puppet", draw_link ? puppet_is((const void*)draw_link) : 0);
     wwhd_log_int("multiplayer:   its skin (-1: Link)", draw_link ? skin_of(draw_link) : -1);

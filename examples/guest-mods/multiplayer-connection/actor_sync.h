@@ -332,6 +332,7 @@ typedef struct as_slot {
     f32 before_pos[3];   /* current.pos when its execute began */
     s16 net_health, sent_health;
     u8 net_tag, sent_tag;  /* the owner's elite draw (elite.h), with the health */
+    mp_u32 replay_player;  /* the player of the last strike replayed on it (elite.h: the joker) */
     u32 net_status;      /* the owner's actor_status (ActorHealthSync) */
     u8 sent_variant;     /* owner of a spawned actor: mp_spawn::variant last sent */
     u8 has_last_strike;  /* a strike was seen on it (to give it a lethal one) */
@@ -961,6 +962,26 @@ static void as_swap_in(const as_slot* s, as_player_swap* w) {
     *w->link = w->puppet;
 }
 
+/* daArrow_c::createInit (02052738, d_a_arrow.cpp) keeps the link player's tip animation:
+ * mpBtk (+0x3B8, between mpModel +0x3B0 and mLinChk +0x3BC, d_a_arrow.h) = link + 0x46AC (ice/fire)
+ * or + 0x4720 (light), set again by _draw every frame. An arrow copy is created with its creator's
+ * puppet as link player (as_swap_in): it kept a pointer into the puppet, and once the puppet was
+ * deleted (player gone, puppet made again) the arrow drew with a freed animation: crash
+ * 2026-10-19 18:11, indirect branch to 0 in J3DModel::viewCalc from daArrow_c::_draw (0.2.92 fix).
+ * The copy takes the same animation of the local Link, which a normal arrow uses too. */
+#define AS_ARROW_BTK 0x3B8
+#define AS_PUPPET_BTK_END 0x4800 /* past the two animations (+0x46AC, +0x4720) */
+static void as_arrow_btk_home(const void* actor, const as_player_swap* w) {
+    if (!actor || !w->player0 || !w->old_link) return;
+    if (*(const volatile s16*)((const u8*)actor + AS_PROC_NAME) != AS_PROC_ARROW) return;
+    volatile u32* btk = (volatile u32*)((u8*)actor + AS_ARROW_BTK);
+    u32 at = *btk;
+    if (at < w->puppet || at >= w->puppet + AS_PUPPET_BTK_END) return;
+    *btk = w->old_link + (at - w->puppet);
+    static u32 logged;
+    if (!logged++) wwhd_log("multiplayer: arrow copy: tip animation taken from the local Link");
+}
+
 static void as_swap_out(const as_player_swap* w) {
     if (!w->player0) return;
     if (*w->player0 == w->puppet) *w->player0 = w->old_player0;
@@ -1106,14 +1127,19 @@ WWHD_REPLACE(0x025D63E8, s32, as_solid_heap, (u32 actor, u32 callback, u32 size)
         }
         ret = as_entry_solid_heap(actor, callback, 0, best);
     } else {
-        if (!known) need = AS_HEAP_UNKNOWN;
+        /* a kind not built yet: at least the game's own estimate and a quarter (0.2.98: a Miniblin,
+         * daPt_Create estimate 0x4B000, was let try with 256 KiB: crash-20261019-185804.log, null + 0x340
+         * written in its morf's model, mDoExt_McaMorf 025E4F64 from useHeapInit 02446A4C) */
+        if (!known) need = size + size / 4u > AS_HEAP_UNKNOWN ? size + size / 4u : AS_HEAP_UNKNOWN;
         if (l_first >= need) {
             ret = as_solid_heap_original(actor, callback, size);
         } else if (l_other >= need && l_other > l_first) {
             if ((as_heap_moved++ & 15) == 0) wwhd_log_int("multiplayer: actor built in the other actors' heap (proc)", proc);
             ret = as_entry_solid_heap(actor, callback, 0, other);
-        } else if (!known) {
-            ret = as_solid_heap_original(actor, callback, size); /* its size is not known: the game tries */
+        } else if (!known && l_first >= size && l_first >= l_other) {
+            ret = as_solid_heap_original(actor, callback, size); /* the game's estimate fits: the game tries */
+        } else if (!known && l_other >= size) {
+            ret = as_entry_solid_heap(actor, callback, 0, other);
         } else {
             if ((as_heap_refused_other++ & 15) == 0)
                 as_heap_log_refusal("multiplayer: actor not made, no room in the actors' heaps (proc)", proc, need,
@@ -1148,6 +1174,7 @@ WWHD_REPLACE(0x025D4C70, s32, as_create, (void* actor)) {
     as_roster_creating = user;
     s32 result = as_create_original(actor);
     as_roster_creating = outer;
+    as_arrow_btk_home(actor, &swap);
     as_swap_out(&swap);
     as_roster_result(user, result);
     return result;
@@ -1999,7 +2026,10 @@ static u32 as_collider_actor(u32 obj) {
  * The hitter's game: a hit of its Link's sword, or of its own spawned weapon, on a synchronised
  * actor joins the next ActorPlayerSync update. */
 static u32 as_copy_hits_logged, as_copy_skips_logged;
+static mp_u32 as_replay_player_now = MP_NO_ID; /* the player of the strike being replayed (as_replay) */
+static int el_joker_refuses(u32 target, u32 at); /* elite.h: a joker takes no hit but its target's */
 WWHD_REPLACE(0x0200CFA8, void, as_hit, (void* self, void* at, void* tg, void* pos)) {
+    if (at && tg && el_joker_refuses(as_collider_actor((u32)tg), (u32)at)) return; /* no hit at all */
     u32 at_offset = 0;
     as_slot* weapon = (at && as_session) ? as_weapon_of((u32)at, &at_offset) : 0;
     if (weapon && weapon->replica && !as_replaying &&
@@ -2169,6 +2199,7 @@ static void as_replay(u32 ccs, const as_pending_strike* p) {
     as_hit_pos.y = k->pos[1];
     as_hit_pos.z = k->pos[2];
     u32 g = as_weapon_collider(k); /* a bomb's or arrow's hit: with the copy's own collider */
+    as_replay_player_now = p->player; /* elite.h el_joker_refuses: whose hit this is */
     static u32 weapon_replays_logged;
     if (k->attacker && weapon_replays_logged < 6) {
         ++weapon_replays_logged;
@@ -2183,6 +2214,7 @@ static void as_replay(u32 ccs, const as_pending_strike* p) {
         as_replaying = 1;
         wwhd_set_at_tg((void*)ccs, (void*)g, (void*)tg, &as_hit_pos);
         as_replaying = 0;
+        as_replay_player_now = MP_NO_ID;
         u32 hit = as_ld32(tg + AS_OBJ_TG_HITOBJ) == g;
         as_load_at(g, &saved);
         if (!hit) {
@@ -2200,9 +2232,11 @@ static void as_replay(u32 ccs, const as_pending_strike* p) {
         as_load_at(g, &wanted);
         as_st32(g + AS_OBJ_STTS, hitter + AS_LINK_STTS);
         wwhd_set_at_tg((void*)ccs, (void*)g, (void*)tg, &as_hit_pos);
+        as_replay_player_now = MP_NO_ID;
         if (as_ld32(tg + AS_OBJ_TG_HITOBJ) != g) return; /* filtered like a real continuous hit */
     }
     s->replayed = 1;
+    s->replay_player = p->player;
     s->replay_clock = 0;
     if (!k->attacker) {
         s->last_strike = *k;

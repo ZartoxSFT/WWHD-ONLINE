@@ -162,12 +162,17 @@ static void pb_step(void* link_actor) {
 /* heavy.h: the bot is a player of the local Link's room. */
 static int pb_room_player(void) { return pb_mode != PB_OFF && pb_box; }
 
+/* heavy.h: the bot pushes within `radius` of a place. */
+static int pb_pushing_near_pos(const f32* pos, f32 radius) {
+    if (pb_mode != PB_PUSH || !pb_box) return 0;
+    f32 dx = pb_bot.pos[0] - pos[0], dy = pb_bot.pos[1] - pos[1], dz = pb_bot.pos[2] - pos[2];
+    return dx * dx + dy * dy + dz * dz <= radius * radius;
+}
+
 /* heavy.h: the bot pushes within `radius` of the local Link. */
 static int pb_pushing_near(const fopAc_ac_c* link, f32 radius) {
-    if (pb_mode != PB_PUSH || !pb_box) return 0;
-    f32 dx = pb_bot.pos[0] - link->current.pos.x, dy = pb_bot.pos[1] - link->current.pos.y;
-    f32 dz = pb_bot.pos[2] - link->current.pos.z;
-    return dx * dx + dy * dy + dz * dz <= radius * radius;
+    f32 pos[3] = {link->current.pos.x, link->current.pos.y, link->current.pos.z};
+    return pb_pushing_near_pos(pos, radius);
 }
 
 static void pb_draw(u32 list) {
