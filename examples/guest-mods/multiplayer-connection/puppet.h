@@ -49,6 +49,7 @@
 
 #define PUPPET_MAX 8 /* the remote players and the dead players' bodies (death.h) */
 #define PUPPET_BODY_UID 0x40000000u /* a body's slot: this bit and its player's uid (death.h) */
+#define PUPPET_BOT_UID 0x20000000u  /* the Debug page's push bot (push_bot.h): kept by puppet_clear_all */
 static int puppet_local_ghost;      /* death.h: the local Link is a ghost */
 #define PUPPET_RETRIES 3
 #define PUPPET_CREATE_TIMEOUT 300 /* logic steps */
@@ -977,9 +978,11 @@ static void puppet_remove(mp_u32 uid) {
     if (s) puppet_release(s);
 }
 
+/* The push bot stays (push_bot.h removes it with its crate): without a server the connection's
+ * failure clears the puppets at every step. */
 static void puppet_clear_all(void) {
     for (int i = 0; i != PUPPET_MAX; ++i)
-        if (puppet_slots[i].used) puppet_release(&puppet_slots[i]);
+        if (puppet_slots[i].used && puppet_slots[i].uid != PUPPET_BOT_UID) puppet_release(&puppet_slots[i]);
 }
 
 static void puppet_set_target(mp_u32 uid, const mp_transform* t) {

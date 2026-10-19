@@ -1736,20 +1736,47 @@ static void as_add_replica(const mp_placed_actor* a) {
  * enemies, its game UID being the block. The server sends its creation to the other players of
  * the area (SyncedActorManager.broadcastActor); a game that has no actor with that block makes it
  * from the received block (as_summon_remote), then matches it as for a placed actor. Not for a
- * player who enters the area later (the server sends only the actors without a game UID then). */
+ * player who enters the area later (the server sends only the actors without a game UID then).
+ *
+ * Each game makes a summoned creature once (0.2.81): the creatures summoned here and those made
+ * from another game's block are noted, and a creation received later for the same creature (same
+ * name, parameters, place and room; the place, by a Link, is its identity) is not made again.
+ * Before, only the creatures made from another game were noted, for 150 steps: the summoning
+ * player (the target of a shop "troll") got the creature a second time when the server sent it
+ * back later (seen in a log: one creature made twice 12 s apart), the others had one. */
 #define AS_SUMMON 0xFE
-#define AS_SUMMON_RECENT 8
-#define AS_SUMMON_FORGET 150 /* logic steps a remote creature is not made twice */
+#define AS_SUMMON_RECENT 16
 #define AS_PRM_SET_ID 0x16
 #define AS_PRM_ROOM 0x21
 
 typedef struct as_summon_note {
     u8 block[AS_PRM_BYTES];
-    unsigned long long step;
+    char name[AS_STAGE_NAME];
     int used;
 } as_summon_note;
 static as_summon_note as_summon_notes[AS_SUMMON_RECENT];
 static u32 as_summon_next;
+
+static void as_summon_remember(const char* name, const u8* block) {
+    as_summon_note* n = &as_summon_notes[as_summon_next++ % AS_SUMMON_RECENT];
+    memcpy(n->block, block, AS_PRM_BYTES);
+    for (u32 k = 0; k != AS_STAGE_NAME; ++k) n->name[k] = 0;
+    for (u32 k = 0; k != AS_STAGE_NAME && name[k]; ++k) n->name[k] = name[k];
+    n->used = 1;
+}
+
+/* The creature of a noted block: its name, parameters and place (0x00-0x0F) and room. */
+static const as_summon_note* as_summon_known(const char* name, const u8* block) {
+    for (u32 i = 0; i != AS_SUMMON_RECENT; ++i) {
+        const as_summon_note* n = &as_summon_notes[i];
+        if (!n->used || !as_same_bytes(n->block, block, AS_PRM_ANGLE) || n->block[AS_PRM_ROOM] != block[AS_PRM_ROOM])
+            continue;
+        u32 k = 0;
+        while (k != AS_STAGE_NAME && n->name[k] == name[k] && name[k]) ++k;
+        if (k == AS_STAGE_NAME || n->name[k] == name[k]) return n;
+    }
+    return 0;
+}
 
 static void as_summon_create(const char* name, u32 block) {
     for (u32 n = 0; n != sizeof(as_stage_data); ++n) as_stage_data[n] = 0;
@@ -1774,6 +1801,7 @@ static int as_summon(const char* name, u32 params, s16 angle_x, s16 angle_z, con
     /* variants drawn from this block (its place differs each time); the others get the result in
      * the block itself, their game UID */
     if (randomized) as_randomize(name, (const u8*)b, AS_SUMMON_SEED, (u8*)b);
+    as_summon_remember(name, (const u8*)b); /* never made again from the server's copy */
     as_summon_create(name, b);
     wwhd_log("multiplayer: creature summoned:");
     wwhd_log(name);
@@ -1785,18 +1813,21 @@ static void as_summon_remote(const mp_placed_actor* a) {
     if (a->game_uid_size != AS_PRM_BYTES || a->game_uid[AS_PRM_TAG] != AS_TAG || a->game_uid[AS_PRM_COPY] != AS_SUMMON)
         return;
     if (!as_enabled || !mp_filter_contains(as_session, a->name)) return;
-    unsigned long long now = wwhd_logic_step();
-    for (u32 i = 0; i != AS_SUMMON_RECENT; ++i) {
-        as_summon_note* n = &as_summon_notes[i];
-        if (n->used && now - n->step < AS_SUMMON_FORGET && as_same_bytes(n->block, a->game_uid, AS_PRM_BYTES)) return;
+    const as_summon_note* known = as_summon_known(a->name, a->game_uid);
+    if (known) {
+        static u32 again_logged;
+        if (again_logged++ < 8) {
+            wwhd_log("multiplayer: a summoned creature this game already has, not made again:");
+            wwhd_log(a->name);
+            for (u32 k = 0; k != AS_PRM_BYTES; ++k) /* what the server's block changed, for the record */
+                if (known->block[k] != a->game_uid[k]) wwhd_log_int("multiplayer:   differing byte", (int)k);
+        }
+        return;
     }
     u32 b = wwhd_fopAcM_CreateAppend();
     if (!b) return;
     memcpy((void*)b, a->game_uid, AS_PRM_BYTES);
-    as_summon_note* n = &as_summon_notes[as_summon_next++ % AS_SUMMON_RECENT];
-    memcpy(n->block, a->game_uid, AS_PRM_BYTES);
-    n->step = now;
-    n->used = 1;
+    as_summon_remember(a->name, a->game_uid);
     as_summon_create(a->name, b);
     wwhd_log("multiplayer: another player's summoned creature made here:");
     wwhd_log(a->name);

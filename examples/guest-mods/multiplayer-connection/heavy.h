@@ -90,11 +90,11 @@ static u32 hv_room_players(const fopAc_ac_c* link) {
             if (e->id == directory.self || (e->flags & MP_DIR_DEAD) || !map_same_stage(e->stage, stage)) continue;
             if (e->room == link->current.roomNo) ++n;
         }
-        return n;
+        return n + (u32)pb_room_player();
     }
     for (int i = 0; i != MAX_REMOTES; ++i)
         if (remotes[i].active && hv_alive_look(&remotes[i])) ++n;
-    return n;
+    return n + (u32)pb_room_player(); /* the Debug page's bot (push_bot.h) */
 }
 
 static u32 hv_needed_for(u32 players) {
@@ -121,13 +121,14 @@ static u32 hv_helpers(const fopAc_ac_c* link, int kind, mp_u32* lowest) {
         ++n;
         if (r->uid < *lowest) *lowest = r->uid;
     }
+    if (kind == HV_PUSH && pb_pushing_near(link, HV_HELP_RADIUS)) ++n; /* never the lifter */
     return n;
 }
 
 /* 1 when the local Link may do `kind` alone or with the helpers there; the count is shown. */
 static int hv_enough(const fopAc_ac_c* link, int kind, int* lifter) {
     *lifter = 1;
-    if (state != READY || local_uid == MP_NO_ID) return 1;
+    if ((state != READY || local_uid == MP_NO_ID) && !pb_room_player()) return 1; /* the bot: tested alone */
     u32 players = hv_room_players(link);
     if (players <= 1) return 1;
     mp_u32 lowest;
@@ -233,5 +234,5 @@ static void hv_draw(u32 list) {
     u32 n = hv_number(text, hv_count);
     text[n++] = '/';
     n += hv_number(text + n, hv_needed);
-    name_draw(list, x, y, text, n, hv_count >= hv_needed ? 0x6FE08Au : 0xF9C74Fu, 0.6f, 1.0f);
+    name_draw(list, x, y, text, n, hv_count >= hv_needed ? 0x6FE08Au : 0xF9C74Fu, 1.2f, 1.0f);
 }

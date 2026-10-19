@@ -832,6 +832,7 @@ static void draw_gamepad(u32 list) {
  * the Pro Controller the MAP screen is on the TV: its sea chart instead (the game is in its menu). */
 static wwhd_hud_element marker_element;
 static void hv_draw(u32 list); /* heavy.h, included below */
+static void pb_draw(u32 list); /* push_bot.h, included below */
 
 static void draw_markers(u32 list) {
     chart_view v;
@@ -847,6 +848,7 @@ static void draw_markers(u32 list) {
      * items, collection, map and bag, on the TV or the GamePad) */
     dh_draw(list); /* the dead players' bodies, the revive prompt (death.h) */
     hv_draw(list); /* the players lifting or pushing a heavy thing together (heavy.h) */
+    pb_draw(list); /* the Debug page's bot (push_bot.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
@@ -1663,7 +1665,8 @@ static void connect_read(void);            /* the launcher's "Connect to the ser
  * dComIfG_play_c::mItemMaxLifeCount (play + 0x12A0 + 0x48BE, s16: the meter then fills the hearts),
  * mItemLifeCount (+0x48A4, f32 quarter hearts, capped by the meter to the full hearts),
  * mItemRupeeCount (+0x48A8, s32, as the teleport pays). The meter clears the pending life when it
- * applies a new maximum: a life asked with a maximum is given at a later step. players.txt reports
+ * applies a new maximum: a life asked with a maximum is given at a later step. "bot=" (1 pushing,
+ * 2 standing by, 0 removed): a crate and a bot in front of the local Link (push_bot.h). players.txt reports
  * "life=", "max_life=" (and "rupees=", already there). */
 #define DEBUG_PLAY_MAX_LIFE (0x12A0 + 0x48BE)
 #define DEBUG_PLAY_LIFE (0x12A0 + 0x48A4)
@@ -1672,6 +1675,7 @@ static char debug_text[256];
 static int debug_read_once;
 static u32 debug_last_id;
 static int debug_life_wanted = -1;   /* a life to give once the new maximum is applied */
+static void pb_request(u32 mode);    /* "bot=": the push bot (push_bot.h, included below) */
 
 /* "key=number" in debug.cfg: 1 and the number when the key is there. */
 static int debug_cfg_value(const char* text, u32 size, const char* key, u32* value) {
@@ -1744,6 +1748,7 @@ static void debug_step(u8* play) {
         *(volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT) = (s32)v - (s32)map_rupees();
         wwhd_log_int("multiplayer: debug: rupees", (int)v);
     }
+    if (debug_cfg_value(debug_text, (u32)got, "bot", &v)) pb_request(v);
 }
 static const char* connection_state(void);
 
@@ -2021,6 +2026,7 @@ static void multiplayer_connection_step(void* link) {
     }
 }
 
+#include "push_bot.h" /* the Debug page's bot at a crate */
 #include "heavy.h" /* heavy things take several players */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
@@ -2042,5 +2048,6 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());
+    pb_step(i_this);
     return result;
 }
