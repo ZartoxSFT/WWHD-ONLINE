@@ -91,12 +91,12 @@ void trace_due_deletes(const char* when) {
     if (!trace_on()) return;
     uint32_t n = ld32(kDeleteQueue);
     for (int k = 0; n && k < 512; k++, n = ld32(n + 8)) {
-        if (n < 0x10000000 || n >= 0x50000000) break;
+        if (n < 0x10000000 || n >= mem::kMem2End) break;
         int timer = (int16_t)ld16(n + 0x18);
         if (timer > 0) continue;
         uint32_t proc = ld32(n + 0xC);
         uint32_t sub = proc ? ld32(proc + 0xF0) : 0;  // fopAc_ac_c::sub_method (true60.cpp kSubMethod)
-        uint32_t exec = sub >= 0x10000000 && sub < 0x50000000 ? ld32(sub + 8) : 0;
+        uint32_t exec = sub >= 0x10000000 && sub < mem::kMem2End ? ld32(sub + 8) : 0;
         trace("%s: process %08X (execute %08X) due for deletion", when, proc, exec);
     }
 }
@@ -166,7 +166,7 @@ void call(Cpu* c, void (*f)(Cpu*), uint32_t r3) {
 const uint32_t kActorQueue = GD(0x101F3328);  // g_fopAcTg_Queue (fopAcIt_Executor 025D51DC)
 uint32_t actor_execute(uint32_t a) {
     uint32_t sub = ld32(a + 0xF0);  // fopAc_ac_c::sub_method (true60.cpp kSubMethod)
-    return sub >= 0x10000000 && sub < 0x50000000 ? ld32(sub + 8) : 0;
+    return sub >= 0x10000000 && sub < mem::kMem2End ? ld32(sub + 8) : 0;
 }
 void test_door_delete(Cpu* c) {
     static const char* e = getenv("WWHD_TEST_DOOR_DELETE");
@@ -175,7 +175,7 @@ void test_door_delete(Cpu* c) {
     const uint32_t fn = (uint32_t)strtoul(e, nullptr, 16);
     uint32_t n = ld32(kActorQueue);
     for (int k = 0; n && k < 2048; k++, n = ld32(n + 8)) {
-        if (n < 0x10000000 || n >= 0x50000000) break;
+        if (n < 0x10000000 || n >= mem::kMem2End) break;
         uint32_t a = ld32(n + 0xC);
         if (!a) continue;
         uint32_t x = actor_execute(a);

@@ -113,10 +113,10 @@ static void sv_close(void) { sv_state = 0; }
 
 /* ------------------------------------------------------------------ notices */
 
-#define SV_SIDE_NOTICES 4
+#define SV_SIDE_NOTICES 6
 #define SV_NOTICES (2 * SV_SIDE_NOTICES) /* left: items and chests, right: upgrades */
 #define SV_LEFT 0
-#define SV_RIGHT 1
+#define SV_RIGHT 0 /* 0.3.18: every notice bottom left (the right side was the upgrades') */
 #define SV_NOTICE_STEPS 150
 typedef struct sv_notice {
     char text[48];

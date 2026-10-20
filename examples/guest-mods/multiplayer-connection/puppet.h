@@ -48,6 +48,24 @@
 #include "skin.h"
 
 #define PUPPET_MAX 8 /* the remote players and the dead players' bodies (death.h) */
+
+/* outfit.h outfit_force: the casual clothes' HD texture object, as playerInit reads it
+ * (getRes("Link", 0x71), the game's own Link archive, not a skin's), kept per local Link. */
+static u32 outfit_casual_link, outfit_casual_object;
+static u32 outfit_casual_texture(void) {
+    const u8* play = wwhd_play_get();
+    u32 link = play ? *(const volatile u32*)(play + WWHD_PLAY_PLAYER_OFFSET) : 0;
+    if (link && link == outfit_casual_link && outfit_casual_object) return outfit_casual_object;
+    u32 control = WWHD_GAME_DATA(0x101F4F28, u32);
+    if (!control) return 0;
+    skin_link_key[0] = (u32)skin_link_name;
+    skin_link_key[1] = skin_string_vtable();
+    u32 res = skin_get_res_original(control, (u32)skin_link_key, 0x71);
+    outfit_casual_link = link;
+    outfit_casual_res = res;
+    outfit_casual_object = res ? *(const volatile u32*)(res + 0x20) : 0;
+    return outfit_casual_object;
+}
 #define PUPPET_BODY_UID 0x40000000u /* a body's slot: this bit and its player's uid (death.h) */
 #define PUPPET_BOT_UID 0x20000000u  /* the Debug page's push bot (push_bot.h): kept by puppet_clear_all */
 static int puppet_local_ghost;      /* death.h: the local Link is a ghost */
@@ -702,8 +720,17 @@ WWHD_REPLACE(0x023DDF64, u32, item_heap, (void* self)) {
 #define DRAW_VT_CALC 0x3C
 static u32 draw_bad_word, draw_bad_value;
 
-static int draw_ptr(u32 p) { return p >= 0x10000000u && p < 0x50000000u && !(p & 3u); }
-static int draw_code(u32 p) { return p >= 0x02000000u && p < 0x03000000u && !(p & 3u); }
+/* 0.3.50: the end of guest data is the runtime's MEM2 end, 0x60000000 (runtime.h mem::kMem2End):
+ * with 0x50000000 here every model whose data lay above was "not fit to draw" and left out: the
+ * skins loaded past 0x50000000 (invisible, black when half above, tests 0.3.43-0.3.45) and every
+ * model when the game's heaps went above (0.3.36, 0.3.37, 0.3.46). */
+#define DRAW_DATA_END 0x60000000u
+static int draw_ptr(u32 p) { return p >= 0x10000000u && p < DRAW_DATA_END && !(p & 3u); }
+/* 0.3.50: an animation's calc must be the game's code, not its C++ library at the end of the code
+ * (crash instance 3 23:21: viewCalc 027F55FC called EU 028F0BD4 = USA 028F0314 there, then abort():
+ * a freed animation keeps a base class vtable, whose entry is the pure virtual handler) */
+#define DRAW_CODE_LIBRARY 0x028E0000u
+static int draw_code(u32 p) { return p >= 0x02000000u && p < DRAW_CODE_LIBRARY && !(p & 3u); }
 
 static int draw_model_ok(const void* model) {
     u32 m = (u32)model;
@@ -1198,7 +1225,7 @@ static void puppet_remove(mp_u32 uid) {
  * failure clears the puppets at every step. */
 static void puppet_clear_all(void) {
     for (int i = 0; i != PUPPET_MAX; ++i)
-        if (puppet_slots[i].used && puppet_slots[i].uid != PUPPET_BOT_UID) puppet_release(&puppet_slots[i]);
+        if (puppet_slots[i].used && !(puppet_slots[i].uid & PUPPET_BOT_UID)) puppet_release(&puppet_slots[i]); /* bots: the bit (0.3.51) */
 }
 
 static void puppet_set_target(mp_u32 uid, const mp_transform* t) {

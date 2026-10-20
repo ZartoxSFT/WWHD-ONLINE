@@ -12,7 +12,7 @@
 // ---- guest memory layout ----
 namespace mem {
 constexpr uint32_t kMem2Start = 0x10000000;   // app data + heap (MEM2)
-constexpr uint32_t kMem2End = 0x50000000;
+constexpr uint32_t kMem2End = 0x60000000;   // 0x50000000 on the console: 256 MiB more for the game's heaps
 constexpr uint32_t kRuntimeStart = 0x60000000; // runtime-owned guest objects (stacks, OS structs)
 constexpr uint32_t kRuntimeEnd = 0x70000000;
 constexpr uint32_t kHostStart = 0x68000000;    // ... of them host-only (not part of save states)

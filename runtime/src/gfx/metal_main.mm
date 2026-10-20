@@ -211,7 +211,7 @@ void init() {
     R.queue = [R.device newCommandQueue];
     display_init();
     // GPU-visible guest memory: MEM2 (code data + heaps), runtime objects, foreground bucket, MEM1
-    map_guest_range(0x10000000, 0x40000000);
+    map_guest_range(mem::kMem2Start, mem::kMem2End - mem::kMem2Start);
     map_guest_range(0x60000000, 0x10000000);
     map_guest_range(0xE0000000, 0x04000000);
     map_guest_range(0xF4000000, 0x02000000);

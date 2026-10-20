@@ -947,10 +947,22 @@ typedef struct as_player_swap {
     u32 old_player0, old_link, puppet;
 } as_player_swap;
 
+/* 0.3.51: also a copy another player carries (a pot, a rock: the owner's carry bit, as
+ * as_carried_place). daTsuboMode::Act_c::mode_carry (024CF844, d_a_tsubo_mode.cpp) places a
+ * carried pot from dComIfGp_getPlayer(0): the copy was drawn in the local Link's hands ("a pot on
+ * the player"), as_place moving it to the puppet's only around its execute, after its matrix. */
+static int as_carried_by_other(const as_slot* s) {
+    int carried = s->kind == AS_KIND_PLACED ? s->has_net_health && (s->net_status & 0x2000u)
+                                            : s->replica && (s->spawn.variant & 1);
+    return carried && s->owner && s->owner != as_local_uid;
+}
+
 static void as_swap_in(const as_slot* s, as_player_swap* w) {
     w->player0 = w->link = 0;
-    if (!s || s->kind != AS_KIND_SPAWNED || !s->replica || s->cls != AS_CLS_WEAPON) return;
-    puppet_slot* ps = puppet_slot_for(s->creator, 0);
+    if (!s) return;
+    int weapon = s->kind == AS_KIND_SPAWNED && s->replica && s->cls == AS_CLS_WEAPON;
+    if (!weapon && !as_carried_by_other(s)) return;
+    puppet_slot* ps = puppet_slot_for(weapon ? s->creator : s->owner, 0);
     u8* play = wwhd_play_get();
     if (!ps || !ps->actor || !play) return;
     w->puppet = ps->actor;
@@ -1182,9 +1194,25 @@ WWHD_REPLACE(0x025D4C70, s32, as_create, (void* actor)) {
 
 WWHD_GAME_ORIGINAL(0x025D5600, u32, as_create_append_original, (void));
 
+/* 0.3.33: an actor a placed actor creates while it is being created (its fopAc_Create, decomp
+ * d_a_bb.cpp: the Kargaroc carrying a Bokoblin or a Moblin, fpcSCtRq_Request of fpcNm_BK_e /
+ * fpcNm_MO2_e with a block from fopAcM_CreateAppend, position its own current.pos, room, angles
+ * home.angle, parameters (its own & 0xFF000000) | 0xFFFF05) is a placed actor too: the block gets
+ * AS_TAG and the creator's copy number. Every game makes it at the same time with the same block
+ * (the creator's place at creation is its placed one), so the game UIDs match and it syncs when its
+ * name is in the server's list ("Bk", "mo2"), like the placed ones. A summoned creator's (AS_SUMMON)
+ * child takes AS_CHILD, so it is not taken for a summon. */
+#define AS_CHILD 0xFD
+
 /* fopAcM_CreateAppend: the creation context goes into the new block's padding. */
 WWHD_REPLACE(0x025D5600, u32, as_create_append, (void)) {
     u32 prm = as_create_append_original();
+    const u8* creator = (const u8*)as_roster_creating;
+    if (prm && creator && creator[AS_PRM_TAG] == AS_TAG && !as_spawning) {
+        *(volatile u8*)(prm + AS_PRM_TAG) = AS_TAG;
+        *(volatile u8*)(prm + AS_PRM_COPY) = creator[AS_PRM_COPY] == 0xFE ? AS_CHILD : creator[AS_PRM_COPY];
+        return prm;
+    }
     if (prm && as_context != AS_CTX_NONE && !as_spawning) {
         *(volatile u8*)(prm + AS_PRM_TAG) = AS_RT_TAG;
         *(volatile u8*)(prm + AS_PRM_COPY) = as_context;
@@ -2432,14 +2460,28 @@ WWHD_GAME_ORIGINAL(0x025D8120, u32, as_item_from_table_original,
                    (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale));
 static int as_breaking_copy;
 
+/* 0.3.19: a pot broken by the local Link's own code (a throw, a roll, its execute) made its break
+ * effects while particle_sync.h noted the local Link's particles: they were sent, and the other games,
+ * which break their copy with its own effects, showed them twice. Only the players' particles go: none
+ * is noted while a pot breaks (entry and return hooks) nor while a loot is made (as_item_from_table). */
+static int as_pot_capture_saved = -1;
 WWHD_HOOK(0x024CC004, as_pot_damaged, (void* self, s32 action, void* poly, u32 effects, void* pos)) {
     (void)action;
     (void)poly;
     (void)effects;
     (void)pos;
+    if (as_pot_capture_saved < 0) {
+        as_pot_capture_saved = ps_capturing;
+        ps_capturing = 0;
+    }
     if (as_breaking_copy || !self) return;
     as_slot* s = as_find(self);
     if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) s->broken = 1;
+}
+WWHD_HOOK_RETURN(0x024CC004, as_pot_damaged_end, (void* self)) {
+    (void)self;
+    if (as_pot_capture_saved >= 0) ps_capturing = as_pot_capture_saved;
+    as_pot_capture_saved = -1;
 }
 
 /* bonus.h: a rare yellow heart or yellow magic with a loot */
@@ -2452,7 +2494,10 @@ WWHD_REPLACE(0x025D8120, u32, as_item_from_table,
              (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale)) {
     if (as_breaking_copy) return 0;
     bonus_drop_begin();
+    int capture = ps_capturing;
+    ps_capturing = 0; /* a loot's appearance is no player's particle (0.3.19) */
     u32 result = as_item_from_table_original(pos, item, bit, room, type, angle, action, scale);
+    ps_capturing = capture;
     bonus_drop_end(pos, room, result);
     return result;
 }

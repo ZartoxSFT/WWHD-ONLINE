@@ -161,7 +161,7 @@ uint64_t g_link_steps = 0;  // Link's full-pass executes since the last save-sta
 
 uint32_t actor_execute_fn(uint32_t proc) {
     uint32_t sub = ld32(proc + kSubMethod);
-    if (sub < 0x10000000 || sub >= 0x50000000) return 0;
+    if (sub < 0x10000000 || sub >= mem::kMem2End) return 0;
     return ld32(sub + 8);
 }
 
@@ -326,7 +326,7 @@ bool cam_has_nan(uint32_t proc) {
 }
 bool is_camera(uint32_t proc) {
     uint32_t m = ld32(proc + kCamMtd);
-    return m >= 0x10000000 && m < 0x50000000 && ld32(m + 8) == kCameraExecute;
+    return m >= 0x10000000 && m < mem::kMem2End && ld32(m + 8) == kCameraExecute;
 }
 
 // step length a process executes with on this pass

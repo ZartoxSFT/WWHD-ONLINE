@@ -2,7 +2,7 @@
   "format_version": 1,
   "id": "multiplayer-connection",
   "name": "Wind Waker multiplayer connection",
-  "version": "0.3.16",
+  "version": "0.3.51",
   "game_id": "wwhd",
   "minimum_manager_version": "1.5.0",
   "kind": "guest",
@@ -109,6 +109,20 @@
       "type": "bool",
       "name": "Remote Links wear their own tunic colours",
       "default": true
+    },
+    {
+      "id": "heap_mode",
+      "type": "number",
+      "name": "Memory: 0 the game's heaps only, 1 a heap of the skins' own (bigger sead arena), 2 bigger game heaps (test); restart",
+      "default": 1,
+      "min": 0,
+      "max": 2
+    },
+    {
+      "id": "skin_heap_high",
+      "type": "bool",
+      "name": "Memory test: load the skins above 0x50000000 (restart)",
+      "default": false
     }
   ]
 }

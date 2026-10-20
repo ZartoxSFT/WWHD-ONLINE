@@ -399,7 +399,7 @@ void proc_digest(uint32_t proc) {
         last_step = step;
     }
     uint32_t prof = ld32(proc + 0x10), size = 0;
-    if (prof >= 0x10000000 && prof < 0x50000000) size = ld32(prof + 0x10);
+    if (prof >= 0x10000000 && prof < mem::kMem2End) size = ld32(prof + 0x10);
     if (size < 0x20 || size > 0x40000) size = 0x20;
     struct Skip { int name; uint32_t off, len; };
     static std::vector<Skip> skips = [] {
@@ -440,7 +440,7 @@ void proc_digest(uint32_t proc) {
         if (!skip) h = (h ^ p[i]) * 0x100000001b3ull;
     }
     uint32_t sub = size >= 0x3AC ? ld32(proc + 0xF0) : 0, exec = 0;
-    if (sub >= 0x10000000 && sub < 0x50000000) exec = ld32(sub + 8);
+    if (sub >= 0x10000000 && sub < mem::kMem2End) exec = ld32(sub + 8);
     fprintf(f, "%llu %08X %04X %X %016llx %08X", (unsigned long long)step, ld32(proc + 4), ld16(proc + 8), size,
             (unsigned long long)h, exec);
     if (size >= 0x3AC) fprintf(f, " %08X %08X %08X", ld32(proc + 0x314), ld32(proc + 0x318), ld32(proc + 0x31C));

@@ -62,9 +62,10 @@
 #define HUD_HEIGHT 720.0f
 #define MARKER_HEIGHT 140.0f                /* name baseline above the remote Link's feet */
 /* Name fade with the distance between the two Links, in game units (deduced: 1 unit = 1 cm,
- * Link stands about 140 units tall): opaque up to 10 m, fading out, hidden from 20 m. */
-#define NAME_FADE_START 1000.0f
-#define NAME_HIDE_DISTANCE 2000.0f
+ * Link stands about 140 units tall): 0.3.21: opaque up to 7 m, fading out between 7 and 10 m, hidden
+ * from 10 m (0.3.20: 6 and 7 m; before: 10 and 20 m). */
+#define NAME_FADE_START 700.0f
+#define NAME_HIDE_DISTANCE 1000.0f
 
 enum { IDLE, WAIT_INIT, READY, FAILED };
 
@@ -275,6 +276,7 @@ static int el_remote_room(const remote_player* r, s8* room) {
 }
 #include "death.h"    /* no game over while another player of the stage lives */
 static void cy_received(const mp_u8* body, mp_u32 length); /* carry.h */
+static void ev_received(const mp_u8* body, mp_u32 length); /* event_sync.h */
 #include "pvp.h"      /* the players who turned PvP on fight each other */
 
 static void handle_frame(const unsigned char* item, u32 size) {
@@ -357,6 +359,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         dh_revived(body, length);
     } else if (id == session.server_player_carry) {
         cy_received(body, length);
+    } else if (id == session.server_player_event) {
+        ev_received(body, length);
     } else if (id == session.server_save_from) {
         sv_from_received(body, length);
     } else if (id == session.server_save_update) {
@@ -1828,6 +1832,8 @@ static int debug_read_once;
 static u32 debug_last_id;
 static int debug_life_wanted = -1;   /* a life to give once the new maximum is applied */
 static void pb_request(u32 mode);    /* "bot=": the push bot (push_bot.h, included below) */
+static void sb_request(const char* id); /* "skinbot=" / "skinbots=0": bots with a skin (skin_bot.h) */
+static void sb_request_clear(void);
 
 /* "key=number" in debug.cfg: 1 and the number when the key is there. */
 static int debug_cfg_value(const char* text, u32 size, const char* key, u32* value) {
@@ -1977,6 +1983,11 @@ static void debug_step(u8* play) {
         wwhd_log_int("multiplayer: debug: rupees", (int)v);
     }
     if (debug_cfg_value(debug_text, (u32)got, "bot", &v)) pb_request(v);
+    { /* the Debug page's bots with a skin (skin_bot.h) */
+        char skin[MP_SKIN_MAX + 1];
+        if (debug_cfg_text(debug_text, (u32)got, "skinbot", skin, sizeof(skin))) sb_request(skin);
+        if (debug_cfg_value(debug_text, (u32)got, "skinbots", &v) && !v) sb_request_clear();
+    }
     debug_spawn(play, debug_text, (u32)got); /* SUMMON AN ACTOR */
     if (debug_cfg_value(debug_text, (u32)got, "reset_room", &v) && v) { /* the launcher's RESET THIS ROOM */
         const char* r = room_reset_try(play);
@@ -2127,6 +2138,11 @@ static void map_step(void* link_actor, double dt) {
     map_put(&o, bonus_magic_full() ? ",1" : ",0");
     map_put(&o, bonus_long_hookshot ? ",1" : ",0"); /* the Long Hookshot (LauncherUI: owned) */
     map_put(&o, bonus_pigs ? ",1\n" : ",0\n");      /* a Golden Pig to call */
+    /* 0.3.18: the hero's clothes received (outfit.h): the launcher keeps "pyjama" on until then */
+    map_put(&o, outfit_hero_unlocked() ? "hero_clothes=1\n" : "hero_clothes=0\n");
+    map_put(&o, "skins_missing="); /* the launcher fetches them from the server (skin.h) */
+    map_put(&o, skin_missing());
+    map_put(&o, "\n");
     if (shop_result_id) {
         map_put(&o, "shop=");
         map_put_uint(&o, shop_result_id);
@@ -2280,10 +2296,13 @@ static void multiplayer_connection_step(void* link) {
 }
 
 #include "push_bot.h" /* the Debug page's bot at a crate */
+#include "skin_bot.h" /* the Debug page's bots with a skin */
 #include "heavy.h" /* heavy things take several players */
 #include "door_lock.h" /* locked doors wait for the whole room */
 #include "golden_pig.h" /* the shop's Golden Pig, called with the D-pad's down */
 #include "carry.h" /* the players catch, carry and throw each other */
+#include "event_sync.h" /* a cutscene plays for the whole room */
+#include "heap_grow.h" /* bigger game heaps for the skins of many players */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
 
@@ -2305,10 +2324,12 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     el_link_after(i_this); /* a cursed elite near: the hit's invincibility cut (elite.h) */
     skin_leave(skin);
     cy_step(i_this); /* before the place is sent */
+    ev_step(i_this); /* a cutscene of another player of the room (event_sync.h) */
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());
     pb_step(i_this);
+    sb_step(i_this);
     dl_step(wwhd_logic_dt());
     gp_step(i_this, wwhd_logic_dt());
     return result;

@@ -269,9 +269,47 @@ WWHD_HOOK(0x02398014, hv_switch_execute, (void* self)) {
     if (free_slot) { free_slot->actor = (u32)self; free_slot->seen = step; }
 }
 
+/* 0.3.35: a player counts only standing ON the switch, as the game's own test (rideCB, decomp
+ * d_a_obj_swpush.cpp): its top is the quad of the vertices 6, 10, 11, 7 (swpushOpVertices) of the
+ * switch's background, Act_c::mpBgW (+0x3BC), whose vertex table pm_vtx_tbl (+0x90, world places,
+ * 0xC each; count in pm_bgd +0x94 -> m_v_num) the switch moves with its top (Mthd_Execute writes
+ * their y). The player's feet must be over that quad and within HV_TOP_BELOW / HV_TOP_ABOVE of its
+ * height: a player pressed against the side, on the floor, no longer counts (the cylinder of
+ * HV_SWITCH_RADIUS and HV_SWITCH_HEIGHT stays only for a switch whose background is not known). */
+#define HV_SWITCH_BG 0x3BC
+#define HV_BG_VERTICES 0x90
+#define HV_BG_DATA 0x94
+#define HV_TOP_BELOW 25.0f
+#define HV_TOP_ABOVE 60.0f
+static const u8 hv_switch_top[4] = {6, 10, 11, 7};
+
+static int hv_switch_quad(const fopAc_ac_c* sw, f32 q[4][3]) {
+    u32 bg = *(const volatile u32*)((const u8*)sw + HV_SWITCH_BG);
+    u32 vtx = bg ? *(const volatile u32*)(bg + HV_BG_VERTICES) : 0;
+    u32 data = bg ? *(const volatile u32*)(bg + HV_BG_DATA) : 0;
+    if (!vtx || !data || *(const volatile s32*)data <= 11) return 0;
+    for (int i = 0; i != 4; ++i)
+        for (int c = 0; c != 3; ++c) q[i][c] = *(const volatile f32*)(vtx + hv_switch_top[i] * 0xCu + (u32)c * 4u);
+    return 1;
+}
+
 static int hv_on_switch(const f32* pos, const fopAc_ac_c* sw) {
-    f32 dx = pos[0] - sw->current.pos.x, dz = pos[2] - sw->current.pos.z, dy = pos[1] - sw->current.pos.y;
-    return dx * dx + dz * dz <= HV_SWITCH_RADIUS * HV_SWITCH_RADIUS && dy > -HV_SWITCH_HEIGHT && dy < HV_SWITCH_HEIGHT;
+    f32 q[4][3];
+    if (!hv_switch_quad(sw, q)) {
+        f32 dx = pos[0] - sw->current.pos.x, dz = pos[2] - sw->current.pos.z, dy = pos[1] - sw->current.pos.y;
+        return dx * dx + dz * dz <= HV_SWITCH_RADIUS * HV_SWITCH_RADIUS && dy > -HV_SWITCH_HEIGHT && dy < HV_SWITCH_HEIGHT;
+    }
+    f32 top = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) * 0.25f, dy = pos[1] - top;
+    if (dy < -HV_TOP_BELOW || dy > HV_TOP_ABOVE) return 0;
+    int positive = 0, negative = 0; /* over the convex quad: the same side of its four edges */
+    for (int i = 0; i != 4; ++i) {
+        const f32* a = q[i];
+        const f32* b = q[(i + 1) & 3];
+        f32 cross = (b[0] - a[0]) * (pos[2] - a[2]) - (b[2] - a[2]) * (pos[0] - a[0]);
+        if (cross > 0) positive = 1;
+        if (cross < 0) negative = 1;
+    }
+    return !(positive && negative);
 }
 
 /* The players on that switch: the local Link and the living remote ones. */

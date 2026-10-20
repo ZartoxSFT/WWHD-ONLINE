@@ -58,7 +58,41 @@ class Store {
     std::map<Handle,List> pending;
     std::map<Handle,OwnedImage> images;
     std::map<std::string,std::vector<std::weak_ptr<const Image>>> allocations;
-    std::map<std::tuple<std::string,uint32_t,uint32_t>,std::shared_ptr<const List>> published;  // owner, screen, slot
+    // A list is made once per logic step (30 Hz) and shown on every frame until the next one. Lists
+    // follow the game (name tags over Links): each frame shows its elements between the previous
+    // list and the current one, as the frame interpolation shows the models between two steps.
+    struct Published {
+        std::shared_ptr<const List> list,previous;
+        std::chrono::steady_clock::time_point at{};
+        double period=1.0/30.0;  // seconds between this key's last two commits
+    };
+    std::map<std::tuple<std::string,uint32_t,uint32_t>,Published> published;  // owner, screen, slot
+    static bool follows(const Command& a,const Command& b) {
+        if(a.kind!=b.kind||a.anchor!=b.anchor||a.text!=b.text||a.image!=b.image)return false;
+        // A clip rectangle moves with what it clips (name tags: gradient bands clipped over moving
+        // glyphs; left at the step's place, the bands showed at 30 Hz behind the text).
+        if(a.kind==Command::Line||a.kind==Command::ClipPop)return false;
+        float dx=a.x-b.x,dy=a.y-b.y;
+        return dx*dx+dy*dy<=600.f*600.f;  // farther: a jump (a new place), not followed
+    }
+    static std::shared_ptr<const List> between(const Published& p,std::chrono::steady_clock::time_point now) {
+        if(!p.previous)return p.list;
+        double t=std::chrono::duration<double>(now-p.at).count()/p.period;
+        if(!(t<1.0))return p.list;
+        float alpha=float(t<0?0:t);
+        const auto& cur=p.list->commands;const auto& old=p.previous->commands;
+        size_t n=std::min(cur.size(),old.size());
+        bool moved=false;
+        for(size_t i=0;i<n&&!moved;++i)moved=(cur[i].x!=old[i].x||cur[i].y!=old[i].y)&&follows(cur[i],old[i]);
+        if(!moved)return p.list;
+        auto out=std::make_shared<List>(*p.list);
+        for(size_t i=0;i<n;++i) {
+            if(!follows(cur[i],old[i]))continue;
+            out->commands[i].x=old[i].x+(cur[i].x-old[i].x)*alpha;
+            out->commands[i].y=old[i].y+(cur[i].y-old[i].y)*alpha;
+        }
+        return out;
+    }
     std::atomic<bool> visible{false};
     std::atomic<float> pixel_scale[2]{0.f,0.f};
     std::map<std::string,std::string> errors;
@@ -168,7 +202,18 @@ public:
         if(it->second.clip_depth){it->second.invalid=true;errors[owner]="HUD draw list dropped: unbalanced clip stack";}
         bool valid=!it->second.invalid;
         if(!valid||it->second.commands.empty())published.erase(key);
-        else published[key]=std::make_shared<const List>(std::move(it->second));
+        else {
+            auto now=std::chrono::steady_clock::now();
+            auto& entry=published[key];
+            if(entry.list&&entry.at.time_since_epoch().count()) {
+                double gap=std::chrono::duration<double>(now-entry.at).count();
+                // a step's length (paused or slow steps are not followed)
+                if(gap>0.004&&gap<0.1)entry.period=entry.period*0.75+gap*0.25;
+                entry.previous=gap<0.1?entry.list:nullptr;
+            }
+            entry.list=std::make_shared<const List>(std::move(it->second));
+            entry.at=now;
+        }
         visible.store(!published.empty(),std::memory_order_release);
         pending.erase(it);return valid;
     }
@@ -179,7 +224,9 @@ public:
     }
     std::vector<std::shared_ptr<const List>> snapshot(uint32_t screen) {
         std::lock_guard lock(mutex);std::vector<std::shared_ptr<const List>> out;
-        for(const auto& [key,list]:published)if(std::get<1>(key)==screen||std::get<1>(key)==2)out.push_back(list);
+        auto now=std::chrono::steady_clock::now();
+        for(const auto& [key,entry]:published)
+            if(std::get<1>(key)==screen||std::get<1>(key)==2)out.push_back(between(entry,now));
         return out;
     }
     void note(const std::string& owner,const std::string& message) {std::lock_guard lock(mutex);errors[owner]=message;}

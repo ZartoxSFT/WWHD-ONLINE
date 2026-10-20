@@ -126,7 +126,13 @@ static u32 tunic_hash(u32 address, u32 size) {
     return h;
 }
 
-/* The HD texture objects of the hero clothes, from the local Link; 0 when none. */
+/* The HD texture objects of the hero clothes, from the local Link; 0 when none.
+ * 0.3.34: taken from the entries or the copies (+0x48C), whichever is not the casual clothes'
+ * object (getRes("Link", 0x71), puppet.h outfit_casual_texture), the flag deciding only when that
+ * object is not known. Seen (instance 1, 0.3.32): while the clothes changed, the flag and the table
+ * did not agree for a step and the casual texture was taken as the hero's: recoloured with the
+ * tunic colours, it showed on the hero's clothes (and in the puppets' tunic copies). */
+static u32 outfit_casual_texture(void); /* puppet.h */
 static u32 tunic_find_hero(u32 local, u32* out) {
     const daPy_lk_c* link = (const daPy_lk_c*)local;
     u32 list = link->mpCurrLinktex;
@@ -135,13 +141,19 @@ static u32 tunic_find_hero(u32 local, u32* out) {
     u32 headers = tunic_ld32(list + 8);
     if (count > LINK_TEX_MAX) count = LINK_TEX_MAX;
     int casual = (tunic_ld32(local + LINK_NO_RESET_FLG1) & LINK_CASUAL_CLOTHES) != 0;
+    u32 casual_object = outfit_casual_texture();
     u32 found = 0;
     for (u32 k = 0; k != count; ++k) {
-        u32 header = casual ? local + LINK_TEX_COPIES + k * TEX_HEADER_BYTES
-                            : (headers ? tunic_ld32(headers + k * 4) : 0);
+        u32 entry = headers ? tunic_ld32(headers + k * 4) : 0;
+        u32 copy = local + LINK_TEX_COPIES + k * TEX_HEADER_BYTES;
+        u32 header = casual ? copy : entry;
+        if (casual_object) {
+            u32 e = entry ? tunic_ld32(entry + TEX_HEADER_HD) : 0, c = tunic_ld32(copy + TEX_HEADER_HD);
+            header = e && e != casual_object ? entry : c && c != casual_object ? copy : 0;
+        }
         if (!header) continue;
         u32 gx2 = tunic_ld32(header + TEX_HEADER_HD);
-        if (!gx2 || (gx2 & 3)) continue;
+        if (!gx2 || (gx2 & 3) || gx2 == casual_object) continue;
         int known = 0;
         for (u32 i = 0; i != found; ++i) known |= out[i] == gx2;
         if (!known && found != TUNIC_MAX_TEXTURES) out[found++] = gx2;
@@ -247,8 +259,17 @@ static void tunic_refresh(u32 local) {
                     carried = 1;
                 }
         }
-        for (u32 k = 0; k != tunic_texture_count; ++k)
-            if (tunic_textures[k].pristine) wwhd_free(tunic_textures[k].pristine);
+        /* 0.3.34: a texture left behind gets its own colours back before its copy goes */
+        for (u32 k = 0; k != tunic_texture_count; ++k) {
+            tunic_texture* t = &tunic_textures[k];
+            if (!t->pristine) continue;
+            if (tunic_ld32(t->gx2 + GX2_SURFACE_IMAGE) == t->image) {
+                memcpy((void*)t->image, t->pristine, t->image_size);
+                if (t->mip_size) memcpy((void*)t->mip, t->pristine + t->image_size, t->mip_size);
+                tunic_log_texture("multiplayer: tunic texture left, its colours restored", t->gx2);
+            }
+            wwhd_free(t->pristine);
+        }
         tunic_texture_count = 0;
         for (u32 i = 0; i != count; ++i) {
             if (!next[i].pristine) {

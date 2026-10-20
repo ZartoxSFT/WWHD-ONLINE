@@ -46,6 +46,9 @@
 #define CY_AUTO_JUMP_SPEED 17.0f    /* procAutoJump_init's speedF ceiling */
 #define CY_HANDS_DOWN 20.0f         /* the carried Link's feet under the carrier's hands */
 #define CY_CARRY_HEIGHT 110.0f      /* at least this over the carrier's feet: on its head */
+#define CY_KEEP_POS 0x1046CD48              /* l_debug_keep_pos (cXyz) */
+#define CY_KEEP_SHAPE_ANGLE 0x1046CD10      /* l_debug_shape_angle (csXyz) */
+#define CY_KEEP_CURRENT_ANGLE 0x1046CD08    /* l_debug_current_angle (csXyz) */
 #define CY_PAIRS 8
 #define CY_STATUS_NO_LIFT 0x08010000u /* fopAcStts_UNK8000000_e | fopAcStts_UNK10000_e (procGrabReady) */
 
@@ -346,6 +349,17 @@ static void cy_place_local(void* self) {
     link->mNormalSpeed = 0.0f;
     a->shape_angle.y = c->shape_angle.y;
     a->current.angle.y = c->shape_angle.y;
+    /* 0.3.22: daPy_lk_c::execute (d_a_player_main_04.cpp) begins with current.pos =
+     * l_debug_keep_pos (1046CD48) and the angles from l_debug_shape_angle (1046CD10) and
+     * l_debug_current_angle (1046CD08), which its end saves: a place written between two executes
+     * was thrown away (log 0.3.15-0.3.21: y 809 given, 697, 695, 692... after: the carried Link
+     * sank slowly from where it was, ModeFlg_CAUGHT dropping the ground). Given there too. */
+    volatile f32* keep = &WWHD_GAME_DATA(CY_KEEP_POS, f32);
+    keep[0] = x;
+    keep[1] = y;
+    keep[2] = z;
+    (&WWHD_GAME_DATA(CY_KEEP_SHAPE_ANGLE, s16))[1] = c->shape_angle.y;
+    (&WWHD_GAME_DATA(CY_KEEP_CURRENT_ANGLE, s16))[1] = c->shape_angle.y;
 }
 
 /* The middle of a Link's hands (cl_LhandA 8, cl_RhandA 12 of its model), CY_HANDS_DOWN lower. */

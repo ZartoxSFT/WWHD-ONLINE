@@ -22,6 +22,8 @@ usage: make_skin.py SOURCE --id ID --out DIR [--game GAME_DIR]
            permanent_3d.pack, its Link.szs, or a Link.bfres (then --game gives the shaders)
   --id     the skin's name for the other players: 1 to 12 of a-z 0-9 _
   --out    the folder to write skin_<id>.szs into (the mod's Data folder), or a .szs file
+  --game   the game folder: the shaders of a lone Link.bfres, and (0.3.48) the shader archives
+           byte for byte the game's are left out (the mod reads them from the game's "Link")
 """
 import argparse
 import os
@@ -147,6 +149,12 @@ def build(source, skin_id, out, game=None):
     if not ID_PATTERN.match(skin_id):
         raise SkinError("skin id must be 1 to 12 of a-z 0-9 _: " + skin_id)
     files = link_files(find_source(source), game)
+    if game:  # 0.3.48: the mod reads the game's shader archives from "Link" (skin.h skin_get_file)
+        pack_path = os.path.join(game, "content", "Common", "Pack", PACK)
+        with open(pack_path, "rb") as fh:
+            original = read_archive(read_archive(fh.read())["Link.szs"])
+        for name in [n for n in files if n.endswith(".sharcfb") and original.get(n) == files[n]]:
+            del files[name]
     renamed = {}
     for name, body in files.items():
         renamed[archive_name(skin_id) + ".bfres" if name == "Link.bfres" else name] = body

@@ -1324,6 +1324,38 @@ static void test_death(void) {
 }
 
 /* The carry packets (carry.h, WWClient.receiveCarry): the same body both ways. */
+/* The cutscene packets (event_sync.h, WWClient.receiveEvent): the same body both ways. */
+static void test_event(void) {
+    mp_event e = {7, "sea", 44, "OPENING"};
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_event(&w, &e);
+    static const mp_u8 body[] = {0x87, 's', 'e', 'a', 0, 44, 'O', 'P', 'E', 'N', 'I', 'N', 'G', 0};
+    expect_bytes(&w, body, sizeof(body));
+    mp_event got;
+    assert(mp_read_event(body, sizeof(body), &got));
+    assert(got.sender == 7 && strcmp(got.stage, "sea") == 0 && got.room == 44 && strcmp(got.name, "OPENING") == 0);
+    assert(!mp_read_event(body, sizeof(body) - 1, &got));          /* cut */
+    static const mp_u8 empty[] = {0x87, 's', 0, 1, 0};
+    assert(!mp_read_event(empty, sizeof(empty), &got));            /* no name */
+    static const mp_u8 control[] = {0x87, 's', 0, 1, 'A', 0x07, 0};
+    assert(!mp_read_event(control, sizeof(control), &got));        /* not printable */
+    static const mp_u8 room[] = {0x81, 'M', 0, 0xFF, 'x', 0};
+    assert(mp_read_event(room, sizeof(room), &got) && got.room == -1 && !got.has_place);
+    /* 0.3.32: the sender's place */
+    mp_event placed = {1, "M", 2, "D", 1, {1.0f, -2.0f, 0.5f}, -0x4000};
+    w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_event(&w, &placed);
+    static const mp_u8 with_place[] = {0x81, 'M', 0, 2, 'D', 0, 0x3F, 0x80, 0, 0, 0xC0, 0, 0, 0,
+                                       0x3F, 0, 0, 0, 0xC0, 0x00};
+    expect_bytes(&w, with_place, sizeof(with_place));
+    assert(mp_read_event(with_place, sizeof(with_place), &got) && got.has_place && got.pos[0] == 1.0f &&
+           got.pos[1] == -2.0f && got.pos[2] == 0.5f && got.heading == -0x4000);
+    assert(!mp_read_event(with_place, sizeof(with_place) - 1, &got)); /* a cut place */
+    assert(!mp_read_event(with_place, 7, &got));                      /* one byte of a place */
+    mp_session p = parsed_session();
+    assert(p.client_player_event == MP_NO_ID && p.server_player_event == MP_NO_ID);
+}
+
 static void test_carry(void) {
     mp_carry c = {300, 7, MP_CARRY_THROW, -0x4000};
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
@@ -1725,6 +1757,7 @@ int main(void) {
     test_summon();
     test_death();
     test_carry();
+    test_event();
     test_save_sync();
     test_tunic_colors();
     test_placed_actors();

@@ -837,7 +837,7 @@ static unsigned long long bonus_image_epoch = ~0ull;
 static u32 bonus_image_source; /* the heart texture the images were made from */
 static wwhd_hud_element bonus_element;
 
-static int bonus_ptr(u32 p) { return p >= 0x10000000u && p < 0x50000000u && !(p & 3u); }
+static int bonus_ptr(u32 p) { return p >= 0x10000000u && p < 0x60000000u && !(p & 3u); } /* runtime MEM2 end (0.3.50) */
 
 static int bonus_name_is(u32 pane, const char* name) {
     const char* s = (const char*)(pane + BONUS_PANE_NAME);

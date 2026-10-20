@@ -219,6 +219,26 @@ static void skin_note_remote(const char* id) {
     skin_seen_step[slot] = now;
 }
 
+/* 0.3.19: the skins of the players met lately that this machine does not have (players.txt
+ * "skins_missing=", ids comma-separated): the launcher downloads them from the server (it keeps the
+ * skin each player sends), and they load at the next area. Checked every SKIN_MISSING_STEPS. */
+#define SKIN_MISSING_STEPS 150
+static char skin_missing_text[SKIN_SEEN * (MP_SKIN_MAX + 1) + 1];
+static unsigned long long skin_missing_step;
+static const char* skin_missing(void) {
+    unsigned long long now = wwhd_logic_step();
+    if (skin_missing_step && now - skin_missing_step < SKIN_MISSING_STEPS) return skin_missing_text;
+    skin_missing_step = now ? now : 1;
+    int n = 0;
+    for (int i = 0; i != SKIN_SEEN; ++i) {
+        if (!skin_seen[i][0] || now - skin_seen_step[i] >= SKIN_SEEN_STEPS || skin_file_present(skin_seen[i])) continue;
+        if (n) skin_missing_text[n++] = ',';
+        for (int k = 0; skin_seen[i][k]; ++k) skin_missing_text[n++] = skin_seen[i][k];
+    }
+    skin_missing_text[n] = 0;
+    return skin_missing_text;
+}
+
 static int skin_wanted_now(const skin_archive* a, unsigned long long now) {
     if (skin_same_id(a->id, skin_local) && skin_local[0]) return 1;
     for (int i = 0; i != SKIN_SEEN; ++i)
@@ -226,8 +246,99 @@ static int skin_wanted_now(const skin_archive* a, unsigned long long now) {
     return 0;
 }
 
+/* 0.3.24: a skin loads only when the object heaps keep room for the game. Crashes (dist 14:09-14:54,
+ * instance 3 16:52: Omasao/sea, a skin just loaded, "an object archive heap is missing", then
+ * ResMgr_loadArchive 02612E64 writing through a failed allocation): a skin (~25 MB, about 30 MB
+ * unpacked) lives in ResourceControlHD::mpObjectParentHeap (+0x2040), where the game also cuts its
+ * 15 MiB object heap at sea (createObjectHeaps 026079B4) and loads its objects (with the enemy
+ * multiplier, many). The heap's free size is its own virtual (vtable at +0xC, entry +0x74: the call
+ * selectObjectArchiveHeap 02607B68 makes, decomp d_resorce.cpp ResourceHeapVirtualsHD). A skin is
+ * requested only when the free size keeps SKIN_RESERVE for the game (and the sea's 15 MiB while not
+ * made yet); else that player shows as Link, tried again at the next area. */
+#define SKIN_LOAD_BYTES (32u << 20)    /* what a skin takes once loaded (estimate, logged) */
+#define SKIN_RESERVE (12u << 20)       /* kept free for the area's own objects */
+#define SKIN_SEA_HEAPS (16u << 20)     /* createObjectHeaps' 15 MiB, not made yet */
+#define SKIN_CONTROL 0x101F4F28        /* dComIfG_resControl() */
+#define SKIN_PARENT_HEAP 0x2040        /* ResourceControlHD::mpObjectParentHeap */
+#define SKIN_HEAP_FREE_SLOT 0x74       /* its vtable's getFreeSize */
+static u32 skin_planned;               /* bytes asked for by skins requested in this scene load */
+
+static u32 skin_heap_free(u32 heap) {
+    u32 vtable = heap ? *(const volatile u32*)(heap + 0xC) : 0;
+    u32 fn = vtable ? *(const volatile u32*)(vtable + SKIN_HEAP_FREE_SLOT) : 0;
+    if (!fn) return 0;
+    return ((u32(*)(u32))fn)(heap);
+}
+
+#define SKIN_HEAP_LARGEST_SLOT 0x7C     /* getMaxAllocatableSize(alignment) (heap_grow.h hg_max_alloc) */
+static u32 skin_heap_largest(u32 heap) {
+    u32 vtable = heap ? *(const volatile u32*)(heap + 0xC) : 0;
+    u32 fn = vtable ? *(const volatile u32*)(vtable + SKIN_HEAP_LARGEST_SLOT) : 0;
+    if (!fn) return 0;
+    return ((u32(*)(u32, s32))fn)(heap, 4);
+}
+
+/* 1 when a skin may load now; logs the numbers. */
+#define SKIN_HEAP_NEED (26u << 20)  /* what a skin takes in the skins' heap when its size is not known */
+#define SKIN_MOUNT_BYTES (3u << 20) /* its mounting (shader objects, info): ~2 MB measured */
+static u32 hg_skin_heap_get(void);  /* heap_grow.h: the skins' own heap, 0 without */
+static u32 hg_skin_heap_room(void);
+static void hg_log_heaps(void);
+static int skin_room(const skin_archive* a) {
+    if (hg_skin_heap_get()) { /* 0.3.39: the skins' own heap, its largest free block */
+        u32 largest = hg_skin_heap_room();
+        wwhd_log_int("multiplayer: skin memory: skins' heap room (KiB)", (int)(largest >> 10));
+        /* a skin takes ~23 MB once loaded (22.8 MB unpacked: bfres 14 MB, shaders 8.8 MB); the ones
+         * requested in this scene load are not in the heap yet */
+        /* 0.3.48: the skin's own size, from the header skin_file_present just read (Yaz0: the
+         * unpacked size at +4; SARC: the file size at +8), and the mounting (~2 MB, log 0.3.42) */
+        u32 need = SKIN_HEAP_NEED;
+        if (skin_probe[0] == 'Y' || skin_probe[0] == 'S') {
+            u32 at = skin_probe[0] == 'Y' ? 4u : 8u;
+            u32 size = (u32)skin_probe[at] << 24 | (u32)skin_probe[at + 1] << 16 | (u32)skin_probe[at + 2] << 8 | skin_probe[at + 3];
+            if (size > (1u << 20) && size < (64u << 20)) need = size + SKIN_MOUNT_BYTES;
+        }
+        wwhd_log_int("multiplayer:   needed with this skin (KiB)", (int)(need >> 10));
+        if (largest >= skin_planned + need) {
+            skin_planned += need;
+            return 1;
+        }
+        skin_log("left out: the skins' heap is full (Link is shown, tried again at the next area)", a);
+        return 0;
+    }
+    u32 control = WWHD_GAME_DATA(SKIN_CONTROL, u32);
+    u32 heap = control ? *(const volatile u32*)(control + SKIN_PARENT_HEAP) : 0;
+    if (!heap) return 1; /* not known: the game's own checks */
+    u32 free_bytes = skin_heap_free(heap);
+    /* 0.3.40: an archive loads into the largest free block (hd_res_load_task.cpp startLoad), not
+     * the total: crash 0.3.39 (instance 3, 21:33) after a second skin, 84 MiB free in pieces */
+    u32 largest = skin_heap_largest(heap);
+    wwhd_log_int("multiplayer: skin memory: object heap largest free block (KiB)", (int)(largest >> 10));
+    if (largest < free_bytes) free_bytes = largest;
+    const u8* play = wwhd_play_get();
+    const char* stage = play ? (const char*)play + WWHD_PLAY_START_STAGE_NAME_OFFSET : "";
+    int sea = stage[0] == 's' && stage[1] == 'e' && stage[2] == 'a' && stage[3] == 0;
+    u32 need = skin_planned + SKIN_LOAD_BYTES + SKIN_RESERVE +
+               (sea && !*(const volatile u32*)(control + 0x2048) ? SKIN_SEA_HEAPS : 0u);
+    wwhd_log_int("multiplayer: skin memory: object heap free (KiB)", (int)(free_bytes >> 10));
+    wwhd_log_int("multiplayer:   needed with this skin (KiB)", (int)(need >> 10));
+    if (free_bytes >= need) {
+        skin_planned += SKIN_LOAD_BYTES;
+        return 1;
+    }
+    skin_log("left out: not enough memory in this area (Link is shown, tried again at the next area)", a);
+    return 0;
+}
+
 static void skin_add(const char* id) {
     if (!id[0] || skin_find(id) >= 0) return;
+    int idle = 0;
+    for (int k = 0; k != SKIN_ARCHIVES; ++k) idle |= skin_archives[k].state == SKIN_IDLE;
+    if (!idle) {
+        wwhd_log("multiplayer: skin not loaded, no free skin slot:");
+        wwhd_log(id);
+        return;
+    }
     for (int k = 0; k != SKIN_ARCHIVES; ++k) {
         skin_archive* a = &skin_archives[k];
         if (a->state != SKIN_IDLE) continue;
@@ -241,6 +352,8 @@ static void skin_add(const char* id) {
         if (!skin_file_present(a->id)) {
             a->state = SKIN_FAILED;
             skin_log("is not installed (skin_<id>.szs in the mod's Data folder): Link is shown", a);
+        } else if (!skin_room(a)) {
+            a->state = SKIN_FAILED; /* tried again at the next area (skin_scene_load) */
         } else if (wwhd_dComIfG_setObjectRes((u32)a->arc, 0, 0) != 1) {
             a->state = SKIN_FAILED;
             skin_log("load request refused: Link is shown", a);
@@ -260,11 +373,91 @@ static void skin_add(const char* id) {
  * and those of the players met lately), and returns 1 while one still loads. */
 static void skin_read_local(void); /* skin_local from launcher.cfg or the option (mod.c) */
 
+/* 0.3.18: the object heaps of the Great Sea. Crashes (dist 14:09, 14:19, 14:29, instance 3 14:54,
+ * always at sea after a skin loaded): resorce_hd::ResourceControlHD::selectObjectArchiveHeap
+ * (02607B68, decomp d_resorce.cpp; the sea's far islands "LOD..") reads the vtable of each of its 22
+ * archive heaps (+0x2078) with no null check. createObjectHeaps (026079B4) makes them, on first need,
+ * inside a 15 MiB heap (mpObjectHeap +0x2048) cut from mpObjectParentHeap (+0x2040), where the skins
+ * (about 25 MB each) are: with skins in, that heap could not be made, the pointers stayed null.
+ * At sea, before the skins load, the object heaps are made first (the skins kept from the last
+ * area, unused here, are unloaded before: they load again after, or show Link when no room is
+ * left). Other stages keep the game's own order (no separate heaps there). */
+#define SKIN_RES_CONTROL 0x101F4F28   /* dComIfG_resControl() */
+#define SKIN_OBJECT_HEAP 0x2048        /* ResourceControlHD::mpObjectHeap */
+#define SKIN_OBJECT_ARCHIVE_HEAPS 0x2078
+WWHD_GAME_FUNC(0x026079B4, void, skin_create_object_heaps, (u32 control));
+static __attribute__((unused)) void skin_sea_heaps(void) {
+    const u8* play = wwhd_play_get();
+    u32 control = WWHD_GAME_DATA(SKIN_RES_CONTROL, u32);
+    if (!play || !control) return;
+    const char* stage = (const char*)play + WWHD_PLAY_START_STAGE_NAME_OFFSET;
+    if (!(stage[0] == 's' && stage[1] == 'e' && stage[2] == 'a' && stage[3] == 0)) return;
+    if (*(const volatile u32*)(control + SKIN_OBJECT_HEAP)) return; /* made already */
+    for (int i = 0; i != SKIN_ARCHIVES; ++i) {
+        skin_archive* a = &skin_archives[i];
+        if (a->state != SKIN_LOADED || a->users > 0) continue;
+        wwhd_dComIfG_deleteObjectRes((u32)a->arc);
+        a->state = SKIN_IDLE;
+        skin_log("unloaded to make room for the sea's islands", a);
+    }
+    skin_create_object_heaps(control);
+    wwhd_log(*(const volatile u32*)(control + SKIN_OBJECT_HEAP) ? "multiplayer: the sea's object heaps made before the skins"
+                                                               : "multiplayer: the sea's object heaps could not be made");
+}
+
+/* The guard of selectObjectArchiveHeap: a heap pointer left null (createObjectHeaps found no room)
+ * is never read; then the archive goes to mpObjectHeap as when all 22 are full (null: the parent's). */
+WWHD_GAME_ORIGINAL(0x02607B68, u32, skin_archive_heap_original, (u32 control, u32 name));
+WWHD_REPLACE(0x02607B68, u32, skin_archive_heap, (u32 control, u32 name)) {
+    int missing = !control || !*(const volatile u32*)(control + SKIN_OBJECT_HEAP);
+    for (u32 i = 0; !missing && i != 22; ++i) missing = !*(const volatile u32*)(control + SKIN_OBJECT_ARCHIVE_HEAPS + i * 4);
+    if (!missing) return skin_archive_heap_original(control, name);
+    static u32 logged;
+    if (logged++ < 4) wwhd_log("multiplayer: an object archive heap is missing (no room): the archive goes to the object heap");
+    u32 heap = control ? *(const volatile u32*)(control + SKIN_OBJECT_HEAP) : 0;
+    return heap ? heap : (control ? *(const volatile u32*)(control + 0x2040) : 0);
+}
+
 static int skin_scene_load(void) {
     unsigned long long now = wwhd_logic_step();
     skin_read_local(); /* before the first Link: its settings are read in its steps otherwise */
+    /* 0.3.36: what the scene load sees, once per load (no skin line at all was logged in a session
+     * where the local skin and the others' were installed); a slot in no known state is freed */
+    static unsigned long long logged_step;
+    if (now - logged_step > 30) {
+        logged_step = now;
+        hg_log_heaps(); /* heap_grow.h */
+        wwhd_log("multiplayer: skins at this scene load, local skin:");
+        wwhd_log(skin_local[0] ? skin_local : "(none)");
+        for (int i = 0; i != SKIN_ARCHIVES; ++i) {
+            skin_archive* a = &skin_archives[i];
+            if (a->state > SKIN_FAILED) {
+                wwhd_log_int("multiplayer:   skin slot in an unknown state, freed", (int)a->state);
+                a->state = SKIN_IDLE;
+                a->users = 0;
+            }
+            if (a->state != SKIN_IDLE) {
+                wwhd_log_int("multiplayer:   skin slot state (1 loading, 2 loaded, 3 failed)", (int)a->state);
+                wwhd_log(a->id);
+            }
+        }
+    }
+    int loading = 0; /* the memory a skin still loading will take is not in the heap's free size yet */
+    for (int i = 0; i != SKIN_ARCHIVES; ++i) loading |= skin_archives[i].state == SKIN_REQUESTED;
+    if (!loading) skin_planned = 0;
+    /* 0.3.20: skin_sea_heaps is no longer called. Made here (phase_5) the sea's object heaps could not
+     * be made even with no skin loaded (log "could not be made", 15:57 and 16:16), and the sea's
+     * weather then wrote through a failed allocation (setup_cloud_geometry, guest address 0). The
+     * game makes them on first need again; selectObjectArchiveHeap keeps its null guard. */
     for (int i = 0; i != SKIN_ARCHIVES; ++i) {
         skin_archive* a = &skin_archives[i];
+        /* 0.3.21: a skin that failed for want of its file is tried again once the file is there
+         * (fetched by the launcher from the server), even while still wanted */
+        if (a->state == SKIN_FAILED && skin_file_present(a->id)) {
+            a->state = SKIN_IDLE;
+            skin_log("is installed now: loading it", a);
+            continue;
+        }
         if (a->state == SKIN_IDLE || a->state == SKIN_REQUESTED || a->users > 0 || skin_wanted_now(a, now)) continue;
         if (a->state == SKIN_LOADED) {
             wwhd_dComIfG_deleteObjectRes((u32)a->arc);
@@ -356,4 +549,50 @@ static void skin_leave(int previous) { skin_current = previous; }
 static int skin_local_create(u32 actor) {
     if (!skin_bound(actor)) skin_bind(actor, skin_want(skin_local));
     return 0;
+}
+
+/* 0.3.48: the shader archives of a skin are Link's. A skin archive held a copy of every shader
+ * archive of Link.szs (~20 <model>.sharcfb, 8.8 MB of the 22.8 MB; tools/multiplayer/make_skin.py
+ * now leaves out the ones byte for byte the game's). hdResModel_loadFiles (decomp hd_res_model.cpp)
+ * reads "<archive>.bfres", then "<model>.sharcfb" for each model, from the same archive through
+ * ResMgr_getFile2 (026124F4: an unused first argument, sResourceLoader's object, then the archive
+ * resource, the file's SafeString, the size out; generated code: r4-r6 moved on to ResMgr_getFile).
+ * Replaced: when a ".sharcfb" is missing from the archive whose "MpSk_..." bfres was just read, it
+ * is read from the archive "Link" (ResMgr_getArchive 026123FC: the manager, the name; its first
+ * argument is that same manager object, permanent_3d.pack keeps "Link" loaded). */
+WWHD_GAME_FUNC(0x026123FC, u32, skin_res_archive, (u32 manager, u32 name));
+WWHD_GAME_ORIGINAL(0x026124F4, u32, skin_get_file_original, (u32 manager, u32 res, u32 file, u32 size_out));
+static u32 skin_bfres_res;                /* the archive whose MpSk_ bfres was read last */
+static u32 skin_shared_key[2];
+
+static int skin_ends_with(const char* text, const char* tail) {
+    int n = 0, m = 0;
+    while (text[n]) ++n;
+    while (tail[m]) ++m;
+    if (n < m) return 0;
+    for (int i = 0; i != m; ++i)
+        if (text[n - m + i] != tail[i]) return 0;
+    return 1;
+}
+
+WWHD_REPLACE(0x026124F4, u32, skin_get_file, (u32 manager, u32 res, u32 file, u32 size_out)) {
+    u32 data = skin_get_file_original(manager, res, file, size_out);
+    const char* name = file ? (const char*)*(const volatile u32*)file : 0;
+    if (!name) return data;
+    if (name[0] == 'M' && name[1] == 'p' && name[2] == 'S' && name[3] == 'k' && name[4] == '_' &&
+        skin_ends_with(name, ".bfres")) {
+        skin_bfres_res = res;
+        return data;
+    }
+    if (data || res != skin_bfres_res || !skin_ends_with(name, ".sharcfb")) return data;
+    skin_shared_key[0] = (u32)skin_link_name;
+    skin_shared_key[1] = skin_string_vtable();
+    u32 link = skin_res_archive(manager, (u32)skin_shared_key);
+    u32 shared = link ? skin_get_file_original(manager, link, file, size_out) : 0;
+    static u32 logged;
+    if (logged++ < 6) {
+        wwhd_log(shared ? "multiplayer: skin shader taken from Link:" : "multiplayer: skin shader missing, also in Link:");
+        wwhd_log(name);
+    }
+    return shared;
 }

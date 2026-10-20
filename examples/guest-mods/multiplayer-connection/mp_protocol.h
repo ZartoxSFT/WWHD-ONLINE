@@ -248,6 +248,8 @@ typedef struct mp_session {
     mp_u32 server_player_revive;    /* WWHD extension: another player revived us */
     mp_u32 client_player_carry;     /* WWHD extension (WWClient): a player carried, thrown, put down */
     mp_u32 server_player_carry;     /* WWHD extension: the same, from another player */
+    mp_u32 client_player_event;     /* WWHD extension (WWClient): a cutscene started here */
+    mp_u32 server_player_event;     /* WWHD extension: a cutscene another player started */
     /* the SaveServer initializer's map (SaveServer.writeMap): runs of {type, length in bytes} */
     mp_u32 save_map_count;
     mp_u8 save_map_type[MP_SAVE_MAP_MAX];
@@ -502,6 +504,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->client_save_update = s->client_save_merge = s->client_world = MP_NO_ID;
     s->client_player_revive = s->server_player_revive = MP_NO_ID;
     s->client_player_carry = s->server_player_carry = MP_NO_ID;
+    s->client_player_event = s->server_player_event = MP_NO_ID;
     s->save_map_count = 0;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
@@ -532,6 +535,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_WORLD", &s->server_world);
         mp_assign_id(name, n, i, "SERVER_PLAYER_REVIVE", &s->server_player_revive);
         mp_assign_id(name, n, i, "SERVER_PLAYER_CARRY", &s->server_player_carry);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_EVENT", &s->server_player_event);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -549,6 +553,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_WORLD", &s->client_world);
         mp_assign_id(name, n, i, "CLIENT_PLAYER_REVIVE", &s->client_player_revive);
         mp_assign_id(name, n, i, "CLIENT_PLAYER_CARRY", &s->client_player_carry);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_EVENT", &s->client_player_event);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
@@ -1938,6 +1943,61 @@ static inline int mp_read_carry(const mp_u8* payload, mp_u32 size, mp_carry* c) 
     c->action = mp_read_u8(&r);
     c->angle = (mp_s16)mp_read_u16(&r);
     return r.ok && r.pos == r.size && c->action < MP_CARRY_ACTIONS && c->target != c->sender;
+}
+
+/* ------------------------------------------------------------------ cutscenes */
+
+/* WWHD extension: a stage cutscene started in one game plays in the games of the players of the
+ * same stage and room (event_sync.h). CLIENT_PLAYER_EVENT: VLQ the sender's ActorPlayerSync uid,
+ * string the stage (at most 8), u8 the room (s8), string the event's name (at most 31: dEvDtEvent_c
+ * mName), then optionally (0.3.32) the sender's place when it started: f32 x, y, z, s16 heading
+ * (a body without it stays valid). The server (WWClient.java) sends the same body as
+ * SERVER_PLAYER_EVENT to every other client. */
+#define MP_EVENT_STAGE_MAX 8
+#define MP_EVENT_NAME_MAX 31
+
+typedef struct mp_event {
+    mp_u32 sender;
+    char stage[MP_EVENT_STAGE_MAX + 1];
+    signed char room;
+    char name[MP_EVENT_NAME_MAX + 1];
+    int has_place;
+    float pos[3];
+    mp_s16 heading;
+} mp_event;
+
+static inline void mp_write_event(mp_writer* w, const mp_event* e) {
+    mp_write_vlq(w, e->sender);
+    mp_write_string(w, e->stage);
+    mp_write_u8(w, (mp_u8)e->room);
+    mp_write_string(w, e->name);
+    if (!e->has_place) return;
+    for (int i = 0; i != 3; ++i) mp_write_f32(w, e->pos[i]);
+    mp_write_u16(w, (mp_u16)e->heading);
+}
+
+/* SERVER_PLAYER_EVENT (and CLIENT_PLAYER_EVENT, the same body); 0 when malformed (too long, empty
+ * name, a character out of printable ASCII). */
+static inline int mp_read_event(const mp_u8* payload, mp_u32 size, mp_event* e) {
+    mp_reader r = mp_reader_make(payload, size);
+    mp_u32 sn = 0, nn = 0; /* mp_read_string leaves them unset on a cut body */
+    e->sender = mp_read_vlq(&r);
+    const char* stage = mp_read_string(&r, &sn);
+    e->room = (signed char)mp_read_u8(&r);
+    const char* name = mp_read_string(&r, &nn);
+    e->has_place = r.ok && r.pos != r.size;
+    if (e->has_place) {
+        for (int i = 0; i != 3; ++i) e->pos[i] = mp_read_f32(&r);
+        e->heading = (mp_s16)mp_read_u16(&r);
+    }
+    if (!r.ok || r.pos != r.size || sn == 0 || sn > MP_EVENT_STAGE_MAX || nn == 0 || nn > MP_EVENT_NAME_MAX) return 0;
+    for (mp_u32 i = 0; i != sn; ++i) if (stage[i] < 0x20 || stage[i] > 0x7E) return 0;
+    for (mp_u32 i = 0; i != nn; ++i) if (name[i] < 0x20 || name[i] > 0x7E) return 0;
+    for (mp_u32 i = 0; i != sn; ++i) e->stage[i] = stage[i];
+    e->stage[sn] = 0;
+    for (mp_u32 i = 0; i != nn; ++i) e->name[i] = name[i];
+    e->name[nn] = 0;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ save sync */
