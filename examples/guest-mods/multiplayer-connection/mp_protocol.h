@@ -218,6 +218,8 @@ enum {
 #define MP_SCALING_ENTRY "#dynamic_scaling="
 #define MP_ELITE_ENTRY "#elite_chance="
 #define MP_ELITE_CHANCE_MAX 100
+/* WWHD 0.3.13, the same way: "1" when the players fight each other (pvp.h, a server mutator). */
+#define MP_PVP_ENTRY "#pvp="
 
 typedef struct mp_factory {
     char name[MP_ACTOR_NAME_MAX + 1];
@@ -244,6 +246,8 @@ typedef struct mp_session {
     mp_u32 client_world;            /* WWHD extension (ActorFilter): a sailing player's clock and weather */
     mp_u32 client_player_revive;    /* WWHD extension (WWClient): revive a dead player of the directory */
     mp_u32 server_player_revive;    /* WWHD extension: another player revived us */
+    mp_u32 client_player_carry;     /* WWHD extension (WWClient): a player carried, thrown, put down */
+    mp_u32 server_player_carry;     /* WWHD extension: the same, from another player */
     /* the SaveServer initializer's map (SaveServer.writeMap): runs of {type, length in bytes} */
     mp_u32 save_map_count;
     mp_u8 save_map_type[MP_SAVE_MAP_MAX];
@@ -268,6 +272,7 @@ typedef struct mp_session {
     int enemy_randomizer;    /* 0 when the server sends none */
     int dynamic_scaling;     /* 0 when the server sends none */
     mp_u32 elite_chance;     /* percent, 0 when the server sends none */
+    int pvp;                 /* the players fight each other; 0 when the server sends none */
 } mp_session;
 
 static inline void mp_assign_id(const char* s, mp_u32 n, mp_u32 index, const char* name, mp_u32* id) {
@@ -409,6 +414,10 @@ static inline int mp_read_actor_filter(mp_reader* r, mp_session* s) {
             s->dynamic_scaling = rest_n == 1 && rest[0] == '1';
             continue;
         }
+        if (mp_entry_value(name, n, MP_PVP_ENTRY, &rest, &rest_n)) {
+            s->pvp = rest_n == 1 && rest[0] == '1';
+            continue;
+        }
         if (mp_entry_value(name, n, MP_ELITE_ENTRY, &rest, &rest_n)) {
             mp_u32 chance = mp_entry_number(rest, rest_n, MP_ELITE_CHANCE_MAX);
             s->elite_chance = chance > MP_ELITE_CHANCE_MAX ? 0 : chance;
@@ -492,6 +501,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->server_save_update = s->server_save_from = s->server_world = MP_NO_ID;
     s->client_save_update = s->client_save_merge = s->client_world = MP_NO_ID;
     s->client_player_revive = s->server_player_revive = MP_NO_ID;
+    s->client_player_carry = s->server_player_carry = MP_NO_ID;
     s->save_map_count = 0;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
@@ -506,6 +516,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->enemy_randomizer = 0;
     s->dynamic_scaling = 0;
     s->elite_chance = 0;
+    s->pvp = 0;
 
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -520,6 +531,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_SAVE_FROM", &s->server_save_from);
         mp_assign_id(name, n, i, "SERVER_WORLD", &s->server_world);
         mp_assign_id(name, n, i, "SERVER_PLAYER_REVIVE", &s->server_player_revive);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_CARRY", &s->server_player_carry);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -536,6 +548,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_SAVE_MERGE", &s->client_save_merge);
         mp_assign_id(name, n, i, "CLIENT_WORLD", &s->client_world);
         mp_assign_id(name, n, i, "CLIENT_PLAYER_REVIVE", &s->client_player_revive);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_CARRY", &s->client_player_carry);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
@@ -1702,19 +1715,20 @@ static inline int mp_read_placed_update(const mp_u8* payload, mp_u32 size, const
 }
 
 /* SERVER_MUTATORS (WWHD extension): VLQ enemy multiplier, u8 randomizer, then (0.2.47 servers)
- * u8 dynamic scaling and u8 elite chance (percent). The server sends it to every client when its
- * mutators change while it runs. A body without the last two (an older server) leaves *scaling and
- * *elite at 0; 0 when malformed. */
+ * u8 dynamic scaling and u8 elite chance (percent), then (0.3.13 servers) u8 pvp. The server sends it
+ * to every client when its mutators change while it runs. A body without the last ones (an older
+ * server) leaves them at 0; 0 when malformed. */
 static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer,
-                                      int* scaling, mp_u32* elite) {
+                                      int* scaling, mp_u32* elite, int* pvp) {
     mp_reader r = mp_reader_make(payload, size);
     mp_u32 m = mp_read_vlq(&r);
     mp_u8 random = mp_read_u8(&r);
-    mp_u8 scale = 0, chance = 0;
+    mp_u8 scale = 0, chance = 0, fight = 0;
     if (r.ok && r.pos != r.size) {
         scale = mp_read_u8(&r);
         chance = mp_read_u8(&r);
     }
+    if (r.ok && r.pos != r.size) fight = mp_read_u8(&r);
     if (!r.ok || r.pos != r.size) return 0;
     if (m < 1) m = 1;
     if (m > MP_MULTIPLIER_MAX) m = MP_MULTIPLIER_MAX;
@@ -1722,13 +1736,14 @@ static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32*
     *randomizer = random != 0;
     *scaling = scale != 0;
     *elite = chance > MP_ELITE_CHANCE_MAX ? MP_ELITE_CHANCE_MAX : chance;
+    *pvp = fight != 0;
     return 1;
 }
 
 static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer) {
-    int scaling;
+    int scaling, pvp;
     mp_u32 elite;
-    return mp_read_mutators_ex(payload, size, multiplier, randomizer, &scaling, &elite);
+    return mp_read_mutators_ex(payload, size, multiplier, randomizer, &scaling, &elite, &pvp);
 }
 
 /* ------------------------------------------------------------------ player directory */
@@ -1886,6 +1901,43 @@ static inline int mp_read_revive(const mp_u8* payload, mp_u32 size, char* revive
     if (!r.ok || r.pos != r.size) return 0;
     mp_copy_text(reviver, MP_NAME_MAX + 1, text, n);
     return 1;
+}
+
+/* ------------------------------------------------------------------ carry */
+
+/* WWHD extension: a player carries another (carry.h). CLIENT_PLAYER_CARRY: VLQ the carried (or
+ * carrying) player's ActorPlayerSync uid, VLQ the sender's own uid, u8 action (MP_CARRY_*), u16
+ * the sender's Link's facing (shape_angle.y). The server (WWClient.java) sends the same body as
+ * SERVER_PLAYER_CARRY to every other client; the one whose player has that uid acts on it, the
+ * others note who carries whom. */
+#define MP_CARRY_LIFT 0    /* sender lifts the target */
+#define MP_CARRY_PUT 1     /* sender puts the target down (or drops it) */
+#define MP_CARRY_THROW 2   /* sender throws the target forward, the facing given */
+#define MP_CARRY_JUMP 3    /* sender, carried by the target, jumped off */
+#define MP_CARRY_ACTIONS 4
+
+typedef struct mp_carry {
+    mp_u32 target;
+    mp_u32 sender;
+    mp_u8 action;
+    mp_s16 angle;
+} mp_carry;
+
+static inline void mp_write_carry(mp_writer* w, const mp_carry* c) {
+    mp_write_vlq(w, c->target);
+    mp_write_vlq(w, c->sender);
+    mp_write_u8(w, c->action);
+    mp_write_u16(w, (mp_u16)c->angle);
+}
+
+/* SERVER_PLAYER_CARRY (and CLIENT_PLAYER_CARRY, the same body); 0 when malformed. */
+static inline int mp_read_carry(const mp_u8* payload, mp_u32 size, mp_carry* c) {
+    mp_reader r = mp_reader_make(payload, size);
+    c->target = mp_read_vlq(&r);
+    c->sender = mp_read_vlq(&r);
+    c->action = mp_read_u8(&r);
+    c->angle = (mp_s16)mp_read_u16(&r);
+    return r.ok && r.pos == r.size && c->action < MP_CARRY_ACTIONS && c->target != c->sender;
 }
 
 /* ------------------------------------------------------------------ save sync */

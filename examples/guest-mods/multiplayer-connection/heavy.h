@@ -53,7 +53,7 @@
 #define HV_MISS_HOLD 12            /* procGrabMiss's own count (mProcVar0) */
 #define HV_COUNT_LIFT 150.0f       /* the count's height above the thing */
 
-enum { HV_NONE, HV_PUSH, HV_LIFT };
+enum { HV_NONE, HV_PUSH, HV_LIFT, HV_SWITCH };
 
 WWHD_GAME_ORIGINAL(0x023ED0F0, s32, hv_grab_ready_original, (void* self));
 WWHD_GAME_ORIGINAL(0x023775DC, u32, hv_movebox_pp_original, (u32 target, u32 unused, s16 angle, u32 label));
@@ -243,6 +243,67 @@ static int hv_block_near(const f32* pos, f32* out) {
     return found;
 }
 
+/* 0.3.13: the floor switches' counts for every player of the room. The switches of the stage are
+ * learned from their execute (daObjSwpush::Act_c::Mthd_Execute 02398014, one argument, SDK binding;
+ * an entry hook), forgotten when they stop running (HV_SWITCH_FORGET steps). A switch with a player
+ * on it (HV_SWITCH_RADIUS, HV_SWITCH_HEIGHT; the local Link or a living remote one) shows its count
+ * in every game, the same count hv_switch_ride gives, not twice over the local Link's own. */
+#define HV_SWITCHES 16
+#define HV_SWITCH_FORGET 30
+#define HV_SWITCH_RADIUS 140.0f
+#define HV_SWITCH_HEIGHT 120.0f
+typedef struct hv_switch {
+    u32 actor;
+    unsigned long long seen;
+} hv_switch;
+static hv_switch hv_switches[HV_SWITCHES];
+
+WWHD_HOOK(0x02398014, hv_switch_execute, (void* self)) {
+    unsigned long long step = wwhd_logic_step();
+    hv_switch* free_slot = 0;
+    for (int i = 0; i != HV_SWITCHES; ++i) {
+        hv_switch* s = &hv_switches[i];
+        if (s->actor == (u32)self) { s->seen = step; return; }
+        if (!free_slot && (!s->actor || step - s->seen > HV_SWITCH_FORGET)) free_slot = s;
+    }
+    if (free_slot) { free_slot->actor = (u32)self; free_slot->seen = step; }
+}
+
+static int hv_on_switch(const f32* pos, const fopAc_ac_c* sw) {
+    f32 dx = pos[0] - sw->current.pos.x, dz = pos[2] - sw->current.pos.z, dy = pos[1] - sw->current.pos.y;
+    return dx * dx + dz * dz <= HV_SWITCH_RADIUS * HV_SWITCH_RADIUS && dy > -HV_SWITCH_HEIGHT && dy < HV_SWITCH_HEIGHT;
+}
+
+/* The players on that switch: the local Link and the living remote ones. */
+static u32 hv_switch_players(const fopAc_ac_c* sw, const f32* here) {
+    u32 on = hv_on_switch(here, sw) ? 1u : 0u;
+    for (int i = 0; i != MAX_REMOTES; ++i) {
+        const remote_player* r = &remotes[i];
+        if (r->active && r->has_transform && hv_alive_look(r) && hv_on_switch(hv_remote_pos(r), sw)) ++on;
+    }
+    return on;
+}
+
+static void hv_remote_switches(const f32* here, u32 needed) {
+    unsigned long long step = wwhd_logic_step();
+    for (int i = 0; i != HV_SWITCHES && hv_remote_count != MAX_REMOTES; ++i) {
+        const hv_switch* s = &hv_switches[i];
+        if (!s->actor || step - s->seen > 2) continue;
+        const fopAc_ac_c* sw = (const fopAc_ac_c*)s->actor;
+        f32 at[3] = {sw->current.pos.x, sw->current.pos.y, sw->current.pos.z};
+        if (hv_dist2(at, here) > HV_REMOTE_SHOW_DISTANCE * HV_REMOTE_SHOW_DISTANCE) continue;
+        if (hv_show > 0 && hv_dist2(at, hv_anchor) < HV_SAME_THING * HV_SAME_THING) continue; /* its own */
+        u32 on = hv_switch_players(sw, here);
+        if (!on) continue;
+        hv_shown* shown = &hv_remote_shown[hv_remote_count++];
+        shown->at[0] = at[0];
+        shown->at[1] = at[1];
+        shown->at[2] = at[2];
+        shown->count = on;
+        shown->needed = needed;
+    }
+}
+
 static void hv_remote_step(const daPy_lk_c* link) {
     hv_remote_count = 0;
     if (state != READY || local_uid == MP_NO_ID) return;
@@ -280,6 +341,47 @@ static void hv_remote_step(const daPy_lk_c* link) {
         s->at[2] = at[2];
         s->count = count;
         s->needed = needed;
+    }
+    hv_remote_switches(here, needed);
+}
+
+/* 0.3.11: floor switches take the room too. The yellow floor switch daObjSwpush (d_a_obj_swpush.cpp,
+ * its iron-boots kind included: FLAG_REQ_HEAVY) learns that an actor stands on it from its ride
+ * callback rideCB (0239705C: background, switch, rider; SDK binding, the same in the EU build): a
+ * rider within the switch's top sets mRidingMode (+0x480), and the switch goes down after its delay
+ * (set_push_flag, mode_upper). Replaced: for the local Link, the callback counts only while enough
+ * players of the room (hv_needed_for) stand on the switch: the local Link and the living remote players
+ * within HV_SWITCH_RADIUS of its centre and HV_SWITCH_HEIGHT of its height; the count shows over it.
+ * Every game does the same with its own Link: the switch goes down in each once they are all there.
+ * Other riders (a pot, a block) press it as in the game. */
+WWHD_GAME_ORIGINAL(0x0239705C, void, hv_switch_ride_original, (void* bg, void* sw, void* rider));
+WWHD_REPLACE(0x0239705C, void, hv_switch_ride, (void* bg, void* sw, void* rider)) {
+    if (!sw || !rider || (u32)rider != hv_link || puppet_is(rider)) {
+        hv_switch_ride_original(bg, sw, rider);
+        return;
+    }
+    const fopAc_ac_c* link = (const fopAc_ac_c*)rider;
+    if ((state != READY || local_uid == MP_NO_ID) && !pb_room_player()) {
+        hv_switch_ride_original(bg, sw, rider);
+        return;
+    }
+    u32 players = hv_room_players(link);
+    if (players <= 1) {
+        hv_switch_ride_original(bg, sw, rider);
+        return;
+    }
+    const fopAc_ac_c* s = (const fopAc_ac_c*)sw;
+    f32 none[3] = {s->current.pos.x, s->current.pos.y + 10.0f * HV_SWITCH_HEIGHT, s->current.pos.z};
+    u32 on = 1 + hv_switch_players(s, none); /* the local Link, riding, and the remote ones */
+    hv_kind = HV_SWITCH;
+    hv_needed = hv_needed_for(players);
+    hv_count = on;
+    hv_show = HV_SHOW_SECONDS;
+    hv_anchor_at((u32)sw);
+    if (on >= hv_needed) hv_switch_ride_original(bg, sw, rider);
+    else {
+        static u32 logged;
+        if (logged++ < 3) wwhd_log("multiplayer: a floor switch waits for the players of the room");
     }
 }
 

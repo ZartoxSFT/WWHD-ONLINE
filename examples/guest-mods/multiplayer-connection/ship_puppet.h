@@ -354,6 +354,7 @@ WWHD_REPLACE(0x021644BC, s32, ship_grid_execute, (void* a)) {
 WWHD_REPLACE(0x02162F68, s32, ship_grid_draw, (void* a)) {
     u32 owner = ship_grid_owner((u32)a);
     if (!owner) return ship_grid_draw_original(a);
+    if (cull_player_far((const void*)owner)) return 1; /* its ship is not drawn either (0.3.12) */
     volatile u32* global = &WWHD_GAME_DATA(SHIP_GRID_GLOBAL, u32);
     u32 saved = *global;
     *global = owner;
@@ -366,6 +367,7 @@ WWHD_REPLACE(0x02162F68, s32, ship_grid_draw, (void* a)) {
 
 WWHD_REPLACE(0x02472AAC, s32, ship_puppet_draw, (void* i_this)) {
     if (!ship_puppet_is(i_this)) return ship_draw_original(i_this);
+    if (cull_player_far(i_this)) return 1; /* too far to be worth drawing (puppet.h cull_player_far) */
     int slot = ship_slot_of_actor((u32)i_this);
     boat_swap_begin(slot, (u32)i_this);
     s32 result = ship_draw_original(i_this);

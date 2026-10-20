@@ -146,10 +146,27 @@ static u32 bonus_quiver(void) {
     return save ? *(const volatile u8*)(save + BONUS_SAVE_QUIVER) : 0;
 }
 
+/* 0.3.16: at most 10 elemental arrows of each type with the small quiver (the save's maximum 30), 20
+ * with the middle one (60), 30 with the big one (99). */
+static u32 bonus_elemental_cap(void) {
+    u32 q = bonus_quiver();
+    return q <= 30u ? 10u : q <= 60u ? 20u : 30u;
+}
+
 static void bonus_arrows_step(void) {
     u32 save = bonus_save_addr();
     u8* play = wwhd_play_get();
     if (!save || !play) return;
+    u32 cap = bonus_elemental_cap();
+    for (u32 t = 1; t != 4; ++t)
+        if (bonus_arrows[t] > cap) {
+            bonus_arrows[t] = cap;
+            bonus_dirty = 1;
+        }
+    if (bonus_arrow_shown && *(const volatile s16*)(play + BONUS_PLAY_ARROWS) == 0) {
+        volatile u8* shown = (volatile u8*)(save + BONUS_SAVE_ARROWS);
+        if (*shown > cap) *shown = (u8)cap; /* the shown type's stock, in the save while aiming */
+    }
     u32 want = 0;
     if (bonus_link_alive()) {
         const daPy_lk_c* link = (const daPy_lk_c*)bonus_link;
@@ -161,7 +178,7 @@ static void bonus_arrows_step(void) {
     volatile u8* count = (volatile u8*)(save + BONUS_SAVE_ARROWS);
     if (bonus_arrow_shown) bonus_arrows[bonus_arrow_shown] = *count; /* what the shots left */
     else bonus_arrow_normal = *count;
-    *count = (u8)(want ? bonus_arrows[want] : bonus_arrow_normal);
+    *count = (u8)(want ? (bonus_arrows[want] > cap ? cap : bonus_arrows[want]) : bonus_arrow_normal);
     bonus_arrow_shown = want;
     bonus_dirty = 1;
 }
@@ -592,18 +609,7 @@ static void bonus_fx_step(void) {
 
 static u32 bonus_actor_id(u32 actor) { return actor ? *(const volatile u32*)(actor + BONUS_PROCESS_ID) : 0; }
 
-/* A loot that made something: sometimes a yellow heart or magic at its place. */
-static void bonus_yellow_roll(u32 pos, u32 room) {
-    if (!pos || !bonus_save_ready()) return;
-    bonus_load();
-    u32 item;
-    if (bonus_random() % 1000u < bonus_drop_heart && !bonus_heart_full()) {
-        item = BONUS_ITEM_HEART;
-    } else if (bonus_random() % 1000u < bonus_drop_magic && bonus_max_magic() && !bonus_magic_full()) {
-        item = BONUS_ITEM_MAGIC;
-    } else {
-        return;
-    }
+static void bonus_yellow_make(u32 pos, u32 room, u32 item) {
     u8 saved = as_context;
     as_context = AS_CTX_NONE; /* this game's own */
     bonus_making = 1;
@@ -614,6 +620,17 @@ static void bonus_yellow_roll(u32 pos, u32 room) {
     bonus_yellow_ids[bonus_yellow_next] = id;
     bonus_yellow_next = (bonus_yellow_next + 1) % BONUS_YELLOW_ITEMS;
     wwhd_log(item == BONUS_ITEM_HEART ? "multiplayer: a yellow heart dropped" : "multiplayer: a yellow magic jar dropped");
+}
+
+/* A loot that made something: sometimes a yellow heart, sometimes a yellow magic jar at its place.
+ * 0.3.12: two rolls apart, both may drop (before, a yellow heart left no roll to the magic). */
+static void bonus_yellow_roll(u32 pos, u32 room) {
+    if (!pos || !bonus_save_ready()) return;
+    bonus_load();
+    int heart = bonus_random() % 1000u < bonus_drop_heart;
+    int magic = bonus_random() % 1000u < bonus_drop_magic;
+    if (heart && !bonus_heart_full()) bonus_yellow_make(pos, room, BONUS_ITEM_HEART);
+    if (magic && bonus_max_magic() && !bonus_magic_full()) bonus_yellow_make(pos, room, BONUS_ITEM_MAGIC);
 }
 
 /* The loot window closes (the outermost call). */
@@ -690,18 +707,21 @@ WWHD_REPLACE(0x0217DE18, void, bonus_item_get, (void* self)) {
 /* execItemGet: the yellow heart or magic instead of the red heart or the magic. */
 WWHD_REPLACE(0x0254DA38, void, bonus_exec_item_get, (u32 item)) {
     if (item >= BONUS_ITEM_ARROW_10 && item <= BONUS_ITEM_ARROW_30 && (bonus_picking_type || bonus_arrow_shown)) {
-        u32 count = (item - BONUS_ITEM_ARROW_10 + 1u) * 10u, quiver = bonus_quiver();
+        u32 count = (item - BONUS_ITEM_ARROW_10 + 1u) * 10u, quiver = bonus_quiver(), cap = bonus_elemental_cap();
         u32 type = bonus_picking_type;
         bonus_picking_type = 0;
         bonus_load();
         if (type) { /* elemental: half the pack, to that type's stock */
             count /= 2u;
             u8* play = wwhd_play_get();
-            if (type == bonus_arrow_shown && play) { /* shown now: the game counts it */
+            u32 save = bonus_save_addr();
+            if (type == bonus_arrow_shown && play && save) { /* shown now: the game counts it, up to the cap */
                 volatile s16* pending = (volatile s16*)(play + BONUS_PLAY_ARROWS);
-                *pending = (s16)(*pending + (s16)count);
+                u32 now = *(const volatile u8*)(save + BONUS_SAVE_ARROWS) + (u32)(*pending > 0 ? *pending : 0);
+                u32 room = now >= cap ? 0u : cap - now;
+                *pending = (s16)(*pending + (s16)(count > room ? room : count));
             } else {
-                bonus_arrows[type] = bonus_arrows[type] + count > quiver ? quiver : bonus_arrows[type] + count;
+                bonus_arrows[type] = bonus_arrows[type] + count > cap ? cap : bonus_arrows[type] + count;
             }
             bonus_dirty = 1;
             wwhd_log_int("multiplayer: elemental arrows picked up, type", (int)type);
@@ -1109,6 +1129,40 @@ static void bonus_emit_quarters(u32 list, u32 image, f32 x, f32 y, f32 w, f32 h,
     if (quarters >= 3u) bonus_emit_uv(list, image, x, y, w, h, BONUS_CUT_U, BONUS_CUT_V, 1.0f, 1.0f, alpha);
 }
 
+/* 0.3.13: the centre of heart slot j. The game lays out (and draws) only what it shows: the matrix
+ * of a pane it hides is stale (seen: yellow hearts at the screen's bottom left, or a slot too far).
+ * 0.3.14: still a slot too far at times (a screenshot: three hearts, the yellow one a slot and a half
+ * on), from the fill of an empty or partial heart, hidden. Every slot is now placed from the
+ * containers' bases (P_Base_00) of slots 0 and 1 (and 10), shown whenever the player has those
+ * containers (three at least): ten a row (L_Heart_00..09, then 10..19 under them), the step between
+ * slots 0 and 1, between rows the one between slots 0 and 10 when shown, else that step downwards. */
+#define BONUS_ROW 10u
+static void bonus_slot_center(u32 j, u32 first, f32* x, f32* y) {
+    f32 s;
+    if (first < 2u) {
+        bonus_center(bonus_base[j < BONUS_SLOTS ? j : BONUS_SLOTS - 1u], x, y, &s);
+        return;
+    }
+    f32 x0, y0, x1, y1;
+    bonus_center(bonus_base[0], &x0, &y0, &s);
+    bonus_center(bonus_base[1], &x1, &y1, &s);
+    f32 sx = x1 - x0, sy = y1 - y0;
+    f32 rx = 0.0f, ry = sx < 0.0f ? -sx : sx;
+    if (first > BONUS_ROW) {
+        f32 x10, y10;
+        bonus_center(bonus_base[BONUS_ROW], &x10, &y10, &s);
+        rx = x10 - x0;
+        ry = y10 - y0;
+    }
+    u32 row = j / BONUS_ROW, col = j % BONUS_ROW;
+    if (row > 1u) { /* past the 20th: on along the second row */
+        col += (row - 1u) * BONUS_ROW;
+        row = 1u;
+    }
+    *x = x0 + sx * (f32)col + rx * (f32)row;
+    *y = y0 + sy * (f32)col + ry * (f32)row;
+}
+
 static void bonus_draw(u32 list) {
     if (!bonus_loaded || (!bonus_hearts && !bonus_magic) || !bonus_link_alive() || !bonus_save_ready()) return;
     const u8* play = wwhd_play_get();
@@ -1136,13 +1190,39 @@ static void bonus_draw(u32 list) {
     if (bonus_hearts) {
         f32 alpha = bonus_alpha(bonus_heart[0]);
         u32 first = dComIfGs_player_status_a.max_life / 4u; /* the heart containers */
+        /* 0.3.15: the containers the HUD shows (their bases visible), when it shows fewer: seen, the
+         * save's maximum 20 hearts, life 13 quarters, three hearts on screen; the yellow heart went
+         * after a quarter heart the HUD did not show (a slot too far) */
+        u32 visible = 0;
+        while (visible != BONUS_SLOTS && bonus_alpha(bonus_base[visible]) > 0.0f) ++visible;
+        if (visible >= 1u && visible < first) first = visible;
         u32 shown = *(const volatile u16*)(play + BONUS_PLAY_NOW_LIFE);
+        if (shown > first * 4u) shown = first * 4u;
         u32 start = (shown + 3u) / 4u; /* the first slot after the last (even partial) heart */
         if (start > first) start = first;
         u32 count = (bonus_hearts + 3u) / 4u;
-        f32 x0, y0, x1, y1, s;
-        bonus_center(bonus_heart[0], &x0, &y0, &s);
-        bonus_center(bonus_heart[1], &x1, &y1, &s);
+        { /* the placement's inputs, logged when they change (0.3.14: a yellow heart a slot too far) */
+            static u32 logged_first = ~0u, logged_start = ~0u, logged_count;
+            if (logged_count < 12 && (first != logged_first || start != logged_start)) {
+                ++logged_count;
+                logged_first = first;
+                logged_start = start;
+                f32 hx, hy, bx, by, sk, px, py;
+                wwhd_log_int("multiplayer: yellow hearts: containers", (int)first);
+                wwhd_log_int("multiplayer:   life shown (quarters)", (int)shown);
+                wwhd_log_int("multiplayer:   first yellow slot", (int)start);
+                for (u32 k = 0; k != 4 && k != BONUS_SLOTS; ++k) {
+                    bonus_center(bonus_heart[k], &hx, &hy, &sk);
+                    bonus_center(bonus_base[k], &bx, &by, &sk);
+                    wwhd_log_int("multiplayer:   slot", (int)k);
+                    wwhd_log_int("multiplayer:     fill x", (int)hx);
+                    wwhd_log_int("multiplayer:     base x", (int)bx);
+                }
+                bonus_slot_center(start, first, &px, &py);
+                wwhd_log_int("multiplayer:   yellow x", (int)px);
+                wwhd_log_int("multiplayer:   yellow y", (int)py);
+            }
+        }
         /* The game draws its hearts small but its current one: the yellow hearts are small but the
          * last, which also takes the glow (the game's big heart lost both: bonus_shrink_current). */
         f32 small = bonus_small_scale, big = bonus_big_scale;
@@ -1160,14 +1240,8 @@ static void bonus_draw(u32 list) {
         const volatile f32* heart_size = (const volatile f32*)(bonus_heart[0] + BONUS_PANE_SIZE);
         const volatile f32* base_size = (const volatile f32*)(bonus_base[0] + BONUS_PANE_SIZE);
         for (u32 i = 0; i != count; ++i) {
-            u32 slot = start + i, past = 0;
-            if (slot >= BONUS_SLOTS) { /* past the 20th: on to the right of the last slot */
-                past = slot - (BONUS_SLOTS - 1u);
-                slot = BONUS_SLOTS - 1u;
-            }
-            f32 cx, cy, unused;
-            bonus_center(bonus_heart[slot], &cx, &cy, &unused);
-            cx += (x1 - x0) * (f32)past;
+            f32 cx, cy;
+            bonus_slot_center(start + i, first, &cx, &cy);
             f32 k = i + 1u == count ? big : small;
             f32 w = heart_size[0] * k, h = heart_size[1] * k;
             f32 bw = base_size[0] * k, bh = base_size[1] * k;

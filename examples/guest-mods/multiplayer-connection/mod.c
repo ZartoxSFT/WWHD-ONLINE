@@ -199,8 +199,11 @@ static remote_player* find_remote(mp_u32 uid, int create) {
     return free_slot;
 }
 
+static void cy_reset(void); /* carry.h */
+
 static void clear_area_state(void) {
     for (int i = 0; i != MAX_REMOTES; ++i) remotes[i].active = markers[i].visible = 0;
+    cy_reset();
     puppet_clear_all();
     ship_puppet_clear_all();
     swing_clear_all();
@@ -240,6 +243,7 @@ static void handle_init(const unsigned char* item, u32 size) {
     wwhd_log_int("multiplayer: server enemy multiplier", (int)session.enemy_multiplier);
     wwhd_log_int("multiplayer: server dynamic scaling", session.dynamic_scaling);
     wwhd_log_int("multiplayer: server elite chance (percent)", (int)session.elite_chance);
+    wwhd_log_int("multiplayer: server pvp", session.pvp);
     if (!session.factories_complete) wwhd_log("multiplayer: too many ActorSync factories, placed actors stay local");
     state = READY;
     sv_open(&session); /* the SaveServer map came with the init */
@@ -270,6 +274,8 @@ static int el_remote_room(const remote_player* r, s8* room) {
     return 0;
 }
 #include "death.h"    /* no game over while another player of the stage lives */
+static void cy_received(const mp_u8* body, mp_u32 length); /* carry.h */
+#include "pvp.h"      /* the players who turned PvP on fight each other */
 
 static void handle_frame(const unsigned char* item, u32 size) {
     mp_u32 id, length;
@@ -349,6 +355,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         shop_received(body, length);
     } else if (id == session.server_player_revive) {
         dh_revived(body, length);
+    } else if (id == session.server_player_carry) {
+        cy_received(body, length);
     } else if (id == session.server_save_from) {
         sv_from_received(body, length);
     } else if (id == session.server_save_update) {
@@ -357,8 +365,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         wd_received(body, length);
     } else if (id == session.server_mutators) {
         mp_u32 multiplier, elite;
-        int randomizer, scaling;
-        if (!mp_read_mutators_ex(body, length, &multiplier, &randomizer, &scaling, &elite)) {
+        int randomizer, scaling, pvp;
+        if (!mp_read_mutators_ex(body, length, &multiplier, &randomizer, &scaling, &elite, &pvp)) {
             drop_frame("multiplayer: malformed mutators skipped", body, length);
             return;
         }
@@ -366,6 +374,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
         session.enemy_randomizer = randomizer;
         session.dynamic_scaling = scaling; /* elite.h: the actors follow at their next execute */
         session.elite_chance = elite;      /* for the enemies made from now on */
+        session.pvp = pvp;                 /* pvp.h */
         as_mutators_changed(); /* the loaded area follows at the next step */
         wwhd_log_int("multiplayer: server mutators changed, enemy multiplier", (int)multiplier);
     }
@@ -1843,6 +1852,82 @@ static int debug_cfg_value(const char* text, u32 size, const char* key, u32* val
     return 0;
 }
 
+/* "key=text" in debug.cfg (letters, digits, _): its length, 0 when absent or longer than cap - 1. */
+static u32 debug_cfg_text(const char* text, u32 size, const char* key, char* out, u32 cap) {
+    u32 klen = 0;
+    while (key[klen]) ++klen;
+    for (u32 pos = 0; pos < size;) {
+        u32 end = pos;
+        while (end < size && text[end] != '\n' && text[end] != '\r') ++end;
+        u32 k = 0;
+        while (k != klen && pos + k < end && text[pos + k] == key[k]) ++k;
+        if (k == klen && pos + klen < end && text[pos + klen] == '=') {
+            u32 n = 0;
+            for (u32 i = pos + klen + 1; i < end; ++i) {
+                char c = text[i];
+                int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+                if (!ok || n + 1 >= cap) return 0;
+                out[n++] = c;
+            }
+            out[n] = 0;
+            return n;
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+/* 0.3.13: the launcher's SUMMON AN ACTOR ("spawn=<name>", "spawn_params=<hex>"), DEBUG_SPAWN_AHEAD in
+ * front of the local Link, in its room, facing it. 0.3.14: made as the shop's creatures are
+ * (actor_sync.h as_summon: the stage's own creation from a tagged block, sent to the others through
+ * the server and made once in their games) when the server synchronises that name (its actor list);
+ * any other name by fopAcM_create_str (025D58B4, f_op_actor_mng.cpp: seven arguments, the stage
+ * actor table dStage_searchName, (u32)-1 for an unknown name), in this game only. */
+#define DEBUG_SPAWN_AHEAD 200.0f
+static char debug_spawn_name[12];
+static cXyz debug_spawn_pos;
+static csXyz debug_spawn_angle;
+
+static void debug_spawn(u8* play, const char* text, u32 size) {
+    u32 n = debug_cfg_text(text, size, "spawn", debug_spawn_name, 9);
+    if (!n) return;
+    char hex[12];
+    u32 params = 0xFFFFFFFFu;
+    u32 h = debug_cfg_text(text, size, "spawn_params", hex, 9);
+    if (h) {
+        params = 0;
+        for (u32 i = 0; i != h; ++i) {
+            char c = hex[i];
+            u32 d = c >= '0' && c <= '9' ? (u32)(c - '0') : c >= 'A' && c <= 'F' ? (u32)(c - 'A' + 10) :
+                    c >= 'a' && c <= 'f' ? (u32)(c - 'a' + 10) : 16u;
+            if (d == 16u) { params = 0xFFFFFFFFu; break; }
+            params = params << 4 | d;
+        }
+    }
+    const fopAc_ac_c* link = (const fopAc_ac_c*)*(const volatile u32*)(play + WWHD_PLAY_PLAYER_OFFSET);
+    if (!link) return;
+    s16 y = link->shape_angle.y;
+    debug_spawn_pos.x = link->current.pos.x + DEBUG_SPAWN_AHEAD * as_sin(y);
+    debug_spawn_pos.y = link->current.pos.y;
+    debug_spawn_pos.z = link->current.pos.z + DEBUG_SPAWN_AHEAD * as_sin((s16)(y + 0x4000));
+    debug_spawn_angle.x = 0;
+    debug_spawn_angle.y = (s16)(y + 0x8000);
+    debug_spawn_angle.z = 0;
+    if (state == READY && as_enabled && as_session && mp_filter_contains(as_session, debug_spawn_name)) {
+        f32 at[3] = {debug_spawn_pos.x, debug_spawn_pos.y, debug_spawn_pos.z};
+        if (as_summon(debug_spawn_name, params, 0, 0, at, debug_spawn_angle.y, link->current.roomNo, 0)) {
+            wwhd_log("multiplayer: debug: actor summoned for everyone:");
+            wwhd_log(debug_spawn_name);
+            return;
+        }
+    }
+    u32 id = wwhd_fopAcM_create_str((u32)debug_spawn_name, params, (u32)&debug_spawn_pos, link->current.roomNo,
+                                    (u32)&debug_spawn_angle, 0, 0);
+    wwhd_log(id == 0xFFFFFFFFu || id == 0 ? "multiplayer: debug: no actor of that name (or not made):"
+                                          : "multiplayer: debug: actor summoned here only:");
+    wwhd_log(debug_spawn_name);
+}
+
 static void debug_give_life(u8* play, u32 life) {
     u32 max = dComIfGs_player_status_a.max_life;
     if (life > max) life = max;
@@ -1892,6 +1977,7 @@ static void debug_step(u8* play) {
         wwhd_log_int("multiplayer: debug: rupees", (int)v);
     }
     if (debug_cfg_value(debug_text, (u32)got, "bot", &v)) pb_request(v);
+    debug_spawn(play, debug_text, (u32)got); /* SUMMON AN ACTOR */
     if (debug_cfg_value(debug_text, (u32)got, "reset_room", &v) && v) { /* the launcher's RESET THIS ROOM */
         const char* r = room_reset_try(play);
         if (r[0] != 'o') wwhd_log("multiplayer: room not reset:");
@@ -2197,6 +2283,7 @@ static void multiplayer_connection_step(void* link) {
 #include "heavy.h" /* heavy things take several players */
 #include "door_lock.h" /* locked doors wait for the whole room */
 #include "golden_pig.h" /* the shop's Golden Pig, called with the D-pad's down */
+#include "carry.h" /* the players catch, carry and throw each other */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
 
@@ -2206,15 +2293,18 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     int skin = skin_enter((u32)i_this); /* its models from its skin (skin.h) */
     if (puppet_is(i_this)) {
         s32 result = puppet_execute(i_this);
+        pvp_puppet_after(i_this); /* lock-on on a PvP player (pvp.h) */
         skin_leave(skin);
         return result;
     }
     bonus_note_link(i_this); /* the yellow hearts and magic follow this Link (bonus.h) */
     dh_note_link(i_this);    /* its death and revive (death.h) */
     el_link_step(i_this); /* an electric elite's shock, given in Link's own execute (elite.h) */
+    cy_before(i_this);    /* carried: in its carrier's hands before the game moves it (carry.h) */
     s32 result = daPy_Execute_original(i_this);
     el_link_after(i_this); /* a cursed elite near: the hit's invincibility cut (elite.h) */
     skin_leave(skin);
+    cy_step(i_this); /* before the place is sent */
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());

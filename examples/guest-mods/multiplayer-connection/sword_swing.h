@@ -41,6 +41,11 @@
 #define SWING_PLAY_MASS 0x4EF8         /* play + 0x4EF8: dCcMassS_Mng */
 #define SWING_PRIORITY 1               /* the priority of Link's own sword */
 #define SWING_PLAYERS 8
+#define SWING_AT_VS_ENEMY 2u           /* cCcD_AtSPrm_VsEnemy_e, VsPlayer 4, VsOther 8 (pvp.h) */
+#define SWING_AT_VS_PLAYER 4u
+#define SWING_AT_VS_OTHER 8u
+#define SWING_PLAY_CCS 0x26A4          /* play + 0x26A4: dCcS (puppet.h PUPPET_PLAY_CCS) */
+static int pvp_hits_local(mp_u32 uid); /* pvp.h */
 #define SWING_QUEUE 8                  /* swings waiting per player; the oldest is dropped */
 
 static u32 swing_ld32(u32 address) { return *(const volatile u32*)address; }
@@ -122,6 +127,9 @@ typedef struct swing_player {
 static swing_player swing_players[SWING_PLAYERS];
 static u8 swing_ghosts[SWING_PLAYERS][MP_SWING_CAPSULES][SWING_CPS_BYTES] __attribute__((aligned(32)));
 static int swing_ghosts_built[SWING_PLAYERS];
+/* 0.3.12 PvP (pvp.h): the same capsules for the main collision space, against players only */
+static u8 swing_pvp[SWING_PLAYERS][MP_SWING_CAPSULES][SWING_CPS_BYTES] __attribute__((aligned(32)));
+static int swing_pvp_built[SWING_PLAYERS];
 /* SetStartEnd takes guest addresses: the points live in mod memory */
 static cXyz swing_start;
 static cXyz swing_end;
@@ -176,6 +184,20 @@ static void swing_build(int slot) {
     swing_ghosts_built[slot] = 1;
 }
 
+static void swing_pvp_build(int slot) {
+    if (swing_pvp_built[slot]) return;
+    for (int c = 0; c != MP_SWING_CAPSULES; ++c) {
+        u32 cps = (u32)swing_pvp[slot][c];
+        wwhd_dCcD_Cps_ct_l(cps);
+        wwhd_dCcD_Cps_Set((void*)cps, (u32)&WWHD_GAME_DATA(SWING_AT_CPS_SRC, u8));
+        swing_st32(cps + SWING_TG_SPRM, swing_ld32(cps + SWING_TG_SPRM) & ~SWING_SPRM_SET);
+        swing_st32(cps + SWING_CO_SPRM, swing_ld32(cps + SWING_CO_SPRM) & ~SWING_SPRM_SET);
+        u32 at = swing_ld32(cps + SWING_AT_SPRM) & ~(SWING_AT_VS_ENEMY | SWING_AT_VS_OTHER);
+        swing_st32(cps + SWING_AT_SPRM, at | SWING_AT_VS_PLAYER | SWING_SPRM_SET);
+    }
+    swing_pvp_built[slot] = 1;
+}
+
 /* One received swing per player and logic step, registered like the owner's sword was. */
 static void swing_step(const void* local_link) {
     u8* play = wwhd_play_get();
@@ -190,6 +212,8 @@ static void swing_step(const void* local_link) {
         u32 owner = (u32)local_link;
         puppet_slot* puppet = puppet_slot_for(p->uid, 0);
         if (puppet && puppet->actor) owner = puppet->actor;
+        int pvp = owner != (u32)local_link && pvp_hits_local(p->uid);
+        if (pvp) swing_pvp_build(i);
         for (u32 c = 0; c != s.count && c != MP_SWING_CAPSULES; ++c) {
             u32 cps = (u32)swing_ghosts[i][c];
             swing_start.x = s.capsule[c].start[0];
@@ -205,6 +229,15 @@ static void swing_step(const void* local_link) {
             swing_st32(cps + SWING_STTS, owner + SWING_LINK_STTS);
             swing_st32(cps + SWING_AT_SPRM, swing_ld32(cps + SWING_AT_SPRM) | SWING_SPRM_SET);
             wwhd_mass_set(play + SWING_PLAY_MASS, (void*)cps, SWING_PRIORITY);
+            if (pvp) { /* the same capsule against the local Link (pvp.h) */
+                u32 hit = (u32)swing_pvp[i][c];
+                wwhd_SetStartEnd_cXyz(hit + SWING_SHAPE, (u32)&swing_start, (u32)&swing_end);
+                swing_stf(hit + SWING_SHAPE + SWING_CPS_RADIUS, s.capsule[c].radius);
+                swing_st32(hit + SWING_AT_TYPE, s.at_type);
+                for (u32 k = 0; k != 3; ++k) swing_stf(hit + SWING_AT_VEC + k * 4, s.vec[k]);
+                swing_st32(hit + SWING_STTS, owner + SWING_LINK_STTS);
+                puppet_ccs_set((u32)play + SWING_PLAY_CCS, hit);
+            }
         }
         if (!p->logged) {
             p->logged = 1;

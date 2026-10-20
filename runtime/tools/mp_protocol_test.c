@@ -194,13 +194,14 @@ static mp_u32 build_actor_init(mp_u8* out, mp_u32 capacity) {
     mp_write_string(&w, "ActorBaseSync");
     mp_write_string(&w, "ActorPlayerSync");
     mp_write_string(&w, "ActorFilter");
-    mp_write_vlq(&w, 9);
+    mp_write_vlq(&w, 10);
     mp_write_string(&w, "Bk");
     mp_write_string(&w, "#enemy_multiplier=4");
     mp_write_string(&w, "#enemy_randomizer=1");
     mp_write_string(&w, "#dynamic_scaling=1");
     mp_write_string(&w, "#elite_chance=12");
     mp_write_string(&w, "#elite_chance=x"); /* malformed: 0, then the next one wins again below */
+    mp_write_string(&w, "#pvp=1");
     mp_write_string(&w, "Fmastr1");
     mp_write_string(&w, "NotAnActorName");
     mp_write_string(&w, "kotubo");
@@ -225,20 +226,26 @@ static void test_placed_actors(void) {
         /* 0.2.47: scaling and elite chance after the randomizer; an older body leaves them 0 */
         static const mp_u8 ext[] = {0x83, 0x00, 0x01, 0x0A}, big[] = {0x81, 0x01, 0x00, 0xFF},
                            half[] = {0x81, 0x01, 0x01};
-        int scaling = 7;
+        int scaling = 7, pvp = 7;
         mp_u32 elite = 7;
-        assert(mp_read_mutators_ex(mutators, sizeof(mutators), &m, &random, &scaling, &elite) && m == 6 &&
-               random == 1 && scaling == 0 && elite == 0);
-        assert(mp_read_mutators_ex(ext, sizeof(ext), &m, &random, &scaling, &elite) && m == 3 && !random &&
-               scaling == 1 && elite == 10);
-        assert(mp_read_mutators_ex(big, sizeof(big), &m, &random, &scaling, &elite) && elite == MP_ELITE_CHANCE_MAX &&
-               scaling == 0);
-        assert(!mp_read_mutators_ex(half, sizeof(half), &m, &random, &scaling, &elite));
+        assert(mp_read_mutators_ex(mutators, sizeof(mutators), &m, &random, &scaling, &elite, &pvp) && m == 6 &&
+               random == 1 && scaling == 0 && elite == 0 && pvp == 0);
+        assert(mp_read_mutators_ex(ext, sizeof(ext), &m, &random, &scaling, &elite, &pvp) && m == 3 && !random &&
+               scaling == 1 && elite == 10 && pvp == 0);
+        assert(mp_read_mutators_ex(big, sizeof(big), &m, &random, &scaling, &elite, &pvp) &&
+               elite == MP_ELITE_CHANCE_MAX && scaling == 0);
+        assert(!mp_read_mutators_ex(half, sizeof(half), &m, &random, &scaling, &elite, &pvp));
+        /* 0.3.13: the pvp byte after the elite chance; nothing after it */
+        static const mp_u8 fight[] = {0x81, 0x00, 0x00, 0x05, 0x01}, extra[] = {0x81, 0x00, 0x00, 0x05, 0x01, 0x00};
+        assert(mp_read_mutators_ex(fight, sizeof(fight), &m, &random, &scaling, &elite, &pvp) && pvp == 1 &&
+               elite == 5);
+        assert(!mp_read_mutators_ex(extra, sizeof(extra), &m, &random, &scaling, &elite, &pvp));
         assert(mp_read_mutators(ext, sizeof(ext), &m, &random) && m == 3);
     }
     assert(s.factories_complete && s.factory_count == 4); /* Default, Bk, Spawned, Pl */
     assert(s.enemy_multiplier == 4 && s.enemy_randomizer == 1 && s.filter_count == 3);
     assert(s.dynamic_scaling == 1 && s.elite_chance == 0); /* the malformed last entry reset it */
+    assert(s.pvp == 1 && !mp_filter_contains(&s, "#pvp=1"));
     assert(!mp_filter_contains(&s, "#dynamic") && !mp_filter_contains(&s, "#elite_c"));
     assert(mp_filter_contains(&s, "Bk") && mp_filter_contains(&s, "Fmastr1") && mp_filter_contains(&s, "kotubo"));
     assert(!mp_filter_contains(&s, "B") && !mp_filter_contains(&s, "Bkk") && !mp_filter_contains(&s, "#enemy_m"));
@@ -1316,6 +1323,27 @@ static void test_death(void) {
     assert(p.client_player_revive == MP_NO_ID && p.server_player_revive == MP_NO_ID);
 }
 
+/* The carry packets (carry.h, WWClient.receiveCarry): the same body both ways. */
+static void test_carry(void) {
+    mp_carry c = {300, 7, MP_CARRY_THROW, -0x4000};
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_carry(&w, &c);
+    static const mp_u8 body[] = {0x02, 0xAC, 0x87, 0x02, 0xC0, 0x00};
+    expect_bytes(&w, body, sizeof(body));
+    mp_carry got;
+    assert(mp_read_carry(body, sizeof(body), &got));
+    assert(got.target == 300 && got.sender == 7 && got.action == MP_CARRY_THROW && got.angle == -0x4000);
+    assert(!mp_read_carry(body, sizeof(body) - 1, &got));
+    mp_u8 bad[sizeof(body)];
+    memcpy(bad, body, sizeof(body));
+    bad[3] = MP_CARRY_ACTIONS;
+    assert(!mp_read_carry(bad, sizeof(bad), &got));
+    static const mp_u8 self_carry[] = {0x87, 0x87, 0x00, 0x00, 0x00};
+    assert(!mp_read_carry(self_carry, sizeof(self_carry), &got));
+    mp_session p = parsed_session();
+    assert(p.client_player_carry == MP_NO_ID && p.server_player_carry == MP_NO_ID);
+}
+
 static void test_summon(void) {
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_summon_request(&w, 300, 4, "Tetra");
@@ -1696,6 +1724,7 @@ int main(void) {
     test_directory();
     test_summon();
     test_death();
+    test_carry();
     test_save_sync();
     test_tunic_colors();
     test_placed_actors();

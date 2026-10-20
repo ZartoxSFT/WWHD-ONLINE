@@ -188,7 +188,10 @@ static void dh_after_death_anim(void* link) {
     wwhd_log("multiplayer: the local Link is a ghost until a player revives it");
 }
 
-/* daPy_lk_c::setStickData: a ghost's buttons do nothing; by a body, A only revives. */
+static void cy_after_stick(void* self); /* carry.h */
+
+/* daPy_lk_c::setStickData: a ghost's buttons do nothing; by a body, A only revives; else the
+ * players carry each other (carry.h). */
 WWHD_HOOK_RETURN(0x023F32E4, dh_after_stick, (void* self)) {
     if (!dh_is_local(self)) return;
     volatile u8* trigger = (volatile u8*)self + DH_LINK_ITEM_TRIGGER;
@@ -198,6 +201,8 @@ WWHD_HOOK_RETURN(0x023F32E4, dh_after_stick, (void* self)) {
         *button = 0;
     } else if (dh_prompt) {
         *trigger = (u8)(*trigger & ~1u);
+    } else {
+        cy_after_stick(self);
     }
 }
 

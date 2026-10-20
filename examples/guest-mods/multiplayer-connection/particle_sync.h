@@ -51,6 +51,12 @@
 #define PS_FOLLOW_MAX 12
 #define PS_KEEPALIVE 10          /* steps between two places of an unmoving followed emitter */
 #define PS_FOLLOW_TIMEOUT 45     /* steps without news before a copy is ended */
+/* 0.3.10: a followed emitter that ends by itself (its frames run out: a burning Link's flames) may keep
+ * its callback and flags in the freed memory, so its maker never saw it end and kept sending its place:
+ * the others' copy burned on (a puppet in flames for good). A followed emitter is ended after
+ * PS_FOLLOW_MAX_STEPS at its maker (a stop is sent) and a copy after PS_COPY_MAX_STEPS (whatever comes). */
+#define PS_FOLLOW_MAX_STEPS 300  /* 10 s */
+#define PS_COPY_MAX_STEPS 450    /* 15 s */
 #define PS_MOVE_EPSILON 0.5f
 
 static int ps_replaying;
@@ -77,12 +83,44 @@ static u32 ps_follow_count;
 static mp_u8 ps_next_key;
 static unsigned long long ps_follow_step_done;
 
+/* 0.3.15: the spin attack's and the hurricane spin's trail (ROUNDATTACK00, 01, 02: group 1, ids 0x25,
+ * 0x26, 0x28, made in daPy_lk_c::setCollision while daPyProc_CUT_TURN_e 0x55 or CUT_ROLL_e 0x56,
+ * d_a_player_main_04.cpp). Those emitters make no particle by themselves: their callback
+ * dPa_cutTurnEcallBack_c (d_particle_callbacks.cpp executeAfter 025A9C3C; layout d_particle_local.h:
+ * vtable +0, alpha +4, end flag +5, s16 count +6, positions +8, emitter +0xC) creates one particle at
+ * each position Link gives it each frame (count, positions: the sword's trail) and puts the emitter on
+ * the newest; end (025A9D64) sets the flag, and the next executeAfter stops the emitter. A copy without
+ * that callback showed nothing. A copy of those now gets its own callback object (the vtable the local
+ * Link's m331C, +0x6730, holds), fed every step with PS_CUT_POINTS positions from the last place to
+ * the new place of the sword's tip of its maker's puppet (its right hand cl_RhandA 12, PS_CUT_REACH
+ * further out from the puppet's body); ended by its flag. */
+#define PS_CUT_POINTS 5
+#define PS_CUT_REACH 70.0f
+#define PS_CUTS 6
+#define PS_CUT_VTABLE 0x6730       /* daPy_lk_c::m331C: a dPa_cutTurnEcallBack_c */
+#define PS_CUT_END_STEPS 10        /* steps an ended object is kept: its emitter's last executeAfter */
+typedef struct ps_cut {
+    u8 obj[0x10];                  /* the dPa_cutTurnEcallBack_c the game calls */
+    f32 pos[PS_CUT_POINTS * 3];
+    f32 last[3];
+    int has_last;
+    int used;
+    int ending;                    /* steps left before the slot is free again */
+} ps_cut;
+static ps_cut ps_cuts[PS_CUTS] __attribute__((aligned(8)));
+
+static int ps_is_cut_turn(const mp_particle* p) {
+    return p->group == 1 && (p->id == 0x25 || p->id == 0x26 || p->id == 0x28);
+}
+
 /* the other players' followed emitters, here */
 typedef struct ps_copy {
     mp_u32 uid;
     mp_u8 key;
     u32 emitter;
     unsigned long long heard;
+    unsigned long long made;    /* its creation step */
+    int cut;                    /* its ps_cuts slot, -1 for none */
 } ps_copy;
 static ps_copy ps_copies[PS_FOLLOW_MAX * 2];
 static u32 ps_copy_count;
@@ -197,7 +235,7 @@ static void ps_follow_step(void) {
     ps_follow_step_done = step;
     for (u32 i = 0; i < ps_follow_count;) {
         ps_follow* f = &ps_follows[i];
-        if (ps_follow_ended(f)) {
+        if (ps_follow_ended(f) || step - f->born > PS_FOLLOW_MAX_STEPS) {
             ps_send_stop(f);
             ps_follow_remove(i);
             continue;
@@ -267,7 +305,9 @@ static void ps_end(u32 em) {
     *(volatile u32*)(em + PS_EMITTER_FLAGS) = (flags | PS_STOP_EMIT) & ~(u32)PS_IMMORTAL;
 }
 
-static u32 ps_make(u32 pa, const mp_particle* p) {
+static u32 ps_make_cb(u32 pa, const mp_particle* p, u32 cb);
+static u32 ps_make(u32 pa, const mp_particle* p) { return ps_make_cb(pa, p, 0); }
+static u32 ps_make_cb(u32 pa, const mp_particle* p, u32 cb) {
     ps_pos.x = p->pos[0];
     ps_pos.y = p->pos[1];
     ps_pos.z = p->pos[2];
@@ -283,8 +323,102 @@ static u32 ps_make(u32 pa, const mp_particle* p) {
     }
     int colour = (p->flags & MP_PARTICLE_COLOR) != 0;
     return ps_set_original(pa, p->group, p->id, (u32)&ps_pos, (p->flags & MP_PARTICLE_ANGLE) ? (u32)&ps_angle : 0,
-                           (p->flags & MP_PARTICLE_SCALE) ? (u32)&ps_scale : 0, p->alpha, 0, 0xFFFFFFFFu,
+                           (p->flags & MP_PARTICLE_SCALE) ? (u32)&ps_scale : 0, p->alpha, cb, 0xFFFFFFFFu,
                            colour ? (u32)ps_prm : 0, colour ? (u32)ps_env : 0, 0);
+}
+
+/* 0.3.13: a copy's emitter is still ours: Immortal (we set it) and without a callback (we gave none).
+ * The game can free an emitter whatever its flags (a scene's particles cleared) and give its memory
+ * to another effect (the wind, the sky's): the copy's place, written there every update, and its end
+ * twisted that effect (big broken textures in the sky). A copy that is no longer ours is forgotten,
+ * nothing written. */
+static int ps_copy_alive(const ps_copy* c) {
+    u32 callback = c->cut >= 0 ? (u32)ps_cuts[c->cut].obj : 0;
+    return c->emitter && (ps_ld32(c->emitter + PS_EMITTER_FLAGS) & PS_IMMORTAL) &&
+           ps_ld32(c->emitter + PS_EMITTER_CALLBACK) == callback;
+}
+
+/* Ends a copy the way its kind ends: a spin's by its callback's end flag. */
+static void ps_copy_end(ps_copy* c, int alive) {
+    if (c->cut >= 0) {
+        ps_cut* k = &ps_cuts[c->cut];
+        if (alive) {
+            *(volatile u8*)(k->obj + 5) = 1; /* dPa_cutTurnEcallBack_c::end: its next executeAfter stops it */
+            *(volatile u32*)(c->emitter + PS_EMITTER_FLAGS) = ps_ld32(c->emitter + PS_EMITTER_FLAGS) & ~(u32)PS_IMMORTAL;
+        }
+        k->ending = PS_CUT_END_STEPS;
+        return;
+    }
+    if (alive) ps_end(c->emitter);
+}
+
+/* The sword's tip of a player's puppet: its right hand, PS_CUT_REACH further out from its body. */
+static int ps_cut_tip(mp_u32 uid, f32* out) {
+    puppet_slot* s = puppet_slot_for(uid, 0);
+    if (!s || !s->actor) return 0;
+    const daPy_lk_c* pl = (const daPy_lk_c*)s->actor;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)s->actor;
+    const f32* rh = pl->mpCLModel ? puppet_anm_mtx(pl->mpCLModel, 12) : 0;
+    if (!rh) return 0;
+    f32 dx = rh[3] - a->current.pos.x, dz = rh[11] - a->current.pos.z;
+    f32 len = as_sqrt(dx * dx + dz * dz);
+    if (len < 1.0f) {
+        dx = as_sin(a->shape_angle.y);
+        dz = as_sin((s16)(a->shape_angle.y + 0x4000));
+        len = 1.0f;
+    }
+    out[0] = rh[3] + dx / len * PS_CUT_REACH;
+    out[1] = rh[7];
+    out[2] = rh[11] + dz / len * PS_CUT_REACH;
+    return 1;
+}
+
+/* Every step: the trail of each spin copy, from the last tip to the new one, newest first. */
+static void ps_cut_step(void) {
+    for (u32 i = 0; i != ps_copy_count; ++i) {
+        ps_copy* c = &ps_copies[i];
+        if (c->cut < 0) continue;
+        ps_cut* k = &ps_cuts[c->cut];
+        if (k->ending) continue;
+        f32 tip[3];
+        if (!ps_cut_tip(c->uid, tip)) continue;
+        if (!k->has_last) {
+            for (int d = 0; d != 3; ++d) k->last[d] = tip[d];
+            k->has_last = 1;
+        }
+        for (u32 n = 0; n != PS_CUT_POINTS; ++n) {
+            f32 t = (f32)n / (f32)(PS_CUT_POINTS - 1);
+            for (int d = 0; d != 3; ++d) k->pos[n * 3 + (u32)d] = tip[d] + (k->last[d] - tip[d]) * t;
+        }
+        for (int d = 0; d != 3; ++d) k->last[d] = tip[d];
+        *(volatile u32*)(k->obj + 8) = (u32)k->pos;
+        *(volatile s16*)(k->obj + 6) = PS_CUT_POINTS;
+    }
+    for (u32 j = 0; j != PS_CUTS; ++j)
+        if (ps_cuts[j].used && ps_cuts[j].ending && !--ps_cuts[j].ending) ps_cuts[j].used = 0;
+}
+
+/* A free spin callback object, set up as dPa_cutTurnEcallBack_c's constructor would; -1 when none
+ * (or no local Link to take the vtable from). */
+static int ps_cut_take(void) {
+    u32 local = puppet_local_player();
+    u32 vtable = local ? ps_ld32(local + PS_CUT_VTABLE) : 0;
+    if (!vtable) return -1;
+    for (int j = 0; j != PS_CUTS; ++j) {
+        ps_cut* k = &ps_cuts[j];
+        if (k->used) continue;
+        k->used = 1;
+        k->ending = 0;
+        k->has_last = 0;
+        *(volatile u32*)(k->obj + 0) = vtable;
+        *(volatile u8*)(k->obj + 4) = 0xFF;
+        *(volatile u8*)(k->obj + 5) = 0;
+        *(volatile s16*)(k->obj + 6) = 0;
+        *(volatile u32*)(k->obj + 8) = (u32)k->pos;
+        *(volatile u32*)(k->obj + 0xC) = 0;
+        return j;
+    }
+    return -1;
 }
 
 static ps_copy* ps_copy_find(mp_u32 uid, mp_u8 key) {
@@ -299,28 +433,44 @@ static void ps_copy_drop(ps_copy* c) {
 
 static void ps_follow_replay(u32 pa, mp_u32 uid, const mp_particle* p) {
     ps_copy* c = ps_copy_find(uid, p->key);
+    if (c && !ps_copy_alive(c)) { /* freed by the game: not ours any more */
+        ps_copy_end(c, 0);
+        ps_copy_drop(c);
+        c = 0;
+        if (p->flags & MP_PARTICLE_STOP) return;
+    }
     if (p->flags & MP_PARTICLE_STOP) {
         if (c) {
-            ps_end(c->emitter);
+            ps_copy_end(c, 1);
             ps_copy_drop(c);
         }
         return;
     }
     if (c) {
-        ps_place(c->emitter, p);
+        if (c->cut < 0) ps_place(c->emitter, p); /* a spin's callback places it */
         c->heard = wwhd_logic_step();
         return;
     }
     if (ps_copy_count == PS_FOLLOW_MAX * 2) return;
-    u32 em = ps_make(pa, p);
-    if (!em) return;
+    int cut = ps_is_cut_turn(p) ? ps_cut_take() : -1;
+    u32 em = ps_make_cb(pa, p, cut >= 0 ? (u32)ps_cuts[cut].obj : 0);
+    if (!em) {
+        if (cut >= 0) ps_cuts[cut].used = 0;
+        return;
+    }
     ps_place(em, p);
     *(volatile u32*)(em + PS_EMITTER_FLAGS) = ps_ld32(em + PS_EMITTER_FLAGS) | PS_IMMORTAL;
     c = &ps_copies[ps_copy_count++];
     c->uid = uid;
     c->key = p->key;
+    c->cut = cut;
+    if (cut >= 0) {
+        static u32 cut_logged;
+        if (cut_logged++ < 3) wwhd_log_int("multiplayer: spin attack trail of another player, id", (int)p->id);
+    }
     c->emitter = em;
     c->heard = wwhd_logic_step();
+    c->made = c->heard;
     if (!ps_replayed++) wwhd_log_int("multiplayer: first particle effect of another player, id", (int)p->id);
 }
 
@@ -345,11 +495,17 @@ static void ps_step(void) {
         if (!ps_replayed++) wwhd_log_int("multiplayer: first particle effect of another player, id", (int)p->id);
     }
     ps_replaying = 0;
+    ps_cut_step();
     /* copies whose maker went silent (left, or its stop was lost) */
     unsigned long long step = wwhd_logic_step();
     for (u32 i = 0; i < ps_copy_count;) {
-        if (step - ps_copies[i].heard > PS_FOLLOW_TIMEOUT) {
-            ps_end(ps_copies[i].emitter);
+        if (!ps_copy_alive(&ps_copies[i])) {
+            ps_copy_end(&ps_copies[i], 0);
+            ps_copy_drop(&ps_copies[i]);
+            continue;
+        }
+        if (step - ps_copies[i].heard > PS_FOLLOW_TIMEOUT || step - ps_copies[i].made > PS_COPY_MAX_STEPS) {
+            ps_copy_end(&ps_copies[i], 1);
             ps_copy_drop(&ps_copies[i]);
             continue;
         }
@@ -366,6 +522,9 @@ static void ps_clear(void) {
     for (u32 i = 0; i != ps_copy_count; ++i) {
         u32 em = ps_copies[i].emitter;
         if ((ps_ld32(em + PS_EMITTER_FLAGS) & PS_IMMORTAL) && !ps_ld32(em + PS_EMITTER_CALLBACK)) ps_end(em);
+        else if (ps_copy_alive(&ps_copies[i])) ps_copy_end(&ps_copies[i], 1);
     }
     ps_copy_count = 0;
+    for (u32 j = 0; j != PS_CUTS; ++j)
+        if (ps_cuts[j].used && !ps_cuts[j].ending) ps_cuts[j].ending = PS_CUT_END_STEPS;
 }

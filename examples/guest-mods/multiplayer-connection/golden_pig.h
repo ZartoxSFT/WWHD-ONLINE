@@ -156,10 +156,12 @@ static int gp_hands_free(const daPy_lk_c* link, const u8* play) {
 
 /* The pig on the HUD's D-pad down arrow while one waits to be called (assets/pig.png, the user's picture since 0.3.7;
  * tools/multiplayer/make_pig_icon.py): opposite the Wind Waker's icon, (8, -39) from the D-pad's
- * centre in layout units, as big (118 x 0.6), with the D-pad's scale and alpha (bonus.h). */
-#define GP_ICON_DX 8.0f
+ * centre in layout units, as big (118 x 0.6), with the D-pad's scale and alpha (bonus.h).
+ * 0.3.16: seen too big and to the right (its left edge where its centre should be): smaller, and its
+ * centre half the former width (70.8 / 2) to the left. */
+#define GP_ICON_DX (8.0f - 35.4f)
 #define GP_ICON_DY 39.0f   /* down, on the TV */
-#define GP_ICON_SIZE 70.8f
+#define GP_ICON_SIZE 50.0f
 static u32 gp_icon;
 static unsigned long long gp_icon_epoch = ~0ull;
 

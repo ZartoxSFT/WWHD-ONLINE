@@ -144,6 +144,25 @@ static csXyz puppet_create_angle;
 
 static void puppet_log(const char* message) { wwhd_log(message); }
 
+/* 0.3.10: distance culling. The enemies farther than CULL_DISTANCE (100 m) and, 0.3.12, the other
+ * players' Links, ships and sails (puppets) farther than CULL_PLAYER_DISTANCE (400 m) from the local
+ * Link (player 0, play + 0x5B2C) are not drawn (their execute still runs); not during an event, where
+ * the camera may be far from Link. */
+#define CULL_DISTANCE 10000.0f
+#define CULL_PLAYER_DISTANCE 40000.0f
+static int cull_beyond(const void* actor, f32 distance) {
+    const u8* play = wwhd_play_get();
+    if (!actor || !play || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return 0;
+    const fopAc_ac_c* link = (const fopAc_ac_c*)*(const volatile u32*)(play + WWHD_PLAY_PLAYER_OFFSET);
+    if (!link || (const void*)link == actor) return 0;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
+    f32 dx = a->current.pos.x - link->current.pos.x, dy = a->current.pos.y - link->current.pos.y;
+    f32 dz = a->current.pos.z - link->current.pos.z;
+    return dx * dx + dy * dy + dz * dz > distance * distance;
+}
+static int cull_far(const void* actor) { return cull_beyond(actor, CULL_DISTANCE); }
+static int cull_player_far(const void* actor) { return cull_beyond(actor, CULL_PLAYER_DISTANCE); }
+
 /* ------------------------------------------------------------------ shared texture table */
 
 /* Copies the shared Link texture headers out (save = 1) or back (save = 0). The headers of
@@ -767,6 +786,10 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     }
     int slot = puppet_slot_of_actor((u32)i_this);
     u8* play = wwhd_play_get();
+    if (cull_player_far(i_this)) { /* too far to be worth drawing (cull_player_far) */
+        draw_link = outer_link;
+        return 1;
+    }
     if (slot < 0 || !play) { /* not followed yet, or an orphan about to delete itself: not drawn */
         draw_link = outer_link;
         return 1;
@@ -879,6 +902,7 @@ static f32 puppet_ship_mtx[12] __attribute__((aligned(16)));
  * over the last one's packets (0.2.18: "J3DPacket.cpp mEntryPtr == (0)" halt after a few item
  * changes). The puppet now clears it every execute too. */
 #define PUPPET_RESET_FLG0 0x3C0
+#define PUPPET_DAMAGE_WAIT 0x3B0 /* daPy_py_c::mDamageWaitTimer (s16, d_a_player.h) */
 #define PUPPET_ITEM_NONE 0x100
 #define PUPPET_ITEM_SWORD 0x103
 #define PUPPET_ITEM_FAN_FLY 0x102
@@ -1028,6 +1052,8 @@ WWHD_REPLACE(0x025E1E2C, u32, puppet_shield_sound, (u32 a, u32 b)) {
 }
 
 /* Replaces daPy_lk_c::execute for a puppet: network pose, then the visual tail only. */
+static int cy_place_puppet(mp_u32 uid, fopAc_ac_c* actor); /* carry.h */
+
 static s32 puppet_execute(void* i_this) {
     fopAc_ac_c* actor = (fopAc_ac_c*)i_this;
     const daPy_lk_c* link = (const daPy_lk_c*)i_this;
@@ -1038,6 +1064,11 @@ static s32 puppet_execute(void* i_this) {
     }
     if (!link->mpCLModel || !link->mpCLModelData) return 1;
     *(volatile u32*)((u8*)i_this + PUPPET_RESET_FLG0) = 0; /* as the game's execute, every frame */
+    /* 0.3.10: its hit's red flash (daPy_lk_c::draw while mDamageWaitTimer +0x3B0 > 0) counted down as
+     * changeDamageProc (023FA578) does in the game's execute, which a puppet does not run: once set
+     * it flashed for good */
+    volatile s16* damage_wait = (volatile s16*)((u8*)i_this + PUPPET_DAMAGE_WAIT);
+    if (*damage_wait > 0) *damage_wait = (s16)(*damage_wait - 1);
 
     mp_u32 owner = 0xFFFFFFFFu, owner_proc = PUPPET_NO_PROC;
     for (int i = 0; i != PUPPET_MAX; ++i) {
@@ -1059,6 +1090,7 @@ static s32 puppet_execute(void* i_this) {
         actor->shape_angle.z = s->target.rot[2];
         actor->current.angle.y = s->target.rot[1];
     }
+    if (owner != 0xFFFFFFFFu) cy_place_puppet(owner, actor); /* carried: in its carrier's hands */
 
     u8* play = wwhd_play_get();
     volatile u32* play_ship = play ? (volatile u32*)(play + PUPPET_PLAY_SHIP) : 0;

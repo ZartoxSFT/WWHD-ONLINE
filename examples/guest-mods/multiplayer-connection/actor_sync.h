@@ -1586,6 +1586,7 @@ WWHD_REPLACE(0x025D4654, s32, as_draw, (void* actor)) {
     as_slot* s = actor ? as_find(actor) : 0;
     if (!s || s->kind != AS_KIND_SPAWNED || !s->replica ||
         (s->spawn.proc != AS_PROC_BOOMERANG && s->spawn.proc != AS_PROC_HOOKSHOT && s->spawn.proc != AS_PROC_ROPE)) {
+        if (((const fopAc_ac_c*)actor)->group == AS_GROUP_ENEMY && cull_far(actor)) return 1; /* puppet.h */
         el_draw_begin(actor); /* an elite draws with its own colours (elite.h) */
         s32 drawn = as_draw_original(actor);
         el_draw_end();
