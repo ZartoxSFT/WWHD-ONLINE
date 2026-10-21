@@ -14,7 +14,9 @@
 #pragma once
 #include "wwhd_guest.h"
 
-#define SB_MAX 6
+#define SB_MAX 12
+#define SB_ROW 6                  /* bots per arc; the next ones on an arc behind (0.3.52) */
+#define SB_ROW_GAP 130.0f
 #define SB_UID(k) (PUPPET_BOT_UID | (0x100u + (u32)(k)))
 #define SB_DISTANCE 220.0f
 #define SB_SPREAD 0x1400          /* angle between two bots (about 28 degrees) */
@@ -44,11 +46,14 @@ static void sb_place_all(const fopAc_ac_c* link) {
     int n = sb_count(), i = 0;
     for (int k = 0; k != SB_MAX; ++k) {
         if (!sb_used[k]) continue;
-        s16 a = (s16)(link->shape_angle.y + (s16)((2 * i - (n - 1)) * SB_SPREAD / 2));
+        int row = i / SB_ROW, col = i % SB_ROW;
+        int in_row = n - row * SB_ROW < SB_ROW ? n - row * SB_ROW : SB_ROW;
+        s16 a = (s16)(link->shape_angle.y + (s16)((2 * col - (in_row - 1)) * SB_SPREAD / 2));
         f32 sn = as_sin(a), cs = as_sin((s16)(a + 0x4000));
-        sb_place_of[k].pos[0] = link->current.pos.x + sn * SB_DISTANCE;
+        f32 distance = SB_DISTANCE + (f32)row * SB_ROW_GAP;
+        sb_place_of[k].pos[0] = link->current.pos.x + sn * distance;
         sb_place_of[k].pos[1] = link->current.pos.y;
-        sb_place_of[k].pos[2] = link->current.pos.z + cs * SB_DISTANCE;
+        sb_place_of[k].pos[2] = link->current.pos.z + cs * distance;
         sb_place_of[k].rot[0] = sb_place_of[k].rot[2] = 0;
         sb_place_of[k].rot[1] = (s16)(a + 0x8000); /* facing the local Link */
         ++i;

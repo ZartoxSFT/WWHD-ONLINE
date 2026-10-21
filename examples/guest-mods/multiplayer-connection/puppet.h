@@ -47,7 +47,7 @@
 #include "tunic.h"
 #include "skin.h"
 
-#define PUPPET_MAX 8 /* the remote players and the dead players' bodies (death.h) */
+#define PUPPET_MAX 16 /* the remote players, the dead players' bodies (death.h) and the bots (0.3.52: 8) */
 
 /* outfit.h outfit_force: the casual clothes' HD texture object, as playerInit reads it
  * (getRes("Link", 0x71), the game's own Link archive, not a skin's), kept per local Link. */

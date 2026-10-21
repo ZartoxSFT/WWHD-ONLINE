@@ -38,8 +38,8 @@
 #include "wwhd/bindings.h"
 #include "mp_protocol.h"
 
-#define SKIN_ARCHIVES 6
-#define SKIN_ACTORS 8
+#define SKIN_ARCHIVES 16 /* 0.3.52: 6; the skins' heap (254 MiB) is the real bound */
+#define SKIN_ACTORS 20   /* the local Link and every puppet (PUPPET_MAX) */
 #define SKIN_ARC_BYTES (5 + MP_SKIN_MAX + 1)
 #define SKIN_LOAD_TIMEOUT 1800   /* logic steps (30 s): then the skin counts as failed */
 #define SKIN_PROC_ID 0x04        /* base_process_class::mBsPcId */
@@ -199,7 +199,7 @@ static int skin_want(const char* id) {
 }
 
 /* The skins of the other players met lately, loaded at the next scene load. */
-#define SKIN_SEEN 8
+#define SKIN_SEEN 16
 #define SKIN_SEEN_STEPS (30 * 60 * 10) /* forgotten after 10 minutes unseen */
 static char skin_seen[SKIN_SEEN][MP_SKIN_MAX + 1];
 static unsigned long long skin_seen_step[SKIN_SEEN];
