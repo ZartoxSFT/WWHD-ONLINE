@@ -5147,3 +5147,637 @@ Mod 0.3.51 compilé (117 hooks), vérifications OK, installé instances 1 et 3. 
 - dist non mise à jour (consigne : ne pas y toucher sans demande).
 Copies de `claude.md` et de ce fichier : `ZeldaWWHDRecomp/docs/multiplayer/` (dépôt WWHD-ONLINE),
 pour les récupérer sur une autre machine.
+
+## 0.3.53 : crash au 8e Link portant un skin
+
+0.3.52, non documentée ici : `PUPPET_MAX` 16 (`puppet.h`), `SB_MAX` 12 (`skin_bot.h`).
+**Testé** (instance 1, 2026-10-21 13:36) : 8 bots à skin (3, garfield, amongus, linkle, miku,
+minecraft, peppino, shaggy), 7 skins chargés dans leur tas. Crash à la création du 8e, le premier
+portant « shaggy » : écriture à l'adresse 0. Pile : `phase_2` → `playerInit` → `as_solid_heap` →
+`fopAcM_entrySolidHeap_` → `useHeapInit` → création du modèle (EU 025E38A0, 027F4CC4…027BF644).
+**Vérifié dans les sources** :
+- un Link demande un tas de taille 0 (`d_a_player_main_04b.cpp`) ;
+- `fopAcM_entrySolidHeap_` (`f_op_actor_mng.cpp`) prend alors tout le plus grand bloc du parent,
+  construit, puis réduit. Le code du modèle ne vérifie pas ses allocations.
+**Déduit** : le tas des acteurs n'avait plus de bloc assez grand pour un Link portant ce skin.
+`as_solid_heap` estimait le besoin d'après le plus grand Link construit (+25 %), sans tenir compte
+du modèle propre à chaque skin.
+**Implémenté** (`actor_sync.h`) :
+- la taille du tas d'un Link portant un skin est notée par archive de skin (`as_skin_link_size`) ;
+- le besoin d'un Link à skin = cette taille + 25 %, ou 2 fois celle d'un Link si ce skin n'a pas
+  encore été porté ;
+- les tailles des Links à skin ne gonflent plus celle d'un Link normal (`as_kind_note`).
+Sans place, la création est refusée et journalisée (« actor not made, no room in the actors'
+heaps »), et le puppet est réessayé plus tard.
+Mod 0.3.53 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+La limite réelle du nombre de Links à skin est donc le tas des acteurs du jeu, pas le tas des skins.
+
+## 0.3.54 : tas des puppets (crash au 9e Link)
+
+**Testé, 0.3.53** (instance 1, 13:41) : les Links à skin prennent 573 à 691 Kio
+(`a Link wearing a skin took`). Crash au 8e bot (9e Link avec le local) : `memcpy` vers 0x38.
+**Vérifié** (code généré, décompilé) :
+- `J3DModel::entryModelData` (USA 027F4404) alloue le bloc des matériaux du modèle par
+  `JKRHeap::alloc` (027EC0AC → 0273AE48, tas courant = tas d'acteur du Link, alignement 0x100) ;
+- résultat nul, puis 027DE5BC → 027DD9B0 → `DCZeroRange` sur une base nulle ;
+- `fopAcM_entrySolidHeapRegister` (025D63E8, `f_op_actor_mng_2.cpp`) prend pour les processus
+  0x26, 0xA5, 0xA8 (Link), 0x191, 0x1B5-0x1B6 (0x1B7 si paramètres 0) le **tas de jeu 0**, pour
+  les autres le tas 1 ;
+- les deux tas de jeu font 0xA00000 (`m_Do_machine.cpp mDoExt_createGameHeap`) ;
+- `as_solid_heap` vérifiait toujours le tas 1 (`as_actor_heaps` « first ») : il laissait passer un
+  Link alors que le tas 0, qui contient le Link local et tous les puppets, était plein.
+**Implémenté** :
+- `heap_grow.h` : tas « MpPuppetHeap » de 32 Mio en fin d'arène sead, créé avec le tas des skins
+  (qui passe à environ 222 Mio) ;
+- `actor_sync.h as_solid_heap` : un puppet (`puppet_is`, processus 0xA8) construit son tas dans
+  le tas des puppets (`fopAcM_entrySolidHeap_` 025D6174 avec ce parent). Besoin = taille notée pour
+  son skin + 25 %, sinon 2 fois un Link, sinon 1 Mio. Sans place, refus journalisé (« puppet not
+  made, the puppets' heap is full »). Fonctionne aussi avec la synchro d'acteurs désactivée ;
+- `as_uses_game_heap0` : pour les acteurs du tas 0, le contrôle de place se fait sur le tas 0.
+Capacité attendue : environ 30 puppets. Le tas 0 du jeu (10 Mio) ne sert plus qu'au Link local et
+aux autres acteurs du tas 0.
+Mod 0.3.54 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.55 : 16 joueurs
+
+**Testé, 0.3.54** (l'utilisateur) : 12 skins chargés et portés en même temps (bots), sans crash.
+**Mesuré** (lecture seule, `shader_gain.py`) : tous les skins des instances 1 et 3 sont déjà
+allégés, sans aucun shader du jeu : 11,8-14,1 Mo, 18,8 Mo pour « 3 », saria_in_win et toad
+compris.
+**Limites relevées** :
+- `MAX_REMOTES` 8 → 15 (16 joueurs). Tableaux dimensionnés dessus : `remotes`, `markers`,
+  `dmap_points`, `heavy.h hv_remote_shown`, listes d'`elite.h` ;
+- `PUPPET_MAX` 16 → 24 (joueurs, corps et bots) ;
+- `SWING_PLAYERS` 8 → 16 ;
+- `TUNIC_MAX_SLOTS` 4 → 8 (environ 0,4 Mio de tas du mod par emplacement ; au-delà, tunique d'origine) ;
+- inchangés : `SHIP_PUPPET_MAX` et `BOAT_CLONE_SLOTS` 4 (4 bateaux d'autres joueurs affichés). Un
+  bateau-puppet prend sa place dans le tas de jeu 1 (10 Mio, partagé avec les acteurs) : à mesurer
+  avant de les relever ;
+- pas de limite de joueurs trouvée dans les sources Java du serveur.
+**HUD** : tout le HUD du mod est une seule liste. Le runtime jette une liste entière au-delà de sa
+limite (`guest_hud.h`), et un pseudo de 16 lettres coûte 104 éléments (4 bandes de dégradé).
+- `name_tag.h` : au-delà de `NAME_FULL_NAMES` (6) pseudos visibles, une seule passe de
+  remplissage par pseudo (2 × lettres éléments). 15 pseudos tiennent même sous l'ancienne limite de
+  1024 ;
+- runtime `guest_hud.h` : `kMaxCommands` 1024 → 4096 et `kMaxVertices` 32768 → 131072 (32 par
+  élément comme avant). `guest_hud_test` recompilé et OK.
+Capacité mémoire : tas des skins 222 Mio, soit environ 13 skins allégés distincts (au-delà, Link) ;
+tas des puppets 32 Mio, soit environ 30 Links.
+Mod 0.3.55 compilé (117 hooks), vérifications OK, installé instances 1 et 3. `wwhd.exe` **non
+relinké** : le jeu tournait (fichier verrouillé). **Non testé en jeu.**
+
+## 0.3.56 : objets levés visibles, rubis partagés, colère des cochons, bandeau du launcher
+
+Runtime de dev relinké (`wwhd.exe`, limites HUD 0.3.55 incluses).
+**Launcher** : bandeau de la page 1 (`homeHero`) rétréci. Marges 16/14 au lieu de 34/30, titre 32 px
+au lieu de 43 (`launcher.css`, deux copies), soleil et voile plus petits. Compilé (javac).
+**Vérifié dans les sources** :
+- `daPy_lk_c::dProcGetItem_init` (024216C8, `d_a_player_main_05.cpp`, un argument) : procédure
+  DEMO_GET_ITEM (0xAE), objet dans `mProcVar2` (+0x691A, SDK ; -1 sans objet) ;
+- numéros des rubis (`d_item_data.h`) et montants (`d_item.cpp item_func_*_rupee`) : 0x01 1,
+  0x02 5, 0x03 10, 0x04 20, 0x05 50, 0x06 100, 0x0F 200 ;
+- colère des cochons = un seul drapeau pour tous, `l_kbStatics.ALL_ANGER` (données 101B7FA0,
+  `d_a_kb.cpp`). Mis à 1 quand un cochon tombe à 0 PV (`d_a_kb_exec.cpp`), tous les cochons non
+  touchés attaquent alors, remis à 0 par `attack_move`.
+**Implémenté** (`item_share.h`) : transport par le paquet de cinématique (déjà relayé à tous par le
+serveur), noms réservés commençant par « # », sans changement de serveur ni de protocole.
+`event_sync.h ev_received` les passe à `share_received` :
+- « #GET_xx » : hook de retour sur `dProcGetItem_init` pour le Link local. Chez les autres :
+  l'icône du jeu (`sv_icon`) au-dessus du pseudo de ce joueur pendant 4 s (`mod.c draw_markers`).
+  Pour un rubis, le même montant à chaque autre joueur connecté, où qu'il soit
+  (`PLAY_ITEM_RUPEE_COUNT`). Les rubis sont locaux dans la synchro de sauvegarde : pas de double ;
+- « #PIG_1 » / « #PIG_0 » : chaque changement du drapeau local est envoyé. Reçu dans le même stage
+  et la même room, il est appliqué et n'est pas renvoyé.
+Mod 0.3.56 compilé (118 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+Un client 0.3.50 ou plus ancien traiterait « #PIG_x » comme une cinématique : tout le monde doit
+avoir la 0.3.56.
+
+## 0.3.57 : objet levé envoyé une fois, montant des rubis affiché, pot sur le joueur
+
+**Testé, 0.3.56** (instances 1 et 3) : `dProcGetItem_init` est rappelée pendant toute la levée (elle
+rend TRUE aussitôt quand la procédure est déjà DEMO_GET_ITEM). Le hook envoyait à chaque appel :
+pour un coffre de 100 rubis (objet 6), l'instance 3 a reçu « rupees shared 100 » au moins 12 fois.
+Aucune icône vue : un rubis n'a pas d'icône d'inventaire (`itemForSlot`).
+**Implémenté** :
+- `item_share.h` : un hook d'entrée garde la procédure d'avant l'appel. L'envoi n'a lieu qu'au
+  passage à DEMO_GET_ITEM ;
+- `mod.c draw_markers` : pour un rubis, « +montant » en doré au-dessus du pseudo à la place de
+  l'icône.
+**Pot sur le joueur** (l'utilisateur : en chargeant une salle où se trouve un joueur, un pot est
+dessiné sur lui). **Déduit** : le paquet de création du serveur porte les dernières valeurs
+connues de l'acteur, dont le bit « porté » (0x2000) d'un portage terminé depuis (pot lancé, cassé,
+recréé avec la salle sous la même identité). `as_carried_place` collait donc le pot aux mains du
+puppet de son propriétaire. **Implémenté** (`actor_sync.h`) : à la liaison d'un acteur posé, le
+bit « porté » des valeurs du serveur est retiré. Seules les mises à jour suivantes du propriétaire
+le remettent.
+Mod 0.3.57 compilé (119 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.58 : détection de l'objet levé à chaque pas
+
+**Testé, 0.3.57** (instances 1 et 3, rubis orange) : aucun envoi, pas de ligne « item held up ». Le
+filtre « procédure différente de DEMO_GET_ITEM avant l'appel » excluait tous les appels.
+**Déduit** : le jeu fait entrer Link dans 0xAE avant d'appeler `dProcGetItem_init`.
+**Implémenté** (`item_share.h share_held_up`) : plus de hooks sur 024216C8. À chaque pas du Link
+local, après son execute (`share_step(i_this)` dans `mod.c`), l'objet (`mProcVar2`) est envoyé une
+seule fois, au pas où `mCurProc` devient 0xAE.
+Mod 0.3.58 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.59 : icône à 40 m, bombes et flèches partagées (coffre et achat)
+
+**Testé, 0.3.58** : les rubis d'un coffre sont partagés une fois. L'objet n'apparaît pas au-dessus
+du puppet.
+**Déduit** : le marqueur d'un joueur, pseudo et icône, n'existe qu'à moins de `NAME_HIDE_DISTANCE`
+(10 m) (`mod.c update_markers`). L'option « cacher les pseudos » cachait aussi l'icône.
+**Implémenté** :
+- `mod.c` : `marker.name_shown`. Le marqueur va jusqu'à `SHARE_ITEM_DISTANCE` (40 m) pendant
+  qu'un objet levé est affiché, le pseudo reste à 10 m. L'icône ou « +montant » se dessine même
+  avec les pseudos cachés ;
+- partage des munitions. **Vérifié** : `d_item_data.h` (0x0B-0x0E bombes 5/10/20/30, 0x10-0x12
+  flèches 10/20/30), `d_item.cpp` (`item_func_bomb_*` donne aussi le sac de bombes), achat chez
+  Beedle par `execItemGet` (0254DA38, `d_a_npc_bs1_msg.cpp`), inventaire `mItems[21]` à
+  info + 0x3C (`d_save.h`), emplacements arc 0xC et bombes 0xD (`d_item.h`) :
+  - « #GET_xx » (objet levé, coffre) : icône, plus rubis ou munitions chez les autres ;
+  - « #GIVE_xx » : depuis `bonus.h bonus_exec_item_get` (remplacement existant d'`execItemGet`),
+    un rubis ou des munitions reçus hors levée (proc ≠ 0xAE) et hors ramassage au sol
+    (`bonus_ground_pickup`, compteur posé autour de `daItem_c::itemGetExecute` 0217DE18) :
+    achat ou cadeau ;
+  - réception (`share_give`) : rubis par le compteur ; bombes ou flèches seulement si le joueur
+    a déjà le sac ou l'arc, par `bonus_exec_item_get` lui-même (stocks et plafonds des flèches
+    élémentaires) ; `share_receiving` empêche le renvoi.
+Mod 0.3.59 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.60 : modèle 3D de l'objet levé au-dessus du puppet
+
+Demande : remplacer l'icône par le modèle de l'objet qui tourne, comme dans le jeu.
+**Vérifié** (décompilé `d_a_demo_item.cpp`, `f_op_actor_mng_3.cpp`, code HD généré) :
+- l'objet levé du jeu est `daDitem_c` (process `fpcNm_Demo_Item_e` 0x101), créé par
+  `fopAcM_createDemoItem` (025D7D40) avec `item | bitNo<<8 | argFlag<<16` ;
+- `mArgFlag` +0x76D (lu par `set_pos` 021236A8). `FLAG_UNK01` : son `Delete` n'appelle pas
+  `execItemGet` (aucun objet donné). `FLAG_UNK08` : position `home.pos + mOffsetPos` (+0x760)
+  au lieu du joueur 0 ;
+- `daItemBase_c::show` (021842C8) et `dead` (0218432C) posent les bits 1 et 2 de +0x74F.
+**Implémenté** (`item_share.h`) :
+- à la réception de « #GET_xx », si le puppet de l'expéditeur existe, création d'un `daDitem`
+  (drapeaux 0x09, `as_context = AS_CTX_NONE` pour ne pas le synchroniser) ;
+- à chaque pas : `home.pos` = position du puppet + (0, 130, 0), affiché ; fin (`dead`) après
+  `SHARE_ITEM_STEPS` ou si le puppet disparaît ;
+- l'icône n'est plus dessinée quand le modèle existe (« +N » des rubis reste). Sans puppet
+  (joueur loin ou puppets désactivés), l'icône reste.
+Mod 0.3.60 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+Risque : un `daDitem` charge l'archive de l'objet ; un objet dont l'archive n'est pas en mémoire
+peut ne pas s'afficher ou mettre du temps.
+
+## 0.3.61 : objet levé à 0,5 s, retiré quand la main se baisse ; dist refaite (21 octobre)
+
+**Implémenté** (`item_share.h`) :
+- le modèle (et l'icône de repli) apparaît `SHARE_SHOW_DELAY` (15 pas, 0,5 s) après « #GET_xx » ;
+- l'expéditeur envoie « #END » quand son proc quitte DEMO_GET_ITEM (0xAE) après un « #GET » envoyé :
+  le modèle (`dead`) et l'icône disparaissent chez les autres. Sécurité : 30 s au plus
+  (`SHARE_ITEM_STEPS` 900), puppet disparu. Un client 0.3.60 ou plus ancien ignore « #END ».
+**Dist refaite à la demande** :
+- runtime `build/rel` (ninja, puis relink `-d keeprsp`), `package.py` vers `dist/_rel` (le Python
+  MSYS2 veut des chemins Windows pour `--license`), `guard.py` OK (292 fichiers), zip remplacé ;
+- `multiplayer-connection-0.3.61.wwhdmod` (remplace 0.3.18), `LISEZMOI.txt` mis à jour ;
+- `WWHD-Online-Launcher.jar` : toutes les sources Java recompilées (`--release 17`, sans erreur),
+  jar complet (JavaFX, JNA, ressources, MMBSystem). Testé : serveur démarre (multiplicateurs, skins
+  sur 10015), launcher ouvert (JavaFX). Le dossier `dist/WindWakerHD-v0.3.0-online-windows-x86_64`
+  (installation de test, 1,3 Go) n'est pas touché.
+Mod 0.3.61 compilé (117 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.62 : crashs de la session entre amis (21 octobre), cinématiques par ennemi
+
+**Constat** : le dossier partagé aux amis (`WWHD ONLINE 2.rar`, copie de
+`dist/WindWakerHD-v0.3.0-online-windows-x86_64`, l'installation de test du 18 octobre) a le
+runtime `2db0c10-dirty` (`data/bin/wwhd.exe` du 18 octobre), pas celui du zip refait le 21. Sans :
+MEM2 jusqu'à 0x60000000 (journal « [mem] default heap 104DB000-50000000 » ; tas des skins
+19 Mio libres au lieu d'environ 220), interpolation du HUD (pseudos à 30 im/s), limites HUD 4096.
+Les skins absents et les pseudos à 30 im/s viennent probablement de là (déduit, non vérifié en jeu).
+
+**Crash 1 (5 fois, 16:55-17:06)** : « PROGRAM HALT d_path.cpp:31 0 <= pnt_index &&
+pnt_index < path->m_num », juste après la téléportation du mod vers un joueur à la Forteresse
+(MajyuE, majroom). **Vérifié** (pile EU convertie) : fopAc_Create 025D4C70 -> daObjMovebox
+Mthd_Create 0237A468 -> Act_c::path_init 02377078 -> dPath_GetPnt 025AAEB8. path_init prend le
+point du chemin d'un bloc poussable dans deux switchs sauvegardés (progression partagée) ; un
+point absent du chemin de ce jeu. **Implémenté** : `path_guard.h`, `WWHD_REPLACE` de
+dPath_GetPnt (2 arguments vérifiés dans le code généré, m_num u16 à +0) : un index hors du chemin
+est ramené au point le plus proche (log « path point outside its path »). Chemin nul ou vide :
+l'original, comme avant.
+
+**Crash 2 (17:28, TyuTyu)** : lecture de 0x4 dans `multiplayer-connection.dll`. **Vérifié** :
+adresse du mod 7F024988 (module.c traduit + symboles de mod.elf via guestmod.Translator, base
+0x7F000000), `as_step` lit `actor + AS_PC_ID` d'un `as_slot` sans acteur. Cause : `as_handle_remove`
+marquait « removed » une copie pas encore créée (`AS_SPAWNING`, actor 0). **Corrigé** : copie non
+demandée oubliée, demandée marquée `dropped` et supprimée dès sa création (`as_bind_replica`) ;
+`as_step` libère un slot sans acteur.
+
+**« Guest mod memory region is full »** (journal d'un ami, mod non chargé) : **vérifié**
+(`packages.cpp assign_guest_region`) : région 7F000000-80000000. Le mod (code + données + tas
+8 Mio) était à 0xA20000, story-notebook réservé à 7FA00000 derrière une ancienne version du mod
+de 10 Mio : plus de place. **Corrigé** : tampon `incoming` 1 Mio -> 256 Kio (trames du serveur de
+quelques Kio ; une trame plus grande resterait bloquée dans la file, `network_transport.cpp`).
+Région 0x960000 (0.3.62).
+
+**Pot sur un puppet** : **implémenté** (`actor_sync.h as_carry_trusted`) : le bit de port 0x2000
+n'est cru que si le propriétaire a envoyé une position depuis moins de 1,5 s ou si son Link est dans
+un proc de port (0x6E-0x74, d_a_player_main_0x.h). Déduit, non testé.
+
+**Cinématiques** (demande : seules celles lancées par un ennemi téléportent) : **vérifié**
+(`d_com_inf_game.h` PLAY_EVTCTRL 0x51D0, `d_event.h` mPt1 +0xC4 / mPt2 +0xC8, `d_event.cpp`
+setParam appelé juste après `order`, startProc plus tard dans runProc). `ev_start` n'envoie que si
+l'un des deux acteurs de l'ordre est du groupe ennemi (2).
+
+Non traité : tuniques pyjama/héros (besoin d'un journal ou d'une description précise).
+Mod 0.3.62 compilé (118 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+Dist non modifiée.
+
+## 0.3.63 : vêtements du jeu seulement, rubis ramassés, RESET THIS ROOM en cinématique
+
+**Pyjama / tunique** (décision de l'utilisateur après la session du 21 : textures mélangées au
+hasard au passage pyjama -> tunique) : plus de choix. `outfit_wanted` toujours `OUTFIT_AUTO` (le
+drapeau du jeu, posé par playerInit selon l'event 0x2A80, que la progression partagée donne à tous
+dès qu'un joueur l'a), `outfit_puppet_begin/end` supprimés (les puppets ne réécrivent plus les
+vêtements de leur joueur au dessin). Gardé : la réécriture de la table partagée selon le drapeau du
+Link local à chaque pas (réparation de la note 0.3.27). Launcher : case pyjama toujours
+verrouillée, cochée tant que `hero_clothes=0`, décochée dès `hero_clothes=1` ; le profil écrit
+`outfit=auto`. Compilé (javac).
+
+**Rubis en l'air au-dessus des puppets** : **vérifié dans le code** : un objet *placé* (rubis du
+stage, proc 0xFF) ramassé n'envoyait aucune suppression (`as_on_deleted` : ennemis morts et pots
+seulement), et un objet placé reçu « removed » n'était supprimé que si `health > 0` (règle des
+ennemis) : la copie restait à la dernière place reçue, celle de la montée de l'objet ramassé
+au-dessus du joueur. **Corrigé** : ramassé près du Link local -> `client_remove` ; reçu -> supprimé
+tout de suite.
+
+**RESET THIS ROOM** : refusé pendant un event (« busy »). Autorisé maintenant (journal « room reset
+during an event »), pour sortir d'une cinématique bloquée ; toujours refusé pendant un changement
+de stage, sur le bateau ou en fantôme. Déduit, non testé : le chargement du stage remet le
+contrôle d'event à zéro.
+
+Mod 0.3.63 compilé (118 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.64 : armes des ennemis et des pots synchronisées, pas de port en cinématique
+
+**Port d'un joueur** : `carry.h cy_lift_target` ignore un puppet dont le proc reçu
+(`remote_proc`) est un proc de cinématique (daPyProc_DEMO_TOOL 0xA9 à DEMO_ICE_SLIP 0xDA,
+`d_a_player_main_0x.h`). Déjà en place : pas de port quand le Link local est en event
+(`cy_can_act`), un joueur porté dont l'event commence est lâché (`cy_place_local`, MP_CARRY_JUMP).
+
+**Armes** (`daBoko_c`, process 0x1CF, `d_a_boko.cpp`). **Vérifié** : `mNowMode` u8 à +0x430
+(code généré 020C19E4), modes WAIT 0, MOVE 1, ENEMY_CARRY 2, PLAYER_CARRY 3, THROW 6
+(`d_a_boko.h`). Pots : `d_a_tsubo.cpp spec_make_boko` crée les bâtons avec le pot (dans chaque
+jeu), portés (`setCarryNow`), lâchés à sa suppression avec une vitesse aléatoire (`spec_remove`).
+**Implémenté** (`actor_sync.h`, classe `AS_CLS_BOKO`, nom « Boko » dans la fabrique « Spawned »,
+sans changement du serveur) :
+- tenue par un ennemi ou un pot : propre à chaque jeu ;
+- tombée : partagée par le jeu propriétaire de l'ennemi (créée en contexte OWNED) ou celui qui a
+  cassé le pot (`as_pot_break_note`, 3 s, 2,5 m) ; les autres suppriment la leur (`as_kill`) ;
+  arme sans origine connue (posée dans le stage, ennemi non synchronisé) : locale ;
+- copie : suit la place du propriétaire, dans les mains de son puppet quand il la porte (variant
+  bit 0 = PLAYER_CARRY, `as_carried_place`) ;
+- copie ramassée par le Link local : supprimée pour tous, annoncée de nouveau depuis ce jeu ;
+  copie prise par un ennemi local : devient la sienne ; arme du propriétaire reprise par son
+  ennemi : supprimée pour tous ;
+- coups d'une copie : comme les autres armes (`as_weapon_of`), laissés aux strikes du propriétaire.
+Mod 0.3.64 compilé (118 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+Risques : la rotation d'une copie portée vient de l'arme du propriétaire (pas de la main du
+puppet) ; un ennemi d'un autre joueur reste sans arme dans les autres jeux après l'avoir perdue.
+
+## 0.3.65 : tonneaux multipliés par joueur, puppet caché sous un tonneau
+
+**Vérifié** : le tonneau où l'on se cache est `daObjBarrel` (process 0x1C8, fpcNm_Obj_Barrel_e de
+`d_a_player_main_01.h`, archive Ktaru_01, `d_a_obj_barrel.cpp`) ; « Ktaru » est dans la liste du
+serveur (`actorCreators.ktml`, comme kotubo : synchronisé avec le bit de port).
+**Implémenté** :
+- `as_stage_create` : un tonneau (nom du stage cherché dans la table du jeu, `dStage_searchName`
+  025C109C, process s16 à +8) est créé `mp_player_count()` fois (joueur local + joueurs connectés,
+  16 au plus), copies en anneau de 1,3 m (`as_copy_spread`), même mécanisme que les ennemis
+  (copie numérotée, synchronisée par son numéro). Le nombre est fixé au chargement du stage dans
+  chaque jeu : un joueur arrivé plus tard peut avoir plus de tonneaux (les siens en trop restent
+  locaux) ;
+- `as_step` liste à chaque pas les joueurs dont le tonneau synchronisé est porté
+  (`as_carried_by_other`, donc `as_carry_trusted`) ; `puppet_sense.h sense_nearest_puppet` ignore
+  leurs puppets : ennemis et habitants ne les voient plus (le Link local sous son tonneau est géré
+  par le jeu lui-même).
+Mod 0.3.65 compilé (118 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.66 : interrupteurs de la room partagés, retour au dernier endroit
+
+**Interrupteurs** (`switch_sync.h`). **Vérifié** (`d_save_5.cpp`, `d_save_readable.h`) : switchs
+0-127 = mémoire du stage (sauvegardée, déjà partagée par la progression), 128-191 = donjon
+(`dSv_danBit_c`, non sauvegardés), 192-239 = zone de la room (`dSv_zoneBit_c`). Ces deux derniers
+ne quittaient jamais un jeu. **Implémenté** : hooks d'entrée sur onSwitch 025B9E38, offSwitch
+025B9F7C, revSwitch 025BA20C (this, numéro, room ; absents des differing_functions) : un vrai
+changement (isSwitch 025BA0C0 avant) d'un switch 128-239 de `dComIfGs_info` (sauvegarde + 0x20)
+part en « #SW1_nn_rr » / « #SW0_nn_rr » (transport d'item_share.h, relayé tel quel par le
+serveur). Reçu : même stage (donjon) et même room (zone) -> onSwitch / offSwitch du jeu ; pas
+renvoyé pendant 1 s (rebond d'un interrupteur que l'autre jeu remettrait à sa valeur), 8 envois
+par pas au plus.
+
+**Retour au dernier endroit** (`last_place.h`) : toutes les 5 s en ligne (hors bateau, mort,
+event, téléportation), stage / room / couche / position / direction écrits dans
+`last_place.bin` (dossier Data du mod) avec le serveur (host:port). À la connexion suivante au même
+serveur, 2 s après, hors event : `teleport_go` (la téléportation de la carte, sans prix), sauf si
+déjà dans cette room à moins de 10 m. Le fichier n'est réécrit qu'après cette tentative (abandon
+après 30 s).
+
+**Couleur du bateau** (question) : vérifié dans le code : le bouton APPLY BOAT COLOUR écrit
+`ship_color` tout de suite (`writeHdSettings`, seulement si le launcher est lié au jeu par BROWSE),
+le mod relit launcher.cfg chaque seconde (`refresh_launcher_settings`) et repeint en direct ;
+la couleur part aussi aux autres (`ship_puppet.h` MP_SHIP_COLOR). Cause non trouvée sans journal.
+
+Mod 0.3.66 compilé (121 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+
+## Launcher : téléportation bloquée « A teleport is already on its way » (21-22 octobre)
+
+**Vérifié dans le code** : le launcher garde `teleportPending` jusqu'à une réponse finale du jeu
+(players.txt « teleport=id|résultat »), sans limite de temps. Le mod ignore exprès une demande
+écrite avant sa première lecture de teleport.cfg (`mod.c` : « older than this game », jeu qui
+démarre ou qui charge) et ne répond rien quand il est fermé : le launcher restait bloqué jusqu'à
+son redémarrage. **Corrigé** (`LauncherUI`) : `teleportSince` ; sans réponse en 10 s (60 s après
+« loading »), la demande est oubliée avec un message, une nouvelle peut partir. Compilé (javac).
+Non testé.
+
+**Couleur du bateau** : le problème venait de l'ancien build de la dist (runtime du 18 octobre),
+d'après l'utilisateur.
+
+## 0.3.67 : launcher lié par le dossier de la recomp, launcher.cfg toujours présent, statut sur les vagues
+
+- Launcher : BROWSE choisit le dossier de la recomp (celui de Wind Waker HD.exe), plus le fichier.
+  `configFromGameFolder` : `<recomp>/data/user/ModManager/...` (release portable),
+  `<instance>/user/ModManager/...` (instances de dev), ou un dossier déjà à l'intérieur ; une
+  recomp jamais lancée (Wind Waker HD.exe ou data/bin présents) : le chemin data/user. Le
+  `launcher.cfg` absent est créé (`HdModBridge.update` crée dossiers et fichier). Les messages
+  « BROWSE → launcher.cfg » disent maintenant « the recomp folder ». Un lien déjà enregistré (chemin
+  du fichier) reste valable.
+- Mod : `read_launcher_cfg` écrit un launcher.cfg vide (en-tête) quand il manque.
+- Barre latérale : la carte STATUS (Server / Game, Connected) est posée sur les vagues, le nom
+  « Wind Waker Online » en dessous.
+Mod 0.3.67 compilé (121 hooks), installé instances 1 et 3 ; launcher compilé (javac). Rendu de la
+barre latérale non vérifié visuellement.
+
+## 0.3.68 : une seule cinématique pour un ennemi et ses copies du multiplicateur
+
+**Constat** : un ennemi qui lance sa propre cinématique (Bokoblin, `d_a_bk_exec.cpp demo_camera` :
+`fopAcM_orderPotentialEvent` à chaque pas tant que `eventInfo.checkCommandDemoAccrpt()` est faux ;
+intro m1234 = 1, caméra de mort m1234 = 50) la lançait une fois par copie, jouées à la suite.
+Idée de l'utilisateur (Twilight Princess : mettre les copies en pause) discutée : une pause seule
+ne suffit pas, la copie relâchée redemande sa cinématique.
+**Vérifié** : tout ordre passe par `dEvt_control_c::order` (0253EC0C, `d_event.cpp` : this, type,
+priorité, flag, hind, acteur 1, acteur 2, index d'event ; 9e argument sur la pile, donc hooks
+d'entrée et de retour, pas de remplacement) ; `mOrderCount` s8 à +0xC0 (code généré), « plein » à
+8 = refus ; `eventInfo.mCommand` u16 à +0xF8 de l'acteur, INDEMO = 2 (`f_op_actor.h`) ;
+`dComIfGp_event_reset` est inline : play + 0x52B8 |= 8.
+**Implémenté** (`actor_sync.h`, gd_*) pour un acteur d'un groupe multiplié (as_groups /
+as_enemy_copies) avec au moins 2 membres vivants :
+- rassemblement : ordres refusés 0,5 s ou jusqu'à ce que tous les membres vivants demandent ;
+- un seul joue : le membre qui demande à la fin du rassemblement mène, son ordre passe ;
+- les autres suivent : tant que le meneur est INDEMO, chaque suiveur reçoit INDEMO avant son
+  execute (il joue sa partie avec le meneur) ; son event_reset est annulé après son execute ;
+- après : commande des suiveurs remise à NONE, même ordre du groupe refusé 5 s (au-delà une copie
+  qui redemande joue la sienne : jamais bloquée pour de bon).
+Mod 0.3.68 compilé (123 hooks), vérifications OK, installé instances 1 et 3. **Non testé en jeu.**
+Risque : un ennemi dont la cinématique attend des données d'event (staff de l'event manager) peut
+rester figé comme suiveur jusqu'à la fin de la cinématique du meneur.
+
+## Launcher : RESET BOAT COLOUR
+
+Bouton à côté d'APPLY BOAT COLOUR : `HdModBridge.remove` retire `ship_color` de launcher.cfg ; le
+mod (relecture chaque seconde) n'a plus de couleur, `boat_refresh` remet les textures d'origine
+(« original boat paint restored », boat_paint.h). Le sélecteur revient au rouge d'origine.
+SAVE PROFILE n'écrit plus `ship_color` quand il n'y en a pas et que la couleur est restée le rouge
+d'origine (sinon le reset serait annulé par un rouge « personnalisé »). Compilé (javac), non testé.
+
+## 0.3.69 : tenue du héros avec les textures du pyjama (analyse de fond), pot sur un puppet
+
+**Vérifié** (`d_a_player_main_04b.cpp playerInit` 02410BE8, `d_a_player_main_04.cpp playerDelete`
+0240EBF0) : la table de textures du modèle de Link est partagée par tous les Links. playerInit
+copie les en-têtes ACTUELS de la table comme « originaux » (m48C), écrit le pyjama, puis rééchange
+si la sauvegarde dit héros ; playerDelete rééchange si le Link est en pyjama. Pour un seul Link
+la table revient toujours propre. Les puppets sont déjà isolés : `puppet_phase_2` (qui appelle
+playerInit) et `puppet_delete` sauvent et remettent les en-têtes (`puppet_texture_table`).
+Ce qui écrivait encore : `outfit.h outfit_local_step`, à chaque pas, des en-têtes appris une fois
+par model data (avec le pointeur absolu de l'objet texture HD à +0x20), jamais réappris tant que
+le pointeur de model data ne change pas : après un rechargement de l'archive Link à la même
+adresse (changement de zone, tenue reçue), des en-têtes périmés réécrits en boucle. Déduit : c'est
+la cause de « modèle du héros, textures du pyjama » (image de la session du 22 octobre, dist 0.3.61
+qui avait encore aussi l'écriture par puppet).
+**Corrigé** : `outfit.h` n'écrit plus rien (lecture du drapeau et de l'event 0x2A80 seulement) ;
+les vêtements du Link local sont ceux du jeu.
+
+**Pot sur un puppet** : la dist jouée (0.3.61) n'avait pas `as_carry_trusted` (0.3.62). Ajout
+d'un journal « carry: a copy in a puppet's hands » (propriétaire, process, proc du propriétaire,
+âge de sa dernière place, placé ou spawné), une fois par copie, pour trouver la cause si ça revient.
+Mod 0.3.69 compilé (123 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.70 : dernier endroit gardé par le serveur, chargement direct ; launcher (zoom, mode sombre)
+
+**Dernier endroit** (demande : gardé par le serveur, seulement l'emplacement, pas la sauvegarde ;
+au premier chargement, directement là-bas). Sans changer le format du protocole :
+- client (`last_place.h`) : toutes les 5 s (hors bateau, mort, event, téléportation) un paquet de
+  cinématique « #LP_ll » (couche en hex, place : stage, room, x y z, direction) ;
+- serveur (`WWClient`) : « #LP » n'est relayé à personne, gardé par uid (8 octets de l'init) dans
+  `User/LastPlaces.txt`, renvoyé à ce joueur seul à son CLIENT_INIT_PACKET (SERVER_PLAYER_EVENT,
+  émetteur 0). Testé : compilé (javac) ;
+- client : la place reçue est appliquée 2 s après la connexion (`teleport_go`, sans prix) si le
+  Link n'est pas déjà dans cette room à moins de 10 m, et gardée dans `last_place.bin` (format LPL2,
+  avec le serveur) ;
+- premier chargement : **vérifié** (`d_s_name.cpp` changeGameScene 025ADC60 : `dComIfGs_gameStart`
+  02522198 = setNextStage du return place de la sauvegarde, puis demande de la scène, puis
+  `mRestartRoomParam = 0`) : hook d'entrée sur gameStart, hook de retour sur changeGameScene qui
+  remet stage, place de reprise et paramètre comme teleport_go, d'après `last_place.bin` du même
+  serveur, seulement pour un joueur en ligne (host dans launcher.cfg). Plus de second chargement
+  quand la place est connue localement. Le mod ne se connecte qu'au premier pas de Link, d'où la
+  copie locale.
+**Launcher** : description ELITE ENEMIES raccourcie ; RESET THIS ROOM en rouge (`.danger-button`,
+les deux launcher.css) ; carte : zoom 1x-4x à la molette autour du curseur, boutons − + 1:1,
+déplacement à la souris (ScrollPane pannable), icônes des joueurs à taille fixe ; Play Online :
+interrupteur « Dark mode » (préférence `darkMode`, `launcher-dark.css` ajouté par-dessus, couleurs
+seulement). Compilé (javac). Rendu non vérifié visuellement.
+Mod 0.3.70 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.** Le serveur doit
+être recompilé (dist) pour garder les places.
+
+## 0.3.71 : pot de la femme d'Outset sur un puppet ; tenue du héros, textures du pyjama (suite)
+
+**Pot** (cause trouvée par l'utilisateur : la femme d'Outset qui porte un pot sur la tête). Le pot
+porté par un PNJ a le bit de port 0x2000 (setCarryNow du PNJ) ; le jeu propriétaire du pot
+l'envoyait, les autres le plaçaient dans les mains du puppet du propriétaire. **Corrigé**
+(`actor_sync.h as_carried_by_local`) : les bits de port (statut et variant d'un objet spawné) ne
+sont envoyés que si le Link local porte cet objet (`mActorKeepGrab.mActor` +0x65A4, carry.h).
+**Tenue / pyjama** (après 0.3.70, testé par l'utilisateur : Link local correct, puppets avec le
+chapeau mais les textures du pyjama, des deux côtés). **Vérifié** : le changement de tenue chez
+mémé se fait sur place par la cinématique (`d_a_player_main_03.cpp setDemoData`, ENABLE_SHAPE :
+échange de la table avec les copies du Link et bascule du drapeau), pas par un rechargement ; les
+puppets ne passent pas par là (`puppet_execute` : mise à jour visuelle seulement). Un Link local
+avec skin change la table de son skin : la table partagée des puppets n'est changée par personne.
+Déduit : c'est la cause quand les joueurs ont un skin. **Implémenté** :
+- `outfit.h outfit_puppet_draw_begin/end` : autour du dessin d'un puppet sans skin, l'objet
+  texture HD (+0x20) de chaque entrée de vêtements est celui de SES vêtements (drapeau du puppet) :
+  l'objet du pyjama (getRes("Link", 0x71)) ou celui du héros, appris de l'entrée ou des copies du
+  puppet (+0x48C) quand ce n'est pas celui du pyjama ; remis après (comme les copies de couleur
+  de tunic.h, appliquées ensuite) ;
+- `tunic.h tunic_reset_all` : au changement du drapeau pyjama du Link local, couleurs d'origine
+  remises, copies et textures oubliées, retrouvées 2 rafraîchissements plus tard.
+Mod 0.3.71 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.72 : crash de la cinématique de groupe, porté collé au puppet, tonneaux, bâtons
+
+**Crash 21:31 (instances 1 et 3, 0.3.70)** : lecture de 0 dans le hook de `dEvt_control_c::order`
+(0.3.68), appelé par `fopAcM_orderPotentialEvent` (025D7B24) d'un Moblin (`daMo2_Execute`
+021C9B1C). Vérifié avec le module.c de la build qui a planté (GuestBuild c707cc…, base 7F240000) :
+la boucle qui retire le meneur des suiveurs, pointeur d'entrée invalide. **Réécrit** (indices,
+bornes) et simplifié à la demande : seulement les copies d'un même ennemi placé (même point de
+départ), le premier qui demande joue tout de suite (plus d'attente), les autres refusés et suiveurs.
+**Porté par un joueur** : le puppet du porteur prend chaque place reçue sans lissage
+(`cy_is_carrier`), et le Link local est remis dans ses mains juste après la mise à jour de ce
+puppet (`cy_after_carrier` : décalage des mains depuis old.pos ajouté à la nouvelle place,
+setWorldMatrix 023FF6A0).
+**Tonneaux** : copie portée par un puppet posée à ses pieds (plus à hauteur des mains). Caché :
+**vérifié** (`d_a_player_main_01.cpp checkGrabBarrelSearch` 023DCF08 : mActorKeepGrab.mID +0x65A0
+cherché, Obj_Barrel 0x1C8) ; le puppet dont le joueur porte son tonneau reçoit la copie dans son
+mActorKeepGrab (`as_grab_barrels`), les acteurs jugent avec leur propre code ; l'exclusion du
+puppet de 0.3.65 est retirée.
+**Bâtons** : copie portée par son propriétaire toujours crue (variant envoyé à chaque changement),
+dans la main droite. Synchronisation des bâtons des pots non expliquée (instance 1 : « weapon
+fell, shared », instance 3 : aucune copie vue) : journaux ajoutés (décision à la chute, copie
+demandée, copie créée).
+**Lerp (question)** : envoi sans lissage (positions brutes, joueurs 30 fois/s au plus, acteurs
+toutes les 0,1 s) ; à la réception : joueurs lissés d'un tiers de l'écart par pas (mod.c
+update_markers, rotation directe), acteurs de même (`as_step`, blend dt/0,1), puis
+l'interpolation d'images du runtime entre deux pas.
+Mod 0.3.72 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.73 : caché sous un tonneau d'après l'état du joueur ; tenue des puppets d'après leur joueur
+
+- Tonneau porté par un puppet : remonté d'un cinquième vers les mains (0.3.72 : aux pieds).
+- Caché (0.3.72 testé : les monstres prenaient encore l'aggro) : nouveau bit d'extras
+  `MP_EXTRA_BARREL` 0x08 (ActorPlayerSync, relayé tel quel par le serveur, `extras & 0x7F`), mis
+  par le jeu du joueur quand son Link tient un tonneau (le test de checkGrabBarrel :
+  mActorKeepGrab.mActor +0x65A4, process 0x1C8). Tant qu'il est là, `puppet_sense.h` n'offre ce
+  puppet à aucun acteur.
+- Tenue (testé 0.3.71 avec skins : joueur en tunique, puppet en pyjama des deux côtés). Cause
+  déduite : le drapeau d'un puppet est fixé une fois à sa création (playerInit) ; le cadeau de
+  mémé change la tenue sur place, sans recréer le puppet. **Corrigé** : `outfit_puppet_draw_begin`
+  prend la tenue envoyée par son joueur (`MP_EXTRA_CASUAL`, à chaque mise à jour) pour les textures
+  et met le drapeau du puppet à l'unisson (chapeau et boucle, daPy_lk_c::draw). Indépendant des
+  savestates.
+Mod 0.3.73 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.74 : la tenue des puppets AVEC skin (cause des échecs 0.3.69-0.3.73)
+
+Toutes les corrections de tenue depuis 0.3.69 ne s'appliquaient qu'aux puppets SANS skin
+(`puppet.h` : `if (!skinned) outfit_puppet_draw_begin`). Les tests de l'utilisateur se font avec
+des skins : un puppet avec skin dessine avec la table de textures de SON skin, que son playerInit
+a réglée une fois (pyjama à l'époque), jamais changée ensuite. **Vérifié** (`skin.h` skin_get_res
+026066C4 / skin_key_for) : pendant le code d'un Link avec skin, getRes("Link", i) lit l'archive du
+skin ; son objet pyjama est donc le 0x71 de l'archive du skin. **Implémenté** :
+`skin_casual_object` (getRes de l'archive « MpSk_<id> », 0x71, objet HD +0x20) ;
+`outfit_puppet_draw_begin(puppet, casual, objet pyjama)` appelé pour TOUS les puppets, avec l'objet
+de Link ou celui du skin, objets du héros appris par model data (16 au plus). Journal « clothes:
+puppet model data / casual wanted / casual object / clothes entries listed » à chaque changement.
+Plan B proposé par l'utilisateur si ça ne suffit pas : recharger les textures du skin au
+chargement de la salle suivante.
+Mod 0.3.74 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## Launcher : barre latérale avec icônes, Serveur à part
+
+Les numéros 01-06 des boutons de navigation sont remplacés par des icônes vectorielles (SVGPath
+24x24 à 0,75 dans le rond doré `.nav-badge` ; `.nav-icon` dorée, bleu foncé sur la page active,
+les deux launcher.css) : lecture (Play Online), bateau (Prepare Your Voyage), repère (World Map),
+sac (Shop), insecte (Debug), serveur (Server). Le bouton Server est à part, sous un titre
+« HOSTING », tout en bas juste au-dessus du bloc STATUS. Compilé (javac) ; rendu non vérifié
+(capture d'écran impossible depuis la session de l'outil).
+
+## Launcher : logo
+
+`images/logo.png` (1254x1254, fourni par l'utilisateur) remplace la Triforce en haut à gauche
+(`createLogo`, 48 px, chargé au double pour les écrans haute densité) et sert d'icône à la fenêtre
+et à la barre des tâches (`stage.getIcons()`, 16 à 256 px). `images/logo.ico` (16-256) généré pour
+un raccourci Windows (le launcher démarre par un .bat, qui ne porte pas d'icône). Compilé (javac).
+
+## Launcher : police Sherwood
+
+`SherwoodRegular.ttf` (famille « Sherwood », 45 Ko, fournie par l'utilisateur) chargée une fois au
+démarrage (`Font.loadFont`) et appliquée par le CSS (les deux launcher.css) aux titres : barre
+latérale (titre, pages, sections, signature), bannière, titres de section et de cartes. Textes
+courants inchangés. Coût : négligeable (45 Ko lus une fois). Remarque : launcher.css commence par
+un `@import` de Google Fonts (Barlow Condensed, Nunito) ; JavaFX va chercher ce fichier sur
+Internet au démarrage et ne sait pas lire les polices woff2 qu'il désigne : sans effet probable,
+et une attente possible hors ligne. Non modifié (à décider). Compilé (javac), rendu non vérifié.
+Ajusté à la demande : Sherwood seulement pour le titre en haut à gauche (« WIND WAKER » /
+« ONLINE RECOMP », `.brand-title`, `.brand-subtitle`), le reste revient à la police d'avant.
+
+## Launcher : bouton SAVE en bas, signature retirée
+
+- Barre latérale : signature « WIND WAKER ONLINE / HD recomp multiplayer » retirée, bloc HOSTING +
+  STATUS descendu (marge du bas 10 au lieu de 22).
+- Bas de page : le chemin du jeu (« Game linked: … ») remplacé par un bouton SAVE
+  (`saveAllProfiles`) : réglages du serveur (préférences des mutateurs, `launcherSavers`), puis,
+  si le jeu est lié, connexion (Play Online) et profil (Prepare Your Voyage) écrits ensemble dans
+  launcher.cfg (`gameSavers`). Les pages étant refaites à chaque visite, une seule source par page
+  (la dernière). Les boutons de chaque page restent. Compilé (javac), rendu non vérifié.
+
+## Launcher : notifications par-dessus
+
+`showToast` mettait la notification dans le bas du BorderPane racine (`root.setBottom`) : elle
+prenait de la hauteur à toute la mise en page et remontait le bas de la barre latérale. Maintenant
+la scène a pour racine un StackPane (mise en page + notification), la notification est par-dessus,
+en bas à droite (60 px au-dessus du bas, au-dessus du bouton SAVE), transparente à la souris, et ne
+déplace plus rien. Compilé (javac), rendu non vérifié.
+
+## Launcher : link.png et red.png transparents
+
+Les aperçus du Link et du bateau (images/link.png, sans canal alpha, et images/red.png) avaient un
+fond blanc opaque, visible en mode sombre. Fond rendu transparent (remplissage depuis les bords
+sur le blanc, tolérance 40, puis passage du blanc à la transparence sur une bande de 2 px pour
+garder des contours lisses sans halo ; les blancs internes, yeux, dents, écume, restent). Les deux
+copies de resources remplacées ; originaux gardés dans le scratchpad (img_backup). Le recoloriage
+du launcher garde l'opacité (`pixel.getOpacity()`). Aperçu sur fond sombre vérifié.
+
+## Launcher : le jeu trouvé quel que soit l'ordre de lancement
+
+Avant, le launcher ne regardait que le dossier lié (BROWSE) : un jeu lancé depuis une autre
+installation (autre instance, la release) restait « Not running ». `findRunningGame` (toutes les
+2 s, si le players.txt du jeu lié n'est pas frais) : processus `wwhd.exe` (ProcessHandle, chemin
+de l'exécutable remonté jusqu'à un dossier de recomp, `configFromGameFolder`), puis les dossiers
+connus (`knownGameFolders` : liés avant, instances voisines) ; celui dont players.txt a moins de
+3 s devient le jeu lié (mémorisé, message « Game found »). Limite : le mod écrit players.txt depuis
+le pas de Link (`map_step`) : à l'écran titre et au menu des sauvegardes le jeu n'est pas encore
+vu. Compilé (javac), non testé.
+
+## 0.3.75 : suivre le Chant de la Tornade d'un autre joueur
+
+**Vérifié** (`d_a_player_main_07.cpp`, `d_a_ship.cpp`, code généré) : le Chant de la Tornade
+(chant 1) en mer crée un cyclone `fpcNm_TORNADO_e` 0x1BB (paramètre 1, place de Link), son id dans
+`daShip_c::mTactWarpID` (+0x714) ; la carte donne la destination `mTactWarpPosNum` (+0x6AC) ; puis
+Link pagaie (`procShipPaddle_init` 023F1E60) et le bateau passe en MODE_TACT_WARP 14
+(`mNextMode` +0x636 ; `procTactWarp_init` 0247DBF8 écrit `mCurMode` +0x635 = 14, vu dans le code
+généré) ; `procTactWarp` (02482438) soulève le bateau puis `dStage_changeScene(destination + 0xC5)`.
+**Implémenté** (`gale_follow.h`) : le bateau local qui passe en tact warp avec une destination
+envoie « #GALE_xx » (transport d'item_share.h) ; les autres voient 20 s « <joueur> played the
+Ballad of Gales: hold A to follow » avec une barre ; sur leur bateau en mer (stage « sea »,
+embarqués, hors event), A tenu 1 s (`mItemButton` & 1) fait comme le chant : cyclone sur leur
+Link, id et destination dans leur bateau, Link qui pagaie, bateau en MODE_TACT_WARP. Hors du
+bateau : « be on your boat at sea to follow ». Un suiveur ne renvoie pas « #GALE ».
+Mod 0.3.75 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.** Risques : le
+cyclone créé hors de la cinématique du chant (la caméra d'event du bateau, `shipFirstStartEventCamera`,
+démarre sans event en cours) ; un appui sur A sur le bateau fait aussi ce qu'il fait d'habitude.
+
+## Launcher : le curseur TIME OF DAY suit l'heure du jeu
+
+Le curseur des mutateurs restait à 12 h ; seule la ligne « In game now » suivait le serveur.
+`refreshWorldNow` (toutes les 0,5 s) le place maintenant sur l'heure du jeu quand elle est connue,
+sauf pendant que l'utilisateur le déplace et 4 s après (souris, clavier : `timeSliderTouched`),
+pour pouvoir choisir une heure et faire SET TIME. Compilé (javac).
+
+## 0.3.76 : positions des joueurs interpolées (tampon)
+
+Avant : la place affichée faisait un tiers du chemin vers la dernière reçue à chaque pas (retard
+qui grandit avec la vitesse, dépassement à chaque arrêt, rotations appliquées d'un coup).
+Maintenant (`mod.c` rs_*) : les 6 dernières places reçues gardées avec leur heure d'arrivée
+(`rs_clock`, avancé de dt à chaque pas) ; le puppet est montré 75 ms dans le passé (`RS_DELAY`,
+environ deux envois d'ActorPlayerSync), sur la droite entre les deux places qui encadrent ce moment,
+rotations par le plus court chemin ; après la plus récente, il y reste (pas d'extrapolation : un
+joueur arrêté n'envoie plus rien). Saut de plus de 15 m (téléportation, changement de zone) : pris
+tout de suite. Le porteur du Link local : sa place la plus récente (0.3.72). Protocole et serveur
+inchangés. Ennemis et objets synchronisés : lissage inchangé (as_step).
+Mod 0.3.76 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**

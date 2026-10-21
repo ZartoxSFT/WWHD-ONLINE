@@ -686,8 +686,17 @@ WWHD_REPLACE(0x025D9154, u32, bonus_iball, (u32 pos, u32 table, u32 room, u32 an
     return result;
 }
 
-/* daItem_c::itemGetExecute: a yellow item gives its bonus. */
+/* daItem_c::itemGetExecute: a yellow item gives its bonus. 0.3.59: every pickup on the ground is
+ * counted in bonus_ground_pickup (item_share.h: what is picked up is not shared). */
+static int bonus_ground_pickup;
+static void bonus_item_get_inner(void* self);
 WWHD_REPLACE(0x0217DE18, void, bonus_item_get, (void* self)) {
+    ++bonus_ground_pickup;
+    bonus_item_get_inner(self);
+    --bonus_ground_pickup;
+}
+
+static void bonus_item_get_inner(void* self) {
     u32 elemental = bonus_elemental_of(self);
     if (elemental) {
         bonus_picking_type = elemental;
@@ -705,7 +714,9 @@ WWHD_REPLACE(0x0217DE18, void, bonus_item_get, (void* self)) {
 }
 
 /* execItemGet: the yellow heart or magic instead of the red heart or the magic. */
+static void share_item_given(u32 item); /* item_share.h: a purchase or a gift shared (0.3.59) */
 WWHD_REPLACE(0x0254DA38, void, bonus_exec_item_get, (u32 item)) {
+    share_item_given(item);
     if (item >= BONUS_ITEM_ARROW_10 && item <= BONUS_ITEM_ARROW_30 && (bonus_picking_type || bonus_arrow_shown)) {
         u32 count = (item - BONUS_ITEM_ARROW_10 + 1u) * 10u, quiver = bonus_quiver(), cap = bonus_elemental_cap();
         u32 type = bonus_picking_type;

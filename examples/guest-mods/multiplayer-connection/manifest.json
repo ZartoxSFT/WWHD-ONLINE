@@ -2,7 +2,7 @@
   "format_version": 1,
   "id": "multiplayer-connection",
   "name": "Wind Waker multiplayer connection",
-  "version": "0.3.52",
+  "version": "0.3.76",
   "game_id": "wwhd",
   "minimum_manager_version": "1.5.0",
   "kind": "guest",

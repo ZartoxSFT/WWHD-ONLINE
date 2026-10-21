@@ -27,6 +27,7 @@
 #define SENSE_GROUP_NPC 4
 
 static int sense_enabled = 1;
+
 static u32 sense_swaps; /* executes that saw a puppet, logged once */
 
 WWHD_GAME_ORIGINAL(0x025D475C, s32, sense_execute_original, (void* actor));
@@ -49,6 +50,9 @@ static u32 sense_nearest_puppet(const fopAc_ac_c* actor, u32 local) {
         u32 p = puppet_slots[i].used ? puppet_slots[i].actor : 0;
         if (!p || !puppet_is((const void*)p)) continue;
         if (puppet_slots[i].ghost || (puppet_slots[i].uid & PUPPET_BODY_UID)) continue;
+        /* 0.3.73: a player under a barrel (its game says so, MP_EXTRA_BARREL): seen by no actor
+         * (0.3.72 left it to the actors' own checkGrabBarrel: they still came for it) */
+        if (puppet_slots[i].remote_extras & MP_EXTRA_BARREL) continue;
         const daPy_lk_c* l = (const daPy_lk_c*)p;
         if (!l->mpCLModel) continue; /* not built yet */
         f32 d = sense_distance2(actor, (const fopAc_ac_c*)p);

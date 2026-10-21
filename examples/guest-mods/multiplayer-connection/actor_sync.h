@@ -294,7 +294,7 @@
 enum { AS_LOCAL, AS_PENDING, AS_SYNCED, AS_REMOVED, AS_SPAWNING };
 enum { AS_CTX_NONE, AS_CTX_OWNED, AS_CTX_FOREIGN, AS_CTX_LOCAL };
 enum { AS_KIND_PLACED, AS_KIND_SPAWNED };
-enum { AS_CLS_NONE, AS_CLS_ITEM, AS_CLS_WEAPON, AS_CLS_BALL };
+enum { AS_CLS_NONE, AS_CLS_ITEM, AS_CLS_WEAPON, AS_CLS_BALL, AS_CLS_BOKO };
 
 typedef struct as_slot {
     u32 actor, pcid;
@@ -310,6 +310,7 @@ typedef struct as_slot {
     u8 broken;           /* a pot broken in this game (as_pot_damaged): removed for everyone */
     u8 kind;             /* AS_KIND_* */
     u8 cls;              /* spawned: AS_CLS_* */
+    u8 dropped;          /* removed by the server while its copy was being made (0.3.62) */
     u8 replica;          /* spawned: created from the network */
     u8 requested;        /* replica: fopAcM_create called */
     u8 spawn_ready;      /* replica: speeds given */
@@ -594,6 +595,15 @@ static int as_is_enemy(const char* name) {
     return 0;
 }
 
+/* 0.3.71: the carry bits sent only for what the local Link itself carries (daPy_lk_c::mActorKeepGrab
+ * .mActor +0x65A4, carry.h CY_GRAB_ACTOR). Found by the user: Outset's woman carrying her pot on her
+ * head (an actor's own setCarryNow, the same 0x2000) made the pot's owner "carry" it: every other
+ * game put it in that player's puppet's hands (as_carried_place). */
+#define AS_LINK_GRAB_ACTOR 0x65A4
+static int as_carried_by_local(const fopAc_ac_c* a) {
+    return as_link && *(const volatile u32*)(as_link + AS_LINK_GRAB_ACTOR) == (u32)a;
+}
+
 static void as_read_values(const fopAc_ac_c* a, mp_actor_values* v) {
     v->has_transform = v->has_health = 1;
     v->transform.pos[0] = a->current.pos.x;
@@ -605,6 +615,7 @@ static void as_read_values(const fopAc_ac_c* a, mp_actor_values* v) {
     v->health = a->health;
     v->tag = el_tag_of(a); /* the owner's elite draw rides with the health (elite.h) */
     v->status = a->actor_status;
+    if ((v->status & AS_CARRY_BITS) && !as_carried_by_local(a)) v->status &= ~AS_CARRY_BITS;
 }
 
 static int as_send(mp_u32 id, const mp_writer* w) {
@@ -630,6 +641,62 @@ static void as_note_add(u32 prm, u32 group, u32 copy, u32 made, int randomized, 
     for (u32 i = 0; i != AS_STAGE_NAME; ++i) n->name[i] = name[i];
 }
 
+static f32 as_copy_spread = AS_SPREAD;
+
+/* 0.3.65: the barrels one hides in (daObjBarrel, process 0x1C8, fpcNm_Obj_Barrel_e in
+ * d_a_player_main_01.h; "Ktaru" on the server's list, synchronised like a pot) are made once per
+ * connected player. The stage's name is looked up in the game's own table: dStage_searchName
+ * (025C109C, d_stage.cpp: dStage_objectNameInf, its process name the s16 at +8). */
+#define AS_PROC_BARREL 0x1C8
+#define AS_BARREL_MAX 16
+#define AS_BARREL_SPREAD 130.0f   /* a barrel is about a metre wide */
+static int mp_player_count(void); /* mod.c: the local player and the connected others */
+static int as_is_barrel(u32 data) {
+    u32 info = wwhd_dStage_searchName(data);
+    return info && *(const volatile s16*)(info + 8) == AS_PROC_BARREL;
+}
+
+/* 0.3.65: the players under a barrel (their synchronised barrel carried by them, as_carried_by_other):
+ * no actor sees their puppet (puppet_sense.h). Made again every step (as_step). */
+#define AS_HIDDEN_MAX 16
+static mp_u32 as_hidden[AS_HIDDEN_MAX];
+static u32 as_hidden_barrel[AS_HIDDEN_MAX];  /* the barrel copy each hidden player carries */
+static u32 as_hidden_count;
+/* 0.3.72: hidden by the game's own rule. The actors ask daPy_lk_c::checkGrabBarrel (023DCF08,
+ * d_a_player_main_01.cpp: mActorKeepGrab.mID +0x65A0 searched, an Obj_Barrel 0x1C8) of player 0,
+ * the puppet nearest to them while they run (puppet_sense.h): a puppet held nothing, so a player
+ * under a barrel was seen. While its player carries its barrel (as_carried_by_other), the puppet's
+ * mActorKeepGrab is that barrel's copy (id +0x65A0, actor +0x65A4), cleared after. */
+#define AS_GRAB_ID 0x65A0
+#define AS_GRAB_ACTOR 0x65A4
+static u32 as_grab_given[AS_HIDDEN_MAX];
+static u32 as_grab_given_count;
+static void as_grab_barrels(void) {
+    u32 given[AS_HIDDEN_MAX];
+    u32 count = 0;
+    for (u32 i = 0; i != as_hidden_count && count != AS_HIDDEN_MAX; ++i) {
+        u32 puppet = 0;
+        for (int k = 0; k != PUPPET_MAX && !puppet; ++k)
+            if (puppet_slots[k].used && puppet_slots[k].uid == as_hidden[i]) puppet = puppet_slots[k].actor;
+        if (!puppet || !as_hidden_barrel[i]) continue;
+        *(volatile u32*)(puppet + AS_GRAB_ID) = *(const volatile u32*)(as_hidden_barrel[i] + AS_PC_ID);
+        *(volatile u32*)(puppet + AS_GRAB_ACTOR) = as_hidden_barrel[i];
+        given[count++] = puppet;
+    }
+    for (u32 i = 0; i != as_grab_given_count; ++i) { /* no longer under its barrel */
+        int still = 0;
+        for (u32 k = 0; k != count; ++k) still |= given[k] == as_grab_given[i];
+        if (still) continue;
+        int alive = 0;
+        for (int k = 0; k != PUPPET_MAX; ++k) alive |= puppet_slots[k].used && puppet_slots[k].actor == as_grab_given[i];
+        if (!alive) continue;
+        *(volatile u32*)(as_grab_given[i] + AS_GRAB_ID) = 0xFFFFFFFFu;
+        *(volatile u32*)(as_grab_given[i] + AS_GRAB_ACTOR) = 0;
+    }
+    for (u32 i = 0; i != count; ++i) as_grab_given[i] = given[i];
+    as_grab_given_count = count;
+}
+
 /* Copy number i of a placed enemy: its own block (fopAcM_CreateAppend, the stage loaders'
  * allocator), on its ring, with its variant; 0 when the game heap is exhausted. */
 static u32 as_make_copy(const char* name, const u8* original, u32 i, int randomized, u32 group) {
@@ -637,7 +704,7 @@ static u32 as_make_copy(const char* name, const u8* original, u32 i, int randomi
     if (!copy) return 0;
     memcpy((void*)copy, original, AS_PRM_BYTES);
     f32* position = (f32*)(copy + AS_PRM_POSITION);
-    f32 radius = AS_SPREAD * (f32)(1 + (i - 1) / 8);
+    f32 radius = as_copy_spread * (f32)(1 + (i - 1) / 8);
     position[0] += radius * as_ring_x[(i - 1) & 7];
     position[2] += radius * as_ring_z[(i - 1) & 7];
     if (randomized) as_randomize(name, original, i, (u8*)copy);
@@ -725,6 +792,11 @@ WWHD_REPLACE(0x025C1154, void, as_stage_create, (u32 data, u32 prm)) {
     u32 copies = 1;
     int randomized = enemy && as_session && as_session->enemy_randomizer;
     if (enemy && as_session && as_session->enemy_multiplier > 1) copies = as_session->enemy_multiplier;
+    if (!enemy && as_enabled && as_session && as_is_barrel(data)) { /* one barrel per player */
+        int players = mp_player_count();
+        copies = (u32)(players < 1 ? 1 : players > AS_BARREL_MAX ? AS_BARREL_MAX : players);
+        as_copy_spread = AS_BARREL_SPREAD;
+    }
     u32 group = enemy ? as_group_next++ : 0;
     u32 i = 1;
     for (; i < copies; ++i) {
@@ -733,6 +805,7 @@ WWHD_REPLACE(0x025C1154, void, as_stage_create, (u32 data, u32 prm)) {
         as_roster_note(data, copy);
         as_stage_create_original(data, copy);
     }
+    as_copy_spread = AS_SPREAD;
     *(u8*)(prm + AS_PRM_TAG) = AS_TAG;
     *(u8*)(prm + AS_PRM_COPY) = 0;
     if (group) as_note_add(prm, group, 0, i, randomized, (const char*)data);
@@ -826,8 +899,13 @@ static mp_u32 as_spawn_factory(void) {
     return MP_NO_ID;
 }
 
+#define AS_PROC_BOKO 0x1CF /* fpcNm_BOKO_e: the enemies' sticks, machetes, maces, swords (d_a_boko.cpp) */
+#define AS_BOKO_MODE 0x430         /* daBoko_c::mNowMode (u8; execute reads it, code_006.c 020C19E4) */
+#define AS_BOKO_ENEMY_CARRY 2      /* Mode_ENEMY_CARRY_e: in an enemy's hand */
+#define AS_BOKO_PLAYER_CARRY 3     /* Mode_PLAYER_CARRY_e: in Link's hands */
 static u8 as_spawn_class(s32 proc) {
     if (proc == AS_PROC_ITEM) return AS_CLS_ITEM;
+    if (proc == AS_PROC_BOKO) return AS_CLS_BOKO;
     if (proc == AS_PROC_IBALL) return AS_CLS_BALL;
     if (proc == AS_PROC_BOMB || proc == AS_PROC_BOMB2 || proc == AS_PROC_ARROW || proc == AS_PROC_BOOMERANG ||
         proc == AS_PROC_HOOKSHOT || proc == AS_PROC_ROPE)
@@ -843,6 +921,7 @@ static const char* as_spawn_name(s32 proc) {
     if (proc == AS_PROC_IBALL) return "Iball";
     if (proc == AS_PROC_HOOKSHOT) return "Hookshot";
     if (proc == AS_PROC_ROPE) return "Himo2";
+    if (proc == AS_PROC_BOKO) return "Boko";
     return "Boomrang";
 }
 
@@ -951,10 +1030,26 @@ typedef struct as_player_swap {
  * as_carried_place). daTsuboMode::Act_c::mode_carry (024CF844, d_a_tsubo_mode.cpp) places a
  * carried pot from dComIfGp_getPlayer(0): the copy was drawn in the local Link's hands ("a pot on
  * the player"), as_place moving it to the puppet's only around its execute, after its matrix. */
+/* 0.3.62: a pot still drawn on a player's puppet (friends' session, 2026-10-21; 0.3.53 cleared the
+ * create values' carry bit only). A carry bit is believed only while the owner really carries: a
+ * place received from it in the last AS_CARRY_FRESH seconds (walking with it), or its Link in a
+ * grab proc (daPyProc_GRAB_READY 0x6E to GRAB_HEAVY_WAIT 0x74, d_a_player_main_0x.h: standing
+ * with it). An old carry bit (kept by the server, the carrier gone or still) is dropped then. */
+#define AS_CARRY_FRESH 1.5
+#define AS_PROC_GRAB_FIRST 0x6Eu
+#define AS_PROC_GRAB_LAST 0x74u
+static int as_carry_trusted(const as_slot* s) {
+    /* a weapon copy: its owner sends "carried" each time it changes (variant, as_read_spawn) */
+    if (s->kind == AS_KIND_SPAWNED && s->replica && s->spawn.proc == AS_PROC_BOKO) return 1;
+    if (s->has_target && s->age < AS_CARRY_FRESH) return 1;
+    puppet_slot* p = s->owner ? puppet_slot_for(s->owner, 0) : 0;
+    return p && p->remote_proc >= AS_PROC_GRAB_FIRST && p->remote_proc <= AS_PROC_GRAB_LAST;
+}
+
 static int as_carried_by_other(const as_slot* s) {
     int carried = s->kind == AS_KIND_PLACED ? s->has_net_health && (s->net_status & 0x2000u)
                                             : s->replica && (s->spawn.variant & 1);
-    return carried && s->owner && s->owner != as_local_uid;
+    return carried && s->owner && s->owner != as_local_uid && as_carry_trusted(s);
 }
 
 static void as_swap_in(const as_slot* s, as_player_swap* w) {
@@ -1008,11 +1103,22 @@ static int as_bind_replica(void* actor) {
         if (!s->used || s->state != AS_SPAWNING || !s->requested || s->request_id != pcid) continue;
         as_link_bucket(s, (u32)actor);
         s->state = AS_SYNCED;
+        if (s->spawn.proc == AS_PROC_BOKO) {
+            static u32 logged;
+            if (logged++ < 8) wwhd_log("multiplayer: weapon copy made");
+        }
+        if (s->dropped) { /* removed meanwhile: deleted as soon as made */
+            s->state = AS_REMOVED;
+            s->remove_clock = 0;
+        }
         if (!as_replica_logged++) wwhd_log_int("multiplayer: first spawned actor of another player, process", (int)s->spawn.proc);
         return 1;
     }
     return 0;
 }
+
+static void as_boko_note(void* actor, u8 ctx);
+static void as_boko_after(as_slot* s, void* actor);
 
 /* A block made in a creation context (as_create_append). */
 static void as_register_runtime(void* actor, u32 prm) {
@@ -1022,6 +1128,10 @@ static void as_register_runtime(void* actor, u32 prm) {
     s32 proc = *(const volatile s16*)((const u8*)actor + AS_PROC_NAME);
     u8 cls = as_spawn_class(proc);
     if (cls != AS_CLS_NONE && as_spawn_factory() == MP_NO_ID) return; /* a server without "Spawned" */
+    if (cls == AS_CLS_BOKO) { /* an enemy's weapon: shared once it falls (as_boko_after) */
+        as_boko_note(actor, ctx);
+        return;
+    }
     if ((cls == AS_CLS_ITEM || cls == AS_CLS_BALL) && ctx == AS_CTX_FOREIGN) {
         as_ctx_add(as_kill, &as_kill_count, AS_MAX_KILL, actor, ctx); /* the owner's item comes instead */
         if (!as_suppressed_logged++) wwhd_log("multiplayer: a drop of another player's enemy replaced by theirs");
@@ -1113,14 +1223,81 @@ static void as_heap_log_refusal(const char* what, s16 proc, u32 need, u32 larges
     wwhd_log_int("multiplayer:   largest free block", (int)largest);
 }
 
+/* 0.3.53: a Link wearing a skin. Crash instance 1 (2026-10-21 13:36, 8 skin bots): the 8th Link,
+ * the first one wearing "shaggy", wrote to guest 0 while building its model in useHeapInit. A Link's
+ * heap has the size 0 (d_a_player_main_04b.cpp: fopAcM_entrySolidHeap(this, cb, 0), the HD
+ * fopAcM_entrySolidHeap_ then takes all of the parent's largest block and adjusts it), and the model
+ * code does not check its allocations: the room check here is the only guard, and it took the
+ * largest Link heap built so far, while each skin's model needs its own room. The room a skin's Link
+ * took is noted per skin archive; a skin not worn yet asks for AS_SKIN_LINK_FACTOR times a Link's. */
+#define AS_PROC_PLAYER 0xA8              /* fpcNm_PLAYER_e (puppet.h) */
+#define AS_SKIN_LINK_FACTOR 2u
+static u32 as_skin_link_size[SKIN_ARCHIVES];
+
+static u32 as_skin_link_need(u32 actor, s16 proc, u32 known) {
+    if (proc != AS_PROC_PLAYER) return 0;
+    int archive = skin_of(actor);
+    if (archive < 0 || archive >= SKIN_ARCHIVES) return 0;
+    u32 seen = as_skin_link_size[archive];
+    if (seen) return seen + seen / 4u + 0x10000u;
+    return known ? known * AS_SKIN_LINK_FACTOR + 0x10000u : 0u;
+}
+
+static void as_skin_link_note(u32 actor, s16 proc) {
+    if (proc != AS_PROC_PLAYER) return;
+    int archive = skin_of(actor);
+    u32 heap = *(const volatile u32*)(actor + AS_ACTOR_HEAP);
+    u32 used = heap ? as_heap_query(heap, AS_HEAP_VT_SIZE) : 0;
+    if (archive < 0 || archive >= SKIN_ARCHIVES || !used) return;
+    if (used > as_skin_link_size[archive]) {
+        as_skin_link_size[archive] = used;
+        wwhd_log_int("multiplayer: a Link wearing a skin took (KiB)", (int)(used >> 10));
+    }
+}
+
+static u32 hg_puppet_heap_get(void); /* heap_grow.h: the puppets' own heap, 0 without */
+
+/* 0.3.54: the actors whose heap the game takes from the game heap 0 (fopAcM_entrySolidHeapRegister
+ * 025D63E8, decomp f_op_actor_mng_2.cpp: 0x26, 0xA5, 0xA8 Link, 0x191, 0x1B5-0x1B6, 0x1B7 with
+ * parameters 0), the others from heap 1. as_actor_heaps gives heap 1 as `first`: these swap. */
+static int as_uses_game_heap0(u32 actor, s16 proc) {
+    if (proc == 0x26 || proc == 0xA5 || proc == AS_PROC_PLAYER || proc == 0x191 || proc == 0x1B5 || proc == 0x1B6) return 1;
+    return proc == 0x1B7 && ((const fopAc_ac_c*)actor)->mParameters == 0;
+}
+
 WWHD_REPLACE(0x025D63E8, s32, as_solid_heap, (u32 actor, u32 callback, u32 size)) {
+    s16 who = actor ? *(const volatile s16*)(actor + AS_PROC_NAME) : 0;
+    u32 own = hg_puppet_heap_get();
+    if (own && who == AS_PROC_PLAYER && puppet_is((const void*)actor)) { /* a puppet: in the puppets' heap */
+        u32 room = as_heap_query(own, AS_HEAP_VT_FREE_BLOCK);
+        u32 need = as_skin_link_need(actor, who, as_kind_known(who));
+        if (!need) need = 0x00100000u; /* a Link not built yet: 1 MiB (573-691 KiB seen) */
+        if (room < need) {
+            static u32 refused;
+            if ((refused++ & 15) == 0) as_heap_log_refusal("multiplayer: puppet not made, the puppets' heap is full (proc)", who, need, room);
+            return 0;
+        }
+        s32 made = as_entry_solid_heap(actor, callback, 0, own);
+        if (made && skin_of(actor) >= 0) as_skin_link_note(actor, who);
+        return made;
+    }
     if (!as_enabled || !actor) return as_solid_heap_original(actor, callback, size);
     u32 first, other;
     as_actor_heaps(&first, &other);
     if (!first) return as_solid_heap_original(actor, callback, size);
     s16 proc = *(const volatile s16*)(actor + AS_PROC_NAME);
+    if (as_uses_game_heap0(actor, proc)) { /* checked in the heap the game takes (0.3.54) */
+        u32 t = first;
+        first = other ? other : first;
+        other = t;
+    }
     u32 known = as_kind_known(proc);
     u32 need = known ? known + known / 4u + 0x10000u : 0;
+    u32 skin_need = as_skin_link_need(actor, proc, known);
+    if (skin_need > need) {
+        need = skin_need;
+        known = known ? known : need; /* a known need: no "the game's estimate fits" tries below */
+    }
     u32 l_first = as_heap_query(first, AS_HEAP_VT_FREE_BLOCK);
     u32 l_other = other && other != first ? as_heap_query(other, AS_HEAP_VT_FREE_BLOCK) : 0;
     const u8* block = (const u8*)as_roster_creating;
@@ -1159,7 +1336,11 @@ WWHD_REPLACE(0x025D63E8, s32, as_solid_heap, (u32 actor, u32 callback, u32 size)
             return 0;
         }
     }
-    if (ret) as_kind_note(actor, proc);
+    if (ret) {
+        int skinned = proc == AS_PROC_PLAYER && skin_of(actor) >= 0;
+        if (skinned) as_skin_link_note(actor, proc);
+        else as_kind_note(actor, proc); /* a Link's size without the skins' bigger models */
+    }
     return ret;
 }
 /* fopAc_Create: the block is read before the original runs, on the first call only. */
@@ -1247,8 +1428,23 @@ static u8 as_context_of(const void* actor, const as_slot* s) {
     return e ? e->ctx : AS_CTX_NONE;
 }
 
-static void as_on_deleted(as_slot* s, s8 health) {
+/* 0.3.63: a placed item (a rupee of the stage, proc 0xFF) picked up here: removed for everyone, as a
+ * spawned one (as_on_spawned_deleted). Before, nothing was sent: the others kept it, and where the
+ * picker owned it, at the last place its updates gave, over the picker's puppet (the rise of
+ * daItem_c's get), in the air. */
+static int as_is_item(const void* actor) {
+    return actor && *(const volatile s16*)((const u8*)actor + AS_PROC_NAME) == AS_PROC_ITEM;
+}
+
+static void as_on_deleted(as_slot* s, s8 health, const fopAc_ac_c* a) {
     if (s->state != AS_SYNCED || s->uid == MP_NO_ID || !as_session) return;
+    if (as_is_item(a)) {
+        f32 dx = a->current.pos.x - as_link_pos[0], dy = a->current.pos.y - as_link_pos[1];
+        f32 dz = a->current.pos.z - as_link_pos[2];
+        if (as_have_link && dx * dx + dy * dy + dz * dz < AS_PICKUP_DISTANCE * AS_PICKUP_DISTANCE)
+            as_send_uid(as_session->client_remove, s->uid); /* picked up here: gone for everyone */
+        return;
+    }
     int died = s->group == AS_GROUP_ENEMY && s->max_health > 0 && health <= 0;
     int responsible = (as_local_uid != MP_NO_ID && s->owner == as_local_uid) || s->local_hit;
     if (s->broken) { /* a pot broken here: every game breaks its copy (as_pot_damaged) */
@@ -1276,7 +1472,7 @@ WWHD_REPLACE(0x025D4B4C, s32, as_delete, (void* actor)) {
     }
     if (s && result) {
         if (s->kind == AS_KIND_SPAWNED) as_on_spawned_deleted(s, (const fopAc_ac_c*)actor);
-        else as_on_deleted(s, health);
+        else as_on_deleted(s, health, (const fopAc_ac_c*)actor);
         as_free(s);
     }
     return result;
@@ -1298,7 +1494,7 @@ static int as_follows_owner(const as_slot* s) {
 static int as_carried_place(const as_slot* s, f32* out) {
     int carried = s->kind == AS_KIND_PLACED ? s->has_net_health && (s->net_status & 0x2000u)
                                             : s->replica && (s->spawn.variant & 1);
-    if (!carried || !s->owner) return 0;
+    if (!carried || !s->owner || !as_carry_trusted(s)) return 0;
     puppet_slot* p = puppet_slot_for(s->owner, 0);
     if (!p || !p->actor) return 0;
     const daPy_lk_c* link = (const daPy_lk_c*)p->actor;
@@ -1309,6 +1505,31 @@ static int as_carried_place(const as_slot* s, f32* out) {
     out[0] = (l[3] + r[3]) * 0.5f;
     out[1] = (l[7] + r[7]) * 0.5f;
     out[2] = (l[11] + r[11]) * 0.5f;
+    s16 carried_proc = *(const volatile s16*)((const u8*)s->actor + AS_PROC_NAME);
+    if (carried_proc == AS_PROC_BOKO) { /* 0.3.72: a weapon in the right hand */
+        out[0] = r[3];
+        out[1] = r[7];
+        out[2] = r[11];
+    } else if (carried_proc == AS_PROC_BARREL) { /* a barrel over its player: 0.3.72 at its feet, 0.3.73 a fifth back up */
+        f32 feet = ((const fopAc_ac_c*)link)->current.pos.y;
+        out[0] = ((const fopAc_ac_c*)link)->current.pos.x;
+        out[1] = feet + (out[1] - feet) * 0.2f;
+        out[2] = ((const fopAc_ac_c*)link)->current.pos.z;
+    }
+    { /* 0.3.69: why a copy is in a puppet's hands (the "pot on the player" hunt), once per slot */
+        static u32 logged_uid[8];
+        static u32 logged_count;
+        int seen = 0;
+        for (u32 i = 0; i != logged_count; ++i) seen |= logged_uid[i] == s->uid;
+        if (!seen && logged_count != 8) {
+            logged_uid[logged_count++] = s->uid;
+            wwhd_log_int("multiplayer: carry: a copy in a puppet's hands, owner uid", (int)s->owner);
+            wwhd_log_int("multiplayer: carry:   process", (int)*(const volatile s16*)((const u8*)s->actor + AS_PROC_NAME));
+            wwhd_log_int("multiplayer: carry:   owner's proc", (int)p->remote_proc);
+            wwhd_log_int("multiplayer: carry:   ms since its last place", (int)(s->age * 1000.0));
+            wwhd_log_int("multiplayer: carry:   kind (0 placed, 1 spawned)", (int)s->kind);
+        }
+    }
     return 1;
 }
 
@@ -1338,6 +1559,7 @@ static void as_apply_carry(const as_slot* s, fopAc_ac_c* a) {
         if (!s->replica || s->spawn.proc == AS_PROC_ARROW) return;
         bits = ((s->spawn.variant & 1) ? 0x2000u : 0) | ((s->spawn.variant & 2) ? 0x100000u : 0);
     }
+    if (s->owner != as_local_uid && !as_carry_trusted(s)) bits = 0; /* 0.3.62: not carried any more */
     a->actor_status = (a->actor_status & ~AS_CARRY_BITS) | bits;
 }
 
@@ -1575,6 +1797,177 @@ static void ps_flush(void);
 
 /* fopAc_Execute: the network values around the actor's execute, the puppet senses inside, the
  * creation context for what it creates; a weapon copy runs with its creator's puppet as player. */
+
+/* ---- 0.3.72: one cutscene for an enemy and its multiplier copies ----
+ * An enemy that starts its own cutscene (the Moblin's, the Bokoblin's intro and death camera,
+ * d_a_bk_exec.cpp demo_camera: fopAcM_orderPotentialEvent every step until eventInfo says INDEMO)
+ * did it once per copy of the multiplier, one after the other. Every order goes through
+ * dEvt_control_c::order (0253EC0C, d_event.cpp: this, type, priority, flag, hind flag, actor 1,
+ * actor 2, event index; a 9th argument on the stack, so an entry hook and a return hook).
+ * Only the copies of one placed enemy count (its group: the original, as_groups, and its copies,
+ * as_enemy_copies, made at its place by the multiplier); any other actor of the room is untouched.
+ *  - the first member of a group that asks plays its cutscene (the leader);
+ *  - the group's other members asking meanwhile are refused (mOrderCount +0xC0 shown full, 8,
+ *    during the call, put back by the return hook) and follow it: while the leader's
+ *    eventInfo.mCommand (+0xF8, u16) is INDEMO (2, f_op_actor.h) they get INDEMO before their
+ *    execute; their dComIfGp_event_reset (inline: play + 0x52B8 |= 8) is taken back after it;
+ *  - after it, the group's orders are refused for GD_DONE_STEPS (then a copy still asking plays
+ *    its own: never stuck for good).
+ * 0.3.68 also waited for the other members first (a gathering): crash 2026-10-21 21:31 (both
+ * instances, a Moblin's order), a bad entry pointer in that path; written again with indices. */
+#define GD_MAX 4
+#define GD_MEMBERS 16
+#define GD_DONE_STEPS 150         /* 5 s */
+#define GD_START_STEPS 150        /* the leader's cutscene not started after 5 s: given up */
+#define GD_EVENT_INFO 0xF8        /* fopAc_ac_c::eventInfo.mCommand (u16) */
+#define GD_INDEMO 2
+#define GD_ORDER_COUNT 0xC0       /* dEvt_control_c::mOrderCount (s8) */
+#define GD_RESET_BIT 0x8u
+enum { GD_FREE, GD_PLAYING, GD_DONE };
+typedef struct gd_demo {
+    u8 state;
+    u8 leader_seen;               /* the leader was seen in its cutscene */
+    u32 group;
+    unsigned long long since;
+    u32 leader, leader_pcid;
+    u32 member[GD_MEMBERS], member_pcid[GD_MEMBERS];
+    u32 members;
+} gd_demo;
+static gd_demo gd_demos[GD_MAX];
+static u32 gd_forced;             /* the event control whose count the return hook puts back */
+static s8 gd_saved_count;
+static u32 gd_logged;
+
+/* The multiplied group of a living actor (its id), 0 when none or alone. */
+static u32 gd_group_of(u32 actor) {
+    if (!actor) return 0;
+    u32 group = 0;
+    for (u32 g = 0; g != AS_MAX_GROUPS && !group; ++g)
+        if (as_groups[g].used && as_groups[g].actor == actor && as_alive(actor, as_groups[g].pcid)) group = as_groups[g].id;
+    for (u32 c = 0; c != AS_MAX_ENEMY_COPIES && !group; ++c)
+        if (as_enemy_copies[c].used && as_enemy_copies[c].actor == actor && as_alive(actor, as_enemy_copies[c].pcid))
+            group = as_enemy_copies[c].group;
+    if (!group) return 0;
+    u32 n = 0;
+    for (u32 g = 0; g != AS_MAX_GROUPS; ++g)
+        n += as_groups[g].used && as_groups[g].id == group && as_alive(as_groups[g].actor, as_groups[g].pcid);
+    for (u32 c = 0; c != AS_MAX_ENEMY_COPIES; ++c)
+        n += as_enemy_copies[c].used && as_enemy_copies[c].group == group &&
+             as_alive(as_enemy_copies[c].actor, as_enemy_copies[c].pcid);
+    return n >= 2 ? group : 0;
+}
+
+static int gd_find(u32 group) {
+    for (int i = 0; i != GD_MAX; ++i)
+        if (gd_demos[i].state != GD_FREE && gd_demos[i].group == group) return i;
+    return -1;
+}
+
+/* 1: this order is refused. */
+static int gd_order_refused(u32 ac1, u32 ac2) {
+    u32 actor = ac1, group = gd_group_of(ac1);
+    if (!group) {
+        actor = ac2;
+        group = gd_group_of(ac2);
+    }
+    if (!group) return 0;
+    unsigned long long now = wwhd_logic_step();
+    int i = gd_find(group);
+    if (i >= 0 && gd_demos[i].state == GD_DONE && now - gd_demos[i].since >= GD_DONE_STEPS) {
+        gd_demos[i].state = GD_FREE;
+        i = -1;
+    }
+    if (i < 0) { /* the first to ask leads */
+        for (int k = 0; k != GD_MAX && i < 0; ++k)
+            if (gd_demos[k].state == GD_FREE) i = k;
+        if (i < 0) return 0; /* too many at once: the game's way */
+        gd_demo* d = &gd_demos[i];
+        d->state = GD_PLAYING;
+        d->leader_seen = 0;
+        d->group = group;
+        d->since = now;
+        d->leader = actor;
+        d->leader_pcid = *(const volatile u32*)(actor + AS_PC_ID);
+        d->members = 0;
+        if (gd_logged++ < 8) wwhd_log("multiplayer: an enemy's cutscene: once for it and its copies");
+        return 0;
+    }
+    gd_demo* d = &gd_demos[i];
+    if (d->state == GD_PLAYING && actor == d->leader) return 0;
+    if (d->state == GD_PLAYING && d->members < GD_MEMBERS) { /* follows the leader */
+        int known = 0;
+        for (u32 k = 0; k != d->members; ++k) known |= d->member[k] == actor;
+        if (!known) {
+            d->member[d->members] = actor;
+            d->member_pcid[d->members] = *(const volatile u32*)(actor + AS_PC_ID);
+            ++d->members;
+        }
+    }
+    return 1;
+}
+
+WWHD_HOOK(0x0253EC0C, gd_order, (u32 self, u32 type, u32 priority, u32 flag, u32 hind, u32 ac1, u32 ac2, u32 event)) {
+    (void)type;
+    (void)priority;
+    (void)flag;
+    (void)hind;
+    (void)event;
+    gd_forced = 0;
+    if (!self || !as_enabled || !as_session || !gd_order_refused(ac1, ac2)) return;
+    gd_saved_count = *(volatile s8*)(self + GD_ORDER_COUNT);
+    *(volatile s8*)(self + GD_ORDER_COUNT) = 8; /* "full": order returns 0 at once */
+    gd_forced = self;
+}
+WWHD_HOOK_RETURN(0x0253EC0C, gd_order_end, (u32 unused)) {
+    (void)unused;
+    if (!gd_forced) return;
+    *(volatile s8*)(gd_forced + GD_ORDER_COUNT) = gd_saved_count;
+    gd_forced = 0;
+}
+
+static void gd_step(void) {
+    unsigned long long now = wwhd_logic_step();
+    for (int i = 0; i != GD_MAX; ++i) {
+        gd_demo* d = &gd_demos[i];
+        if (d->state != GD_PLAYING) continue;
+        int alive = as_alive(d->leader, d->leader_pcid);
+        int in_demo = alive && *(const volatile u16*)(d->leader + GD_EVENT_INFO) == GD_INDEMO;
+        if (in_demo) {
+            d->leader_seen = 1;
+            continue;
+        }
+        if (!d->leader_seen && alive && now - d->since < GD_START_STEPS) continue; /* not started yet */
+        for (u32 k = 0; k != d->members && k != GD_MEMBERS; ++k) /* over: the followers' command back */
+            if (as_alive(d->member[k], d->member_pcid[k])) *(volatile u16*)(d->member[k] + GD_EVENT_INFO) = 0;
+        d->state = GD_DONE;
+        d->since = now;
+    }
+}
+
+/* Before a follower's execute: in the leader's cutscene; 1 with the event flags to compare after. */
+static int gd_before(u32 actor, u16* flags) {
+    for (int i = 0; i != GD_MAX; ++i) {
+        const gd_demo* d = &gd_demos[i];
+        if (d->state != GD_PLAYING || !d->leader_seen) continue;
+        for (u32 k = 0; k != d->members && k != GD_MEMBERS; ++k) {
+            if (d->member[k] != actor || !as_alive(actor, d->member_pcid[k])) continue;
+            *(volatile u16*)(actor + GD_EVENT_INFO) = GD_INDEMO;
+            const u8* play = wwhd_play_get();
+            if (!play) return 0;
+            *flags = *(const volatile u16*)(play + WWHD_PLAY_EVENT_FLAGS_OFFSET);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void gd_after(u16 flags) {
+    u8* play = wwhd_play_get();
+    if (!play) return;
+    volatile u16* now = (volatile u16*)(play + WWHD_PLAY_EVENT_FLAGS_OFFSET);
+    if (!(flags & GD_RESET_BIT) && (*now & GD_RESET_BIT)) *now = (u16)(*now & ~GD_RESET_BIT); /* the leader ends it */
+}
+
 WWHD_REPLACE(0x025D475C, s32, as_execute, (void* actor)) {
     if (!actor) return sense_execute(actor);
     as_ctx_entry* kill = as_kill_count ? as_ctx_find(as_kill, &as_kill_count, actor) : 0;
@@ -1596,13 +1989,17 @@ WWHD_REPLACE(0x025D475C, s32, as_execute, (void* actor)) {
     ps_capturing = local;
     s32 result;
     el_actor* elite = el_execute_begin(actor); /* an elite's animations go faster (elite.h) */
+    u16 gd_flags = 0;
+    int gd = gd_before((u32)actor, &gd_flags); /* a copy in its group's one cutscene (0.3.68) */
     if (!as_visual_execute(s, actor, &result)) result = sense_execute(actor);
+    if (gd) gd_after(gd_flags);
     el_execute_end(elite);
     ps_capturing = saved_capture;
     if (local) ps_flush();
     if (s) as_after_execute(s, (fopAc_ac_c*)actor);
     as_swap_out(&swap);
     as_context = saved;
+    if (*(const volatile s16*)((const u8*)actor + AS_PROC_NAME) == AS_PROC_BOKO) as_boko_after(s, actor);
     return result;
 }
 
@@ -1763,6 +2160,10 @@ static void as_apply_values(as_slot* s, const mp_placed_actor* a) {
 static void as_add_replica(const mp_placed_actor* a) {
     if (!a->values.has_spawn || !a->values.has_transform || as_find_uid(a->uid)) return;
     u8 cls = as_spawn_class((s16)a->values.spawn.proc);
+    if (cls == AS_CLS_BOKO) { /* 0.3.72: logged a few times */
+        static u32 logged;
+        if (logged++ < 8) wwhd_log_int("multiplayer: weapon of another player received, copy asked, type", (int)a->values.spawn.params);
+    }
     if (cls == AS_CLS_NONE) return;
     if (cls == AS_CLS_WEAPON) {
         puppet_slot* ps = puppet_slot_for(a->owner, 0);
@@ -1970,6 +2371,10 @@ static int as_handle_create(const mp_u8* body, mp_u32 length) {
     s->state = AS_SYNCED;
     s->has_target = s->has_display = s->has_net_health = 0;
     as_apply_values(s, &a);
+    /* 0.3.57: the create's values are the server's last ones, maybe from a carry long over (a pot
+     * thrown and broken, made again with the room: "a pot drawn on the player" who carried it once,
+     * as_carried_place). Only the owner's updates from now on say it is carried. */
+    if (s->kind == AS_KIND_PLACED) s->net_status &= ~AS_CARRY_BITS;
     if (s->kind == AS_KIND_SPAWNED) {
         if (s->cls == AS_CLS_WEAPON && as_session->client_exclusive_add != MP_NO_ID) {
             as_send_uid(as_session->client_exclusive_add, s->uid); /* the creator keeps it */
@@ -2000,6 +2405,14 @@ static int as_handle_update(const mp_u8* body, mp_u32 length) {
 static int as_handle_remove(mp_u32 uid) {
     as_slot* s = as_find_uid(uid);
     if (!s) return 0;
+    if (s->state == AS_SPAWNING && !s->actor) {
+        /* 0.3.62, crash 2021-10-21 17:28 (a friend, TyuTyu): a copy not made yet marked removed had
+         * no actor, and as_step read actor + 4 (null). Not asked yet: forgotten; asked: its copy is
+         * deleted once made (as_bind_replica). */
+        if (s->requested) s->dropped = 1;
+        else s->used = 0;
+        return 1;
+    }
     s->state = AS_REMOVED;
     s->remove_clock = 0;
     return 1;
@@ -2035,7 +2448,7 @@ static as_slot* as_weapon_of(u32 at, u32* offset) {
     u32 actor = as_ld32(stts + AS_STTS_ACTOR);
     if (!actor || at < actor || at - actor >= AS_MAX_TG_OFFSET) return 0;
     as_slot* s = as_find((const void*)actor);
-    if (!s || s->kind != AS_KIND_SPAWNED || s->cls != AS_CLS_WEAPON) return 0;
+    if (!s || s->kind != AS_KIND_SPAWNED || (s->cls != AS_CLS_WEAPON && s->cls != AS_CLS_BOKO)) return 0;
     *offset = at - actor;
     return s;
 }
@@ -2345,6 +2758,10 @@ static void as_read_spawn(const as_slot* s, const fopAc_ac_c* a, mp_spawn* p) {
         p->variant = *(const volatile u8*)((const u8*)a + AS_ARROW_TYPE);
     else if (s->spawn.proc == AS_PROC_ROPE) /* its state: in the hand or out (as_rope_visual) */
         p->variant = (u8)*(const volatile s32*)((const u8*)a + ROPE_STATE);
+    else if (s->spawn.proc == AS_PROC_BOKO) /* bit 0: in its owner's hands (as_carried_place) */
+        p->variant = *(const volatile u8*)((const u8*)a + AS_BOKO_MODE) == AS_BOKO_PLAYER_CARRY ? 1 : 0;
+    else if (!as_carried_by_local(a)) /* 0.3.71: carried by another actor: not ours to show */
+        p->variant = 0;
     else
         p->variant = (u8)(((a->actor_status & 0x2000u) ? 1 : 0) | ((a->actor_status & 0x100000u) ? 2 : 0));
 }
@@ -2460,6 +2877,25 @@ WWHD_GAME_ORIGINAL(0x025D8120, u32, as_item_from_table_original,
                    (u32 pos, u32 item, u32 bit, u32 room, u32 type, u32 angle, u32 action, u32 scale));
 static int as_breaking_copy;
 
+/* 0.3.64: the last pots broken, here (1) or for another game's break (0): the sticks a pot holds
+ * (daTsubo spec_make_boko, made with the pot in every game, carried inside it, let go with a random
+ * speed when it is deleted: spec_remove) are the breaker's (as_boko_after). */
+#define AS_POT_BREAKS 8
+#define AS_POT_BREAK_STEPS 90      /* 3 s: the pot is deleted at its next execute */
+#define AS_POT_BREAK_REACH 250.0f
+typedef struct { f32 pos[3]; unsigned long long step; u8 here, used; } as_pot_break;
+static as_pot_break as_pot_breaks[AS_POT_BREAKS];
+static u32 as_pot_break_next;
+static void as_pot_break_note(const fopAc_ac_c* pot, u8 here) {
+    as_pot_break* b = &as_pot_breaks[as_pot_break_next++ % AS_POT_BREAKS];
+    b->pos[0] = pot->current.pos.x;
+    b->pos[1] = pot->current.pos.y;
+    b->pos[2] = pot->current.pos.z;
+    b->step = wwhd_logic_step();
+    b->here = here;
+    b->used = 1;
+}
+
 /* 0.3.19: a pot broken by the local Link's own code (a throw, a roll, its execute) made its break
  * effects while particle_sync.h noted the local Link's particles: they were sent, and the other games,
  * which break their copy with its own effects, showed them twice. Only the players' particles go: none
@@ -2476,7 +2912,10 @@ WWHD_HOOK(0x024CC004, as_pot_damaged, (void* self, s32 action, void* poly, u32 e
     }
     if (as_breaking_copy || !self) return;
     as_slot* s = as_find(self);
-    if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) s->broken = 1;
+    if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) {
+        s->broken = 1;
+        as_pot_break_note((const fopAc_ac_c*)self, 1); /* its sticks are this game's to share */
+    }
 }
 WWHD_HOOK_RETURN(0x024CC004, as_pot_damaged_end, (void* self)) {
     (void)self;
@@ -2502,7 +2941,151 @@ WWHD_REPLACE(0x025D8120, u32, as_item_from_table,
     return result;
 }
 
+/* ---- 0.3.64: the enemies' weapons (daBoko_c, process 0x1CF) ----
+ * A weapon is made by its enemy (d_a_bk.cpp and the others: fopAcM_create in the enemy's create, so
+ * in each game for its copy of the enemy) or by a pot that holds sticks (d_a_tsubo.cpp
+ * spec_make_boko, with the pot, in every game). While an enemy holds it (mNowMode ENEMY_CARRY) or a
+ * pot carries it (fopAcStts carry 0x2000) it is each game's own. Once it falls (the enemy hit or
+ * dead, the pot broken), one game's weapon is shared, the others delete theirs:
+ *  - an enemy's: the game owning the enemy (made in its OWNED context, as_register_runtime); made in
+ *    a FOREIGN context, it is deleted (as_kill) and the owner's copy comes;
+ *  - a pot's: the game that broke the pot (as_pot_break_note: broken here, or replayed for another
+ *    game's break, within AS_POT_BREAK_REACH and AS_POT_BREAK_STEPS);
+ *  - any other weapon (lying in the stage, an enemy not synchronised) stays each game's own.
+ * Shared, it is a spawned actor (as_register_spawned, "Boko"): the others make a copy that follows
+ * its place, in its owner's puppet's hands while the owner carries it (variant bit 0, from
+ * PLAYER_CARRY: as_carried_place). A copy the local Link picks up becomes this player's: removed for
+ * everyone, announced again from here. A copy an enemy of this game picks up becomes that enemy's
+ * own (no longer followed); the owner's weapon taken back by its enemy is removed for everyone. */
+#define AS_BOKO_MAX 48
+typedef struct { u32 actor, pcid; u8 ctx, held, used; } as_boko;
+static as_boko as_bokos[AS_BOKO_MAX];
+
+static as_boko* as_boko_find(void* actor, int add) {
+    u32 pcid = *(const volatile u32*)((const u8*)actor + AS_PC_ID);
+    as_boko* free_one = 0;
+    for (u32 i = 0; i != AS_BOKO_MAX; ++i) {
+        as_boko* b = &as_bokos[i];
+        if (b->used && b->actor == (u32)actor && b->pcid == pcid) return b;
+        if (b->used) { /* a weapon gone: its entry is free again */
+            u32 out = 0;
+            if (!wwhd_fopAcM_SearchByID(b->pcid, (u32)&out) || out != b->actor) b->used = 0;
+        }
+        if (!b->used && !free_one) free_one = b;
+    }
+    if (!add || !free_one) return 0;
+    free_one->actor = (u32)actor;
+    free_one->pcid = pcid;
+    free_one->ctx = AS_CTX_NONE;
+    free_one->held = 0;
+    free_one->used = 1;
+    return free_one;
+}
+
+static void as_boko_note(void* actor, u8 ctx) {
+    as_boko* b = as_boko_find(actor, 1);
+    if (b) b->ctx = ctx;
+}
+
+/* 1 broken here, 0 broken for another game, -1 no pot broke there lately. */
+static int as_boko_pot(const fopAc_ac_c* a) {
+    unsigned long long now = wwhd_logic_step();
+    for (u32 i = 0; i != AS_POT_BREAKS; ++i) {
+        const as_pot_break* b = &as_pot_breaks[i];
+        if (!b->used || now - b->step > AS_POT_BREAK_STEPS) continue;
+        f32 dx = a->current.pos.x - b->pos[0], dy = a->current.pos.y - b->pos[1], dz = a->current.pos.z - b->pos[2];
+        if (dx * dx + dy * dy + dz * dz < AS_POT_BREAK_REACH * AS_POT_BREAK_REACH) return b->here;
+    }
+    return -1;
+}
+
+/* The creation block a spawned slot keeps (angles, scale 1.0: as_read_spawn reads them). */
+static void as_boko_prm(u8* prm, const fopAc_ac_c* a) {
+    for (u32 i = 0; i != AS_PRM_BYTES; ++i) prm[i] = 0;
+    s16 angle[3] = {a->shape_angle.x, a->shape_angle.y, a->shape_angle.z};
+    for (u32 i = 0; i != 3; ++i) {
+        prm[AS_PRM_ANGLE + i * 2] = (u8)((u16)angle[i] >> 8);
+        prm[AS_PRM_ANGLE + i * 2 + 1] = (u8)angle[i];
+        prm[AS_PRM_SCALE + i] = 10;
+    }
+}
+
+static void as_boko_share(void* actor) {
+    u8 prm[AS_PRM_BYTES];
+    as_boko_prm(prm, (const fopAc_ac_c*)actor);
+    as_register_spawned(actor, AS_PROC_BOKO, AS_CLS_BOKO, (u32)prm);
+    static u32 logged;
+    if (logged++ < 4) wwhd_log("multiplayer: an enemy's weapon fell, shared");
+}
+
+static void as_boko_after(as_slot* s, void* actor) {
+    if (!as_session || !as_enabled || as_spawn_factory() == MP_NO_ID) return;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
+    u8 mode = *(const volatile u8*)((const u8*)actor + AS_BOKO_MODE);
+    int carried_in = (a->actor_status & 0x2000u) && mode != AS_BOKO_PLAYER_CARRY; /* in a pot */
+    if (s) {
+        if (s->kind != AS_KIND_SPAWNED || s->state != AS_SYNCED) return;
+        if (s->replica && mode == AS_BOKO_ENEMY_CARRY) { /* an enemy of this game took the copy */
+            as_free(s);
+            return;
+        }
+        if (s->replica && mode == AS_BOKO_PLAYER_CARRY) { /* the local Link took the copy: ours now */
+            as_send_uid(as_session->client_remove, s->uid);
+            u8 prm[AS_PRM_BYTES];
+            as_boko_prm(prm, a);
+            for (u32 i = 0; i != AS_PRM_BYTES; ++i) s->prm[i] = prm[i];
+            s->replica = 0;
+            s->state = AS_LOCAL;
+            s->uid = s->solver = MP_NO_ID;
+            s->owner = 0;
+            s->ticket = 0xFF;
+            s->has_target = s->has_display = s->has_net_health = s->has_sent = 0;
+            s->spawn_ready = 1;
+            s->factory = (u8)as_spawn_factory();
+            wwhd_log("multiplayer: picked up another player's weapon, ours now");
+            return;
+        }
+        if (!s->replica && mode == AS_BOKO_ENEMY_CARRY) { /* back in its enemy's hand: each game's own */
+            if (s->uid != MP_NO_ID) as_send_uid(as_session->client_remove, s->uid);
+            as_free(s);
+            as_boko* b = as_boko_find(actor, 1);
+            if (b) {
+                b->ctx = AS_CTX_OWNED;
+                b->held = 1;
+            }
+        }
+        return;
+    }
+    as_boko* b = as_boko_find(actor, mode == AS_BOKO_ENEMY_CARRY || carried_in);
+    if (!b) return;
+    if (mode == AS_BOKO_ENEMY_CARRY || carried_in) { /* held: it may fall later */
+        b->held = 1;
+        return;
+    }
+    if (!b->held) return;
+    b->held = 0; /* fallen: decided once */
+    int pot = as_boko_pot(a);
+    int ours = pot >= 0 ? pot == 1 : b->ctx == AS_CTX_OWNED;
+    int theirs = pot >= 0 ? pot == 0 : b->ctx == AS_CTX_FOREIGN;
+    { /* 0.3.72: the decision, for the sticks of the pots (logged a few times) */
+        static u32 logged;
+        if (logged++ < 12) {
+            wwhd_log_int(ours ? "multiplayer: weapon fell: shared from here, pot (1 here, 0 other game, -1 none)"
+                              : theirs ? "multiplayer: weapon fell: the other game's comes, pot (1 here, 0 other game, -1 none)"
+                                       : "multiplayer: weapon fell: stays local, pot (1 here, 0 other game, -1 none)",
+                         pot);
+            wwhd_log_int("multiplayer: weapon fell:   creation context (0 none, 1 owned, 2 foreign, 3 local)", (int)b->ctx);
+        }
+    }
+    if (ours) as_boko_share(actor);
+    else if (theirs) {
+        b->used = 0;
+        as_ctx_add(as_kill, &as_kill_count, AS_MAX_KILL, actor, AS_CTX_FOREIGN); /* the other game's comes */
+    }
+}
+
 static void as_break_pot(as_slot* s, fopAc_ac_c* a) {
+    as_pot_break_note(a, 0); /* its sticks: the breaker's come instead */
     as_breaking_copy = 1;
     as_pot_damaged_call(a, 1, 0, 1, &a->current.pos);
     as_breaking_copy = 0;
@@ -2606,6 +3189,9 @@ static void as_step(double dt, mp_u32 local_uid, const fopAc_ac_c* link) {
     f32 blend = (f32)(dt / AS_UPDATE_PERIOD);
     if (blend > 1.0f) blend = 1.0f;
     u32 creates = 0;
+    as_grab_barrels(); /* the players under a barrel, as found last step (0.3.72) */
+    as_hidden_count = 0;
+    gd_step(); /* the multiplied enemies' one cutscene */
     for (u32 i = 0; i != AS_MAX; ++i) {
         as_slot* s = &as_slots[i];
         if (!s->used) continue;
@@ -2614,11 +3200,17 @@ static void as_step(double dt, mp_u32 local_uid, const fopAc_ac_c* link) {
             continue;
         }
         const fopAc_ac_c* a = (const fopAc_ac_c*)s->actor;
-        if (*(const volatile u32*)((const u8*)a + AS_PC_ID) != s->pcid) {
+        if (!a || *(const volatile u32*)((const u8*)a + AS_PC_ID) != s->pcid) { /* no actor: 0.3.62 */
             as_free(s); /* deleted without fopAc_Delete (failed create) */
             continue;
         }
         s->group = a->group;
+        if (s->kind == AS_KIND_PLACED && as_hidden_count != AS_HIDDEN_MAX &&
+            *(const volatile s16*)((const u8*)a + AS_PROC_NAME) == AS_PROC_BARREL && as_carried_by_other(s))
+        {
+            as_hidden_barrel[as_hidden_count] = (u32)a;
+            as_hidden[as_hidden_count++] = s->owner; /* under its barrel (as_grab_barrels) */
+        }
         if (a->health > s->max_health) s->max_health = a->health;
         s->age += dt;
         s->hit_clock += dt;
@@ -2665,7 +3257,8 @@ static void as_step(double dt, mp_u32 local_uid, const fopAc_ac_c* link) {
         if (s->state == AS_REMOVED) {
             /* dead at its owner: ours dies of the replayed hits, else it goes after a while */
             s->remove_clock += dt;
-            if (!s->deleting && a->health > 0 && s->remove_clock >= AS_REMOVE_WAIT) {
+            /* an item (0.3.63): at once, it has no health to die of */
+            if (!s->deleting && (as_is_item(a) || (a->health > 0 && s->remove_clock >= AS_REMOVE_WAIT))) {
                 s->deleting = 1;
                 wwhd_fopAcM_delete_actor(s->actor);
             }

@@ -35,7 +35,7 @@
 #include "tunic_color.h"
 
 #define TUNIC_MAX_TEXTURES 2
-#define TUNIC_MAX_SLOTS 4               /* PUPPET_MAX */
+#define TUNIC_MAX_SLOTS 8               /* puppet slots with their own colours (0.3.55: 4); the others show the original tunic */
 #define TUNIC_MAX_BYTES (3u << 20)      /* image + mips of one texture */
 #define TUNIC_HASH_BYTES 4096u
 #define TUNIC_ADDRESS_SPAN 0x10000u     /* copies keep the low 16 address bits (tiling swizzle) */
@@ -224,10 +224,48 @@ static int tunic_capture(tunic_texture* t) {
     return 1;
 }
 
+/* 0.3.71: the clothes changed (the local Link's casual flag: Grandma's gift changes them in place,
+ * d_a_player_main_03.cpp setDemoData, the table and the flag swapped by the cutscene): everything
+ * taken before goes, its colours put back where the texture still is, and the textures are found
+ * again TUNIC_CLOTHES_SETTLE steps later. Seen (2026-10-22, both games): after the hero's clothes
+ * came, the puppets wore them with the pyjama's textures (their colour copies). */
+#define TUNIC_CLOTHES_SETTLE 2   /* refreshes (one a second) */
+static int tunic_last_casual = -1;
+static u32 tunic_settle;
+static void tunic_reset_all(const char* why) {
+    for (u32 k = 0; k != tunic_texture_count; ++k) {
+        tunic_texture* t = &tunic_textures[k];
+        if (!t->pristine) continue;
+        if (tunic_ld32(t->gx2 + GX2_SURFACE_IMAGE) == t->image) {
+            memcpy((void*)t->image, t->pristine, t->image_size);
+            if (t->mip_size) memcpy((void*)t->mip, t->pristine + t->image_size, t->mip_size);
+        }
+        wwhd_free(t->pristine);
+        t->pristine = 0;
+    }
+    tunic_texture_count = 0;
+    tunic_forget_clones();
+    tunic_local_applied = tunic_look_make(TUNIC_DEFAULT_PRIMARY, TUNIC_DEFAULT_SECONDARY);
+    wwhd_log(why);
+}
+
 /* Periodic check from the local Link's step: finds the hero texture, keeps the pristine copy
  * in step with the game's memory and applies the wanted local colours. */
 static void tunic_refresh(u32 local) {
     if (tunic_disabled || !local) return;
+    {
+        int casual = (tunic_ld32(local + LINK_NO_RESET_FLG1) & LINK_CASUAL_CLOTHES) != 0;
+        if (tunic_last_casual >= 0 && casual != tunic_last_casual) {
+            tunic_reset_all(casual ? "multiplayer: tunic: clothes changed (casual), textures found again"
+                                   : "multiplayer: tunic: clothes changed (hero), textures found again");
+            tunic_settle = TUNIC_CLOTHES_SETTLE;
+        }
+        tunic_last_casual = casual;
+        if (tunic_settle) { /* the cutscene's swap done first */
+            --tunic_settle;
+            return;
+        }
+    }
     int rewrite = 0;
     u32 found[TUNIC_MAX_TEXTURES];
     u32 count = tunic_find_hero(local, found);

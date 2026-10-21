@@ -47,7 +47,7 @@
 #include "tunic.h"
 #include "skin.h"
 
-#define PUPPET_MAX 16 /* the remote players, the dead players' bodies (death.h) and the bots (0.3.52: 8) */
+#define PUPPET_MAX 24 /* the remote players (MAX_REMOTES 15), the dead players' bodies (death.h) and the bots (0.3.52: 16, before 8) */
 
 /* outfit.h outfit_force: the casual clothes' HD texture object, as playerInit reads it
  * (getRes("Link", 0x71), the game's own Link archive, not a skin's), kept per local Link. */
@@ -825,10 +825,13 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     volatile u32* list_p1 = (volatile u32*)(play + PLAY_XLU_LIST_P1);
     u32 saved_p0 = *list_p0, saved_p1 = *list_p1;
     puppet_build_packets(slot);
-    /* its clothes first (the local Link's other clothes while it wears them), then its colours;
-     * a skinned puppet has its own model data and textures: neither applies */
+    /* its colours (a skinned puppet has its own model data and textures). 0.3.63: no clothes of its
+     * own any more: every Link wears the game's clothes (outfit.h). */
     int skinned = skin_of((u32)i_this) >= 0;
-    int outfit_swapped = skinned ? 0 : outfit_puppet_begin((puppet_slots[slot].remote_extras & MP_EXTRA_CASUAL) != 0);
+    /* its player's clothes (outfit.h; 0.3.73: the flag its player sends, MP_EXTRA_CASUAL: a puppet's
+     * own flag is set once, at its creation, and Grandma's gift changes the clothes in place) */
+    outfit_puppet_draw_begin((u32)i_this, (puppet_slots[slot].remote_extras & MP_EXTRA_CASUAL) != 0,
+                             skinned ? skin_casual_object((u32)i_this) : outfit_casual_texture());
     if (!skinned) tunic_swap_begin(slot, ((const daPy_lk_c*)i_this)->mpCLModelData);
     int skin = skin_enter((u32)i_this);
     *list_p0 = *(const volatile u32*)(play + PLAY_OPA_LIST_ZELDA0);
@@ -846,7 +849,7 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     *list_p0 = saved_p0;
     *list_p1 = saved_p1;
     tunic_swap_end();
-    outfit_puppet_end(outfit_swapped);
+    outfit_puppet_draw_end();
     draw_link = outer_link;
     return result;
 }

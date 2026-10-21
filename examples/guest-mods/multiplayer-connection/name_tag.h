@@ -8,13 +8,18 @@
  * at the top to grey at the bottom: a vertical gradient. A last fill pass lays the player's
  * primary tunic colour over it, half transparent. Every pass is multiplied by the caller's
  * opacity (the distance fade of mod.c). Elements per name: 2 * glyphs + NAME_BANDS * (glyphs
- * + 2), at most 104 for 16 letters, 832 for MAX_REMOTES names: under the 1024 of a HUD list.
+ * + 2), at most 104 for 16 letters. 0.3.55: all the mod's HUD is one list, and the runtime drops a
+ * whole list past its element limit (runtime guest_hud.h kMaxCommands, 1024 before 0.3.55): with more
+ * than NAME_FULL_NAMES names shown, each is drawn in one fill pass (name_bands 1: 3 * glyphs, 48 for
+ * 16 letters), so 15 names stay under 1024 with the rest of the HUD.
  * Without the atlas (failed load), the built-in text element is used. */
 #pragma once
 #include "wwhd_guest.h"
 #include "name_font.h"
 
 #define NAME_BANDS 4
+#define NAME_FULL_NAMES 6           /* names drawn with the gradient; more: one fill pass each */
+static int name_bands = NAME_BANDS; /* set for the frame by mod.c draw_markers */
 #define NAME_OUTLINE_RGBA 0x10141CD8u
 #define NAME_TOP_RGB 0xFFFFFFu
 #define NAME_BOTTOM_RGB 0x8C8C8Cu
@@ -116,6 +121,11 @@ static void name_draw(u32 list, f32 cx, f32 baseline, const char* text, u32 leng
     name_glyphs(list, name_outline_texture, text, length, x, baseline, scale,
                 name_rgba(NAME_OUTLINE_RGBA >> 8, (f32)(NAME_OUTLINE_RGBA & 0xFF) / 255.0f, opacity));
 
+    if (name_bands <= 1) { /* many names: one fill pass, the gradient's upper grey */
+        name_glyphs(list, name_fill_texture, text, length, x, baseline, scale,
+                    name_rgba(name_mix(NAME_TOP_RGB, name_mix(NAME_BOTTOM_RGB, primary_rgb, NAME_OVERLAY_ALPHA), 0.35f), 1.0f, opacity));
+        return;
+    }
     f32 cap_top = baseline - (f32)NAME_FONT_CAP * scale, band = ((f32)NAME_FONT_CAP * scale) / NAME_BANDS;
     f32 left = x - 8.0f * scale, span = width + 16.0f * scale;
     for (int i = 0; i != NAME_BANDS; ++i) {

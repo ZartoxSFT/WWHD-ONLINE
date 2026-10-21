@@ -34,6 +34,11 @@
 #define CY_PROC_ATN_MOVE 0x07
 #define CY_PROC_WAIT_TURN 0x17
 #define CY_PROC_GRAB_THROW 0x71
+/* 0.3.64: a player in a cutscene is not lifted: its Link in a demo proc (daPyProc_DEMO_TOOL 0xA9 to
+ * DEMO_ICE_SLIP 0xDA, d_a_player_main_0x.h), as ActorPlayerSync curProc gives it (remote_proc). The
+ * local Link in an event lifts nobody (cy_can_act), and a carried Link whose event begins is freed. */
+#define CY_PROC_DEMO_FIRST 0xA9u
+#define CY_PROC_DEMO_LAST 0xDAu
 #define CY_GRAB_ACTOR 0x65A4        /* daPy_lk_c::mActorKeepGrab.mActor (d_a_player_main.h) */
 #define CY_TRIGGER_A 0x01u          /* mItemTrigger: A (death.h dh_after_stick) */
 #define CY_LIFT_RADIUS 100.0f
@@ -205,6 +210,7 @@ static u32 cy_lift_target(const daPy_lk_c* link, mp_u32* uid) {
         const puppet_slot* s = &puppet_slots[i];
         u32 actor = cy_player_puppet(s);
         if (!actor || s->uid == cy_carried_by || cy_is_carried(s->uid)) continue;
+        if (s->remote_proc >= CY_PROC_DEMO_FIRST && s->remote_proc <= CY_PROC_DEMO_LAST) continue; /* in a cutscene */
         const fopAc_ac_c* p = (const fopAc_ac_c*)actor;
         f32 dx = p->current.pos.x - a->current.pos.x, dz = p->current.pos.z - a->current.pos.z;
         f32 dy = p->current.pos.y - a->current.pos.y;
@@ -314,6 +320,42 @@ static void cy_step(void* self) {
         wwhd_log_int("multiplayer:   x moved by execute", (int)(a->current.pos.x - cy_target[0]));
     }
     if (!cy_puppet_of(cy_carried_by) || !cy_can_act(a) || state != READY) cy_place_local(self); /* frees it */
+}
+
+/* 0.3.72: carried, the local Link stays on its carrier's puppet. Before, it was placed before its
+ * own execute, from the puppet's hands of the last draw, and the puppet itself eased towards each
+ * received place (mod.c update_markers, a third of the way a step): the carried player trailed and
+ * slid ("a weird lerp"). Now the carrier's puppet takes each received place as it is
+ * (cy_is_carrier), and right after that puppet's update the local Link is put where its hands are
+ * this step: the hands' offset from the puppet's last place (old.pos, the place of the last draw)
+ * added to its new one, its world matrix made again (setWorldMatrix 023FF6A0, as puppet_execute
+ * does for a puppet). */
+static int cy_is_carrier(mp_u32 uid) {
+    return uid != MP_NO_ID && uid == cy_carried_by;
+}
+
+static void cy_after_carrier(void* puppet) {
+    if (cy_carried_by == MP_NO_ID || !dh_link || cy_puppet_of(cy_carried_by) != (u32)puppet) return;
+    fopAc_ac_c* a = (fopAc_ac_c*)dh_link;
+    if (!cy_can_act(a) || state != READY) return;
+    const fopAc_ac_c* c = (const fopAc_ac_c*)puppet;
+    f32 hands[3];
+    if (!cy_hands((u32)puppet, hands)) return;
+    f32 x = hands[0] - c->old.pos.x + c->current.pos.x;
+    f32 y = hands[1] - c->old.pos.y + c->current.pos.y;
+    f32 z = hands[2] - c->old.pos.z + c->current.pos.z;
+    a->current.pos.x = a->old.pos.x = x;
+    a->current.pos.y = a->old.pos.y = y;
+    a->current.pos.z = a->old.pos.z = z;
+    a->shape_angle.y = c->shape_angle.y;
+    a->current.angle.y = c->shape_angle.y;
+    volatile f32* keep = &WWHD_GAME_DATA(CY_KEEP_POS, f32);
+    keep[0] = x;
+    keep[1] = y;
+    keep[2] = z;
+    (&WWHD_GAME_DATA(CY_KEEP_SHAPE_ANGLE, s16))[1] = c->shape_angle.y;
+    (&WWHD_GAME_DATA(CY_KEEP_CURRENT_ANGLE, s16))[1] = c->shape_angle.y;
+    wwhd_daPy_lk_c__setWorldMatrix(a);
 }
 
 static void cy_place_local(void* self) {

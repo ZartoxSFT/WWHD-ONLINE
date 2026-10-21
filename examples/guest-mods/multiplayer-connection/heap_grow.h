@@ -199,6 +199,20 @@ static char hg_skin_heap_name[] = "MpSkinHeap";
 static u32 hg_skin_heap_key[2];
 
 static u32 hg_skin_heap_get(void) { return hg_skin_heap; }
+
+/* 0.3.54: a heap of the puppets' own (the other players' Links and the Debug bots). Crash instance 1
+ * (2026-10-21 13:41, 0.3.53): the 9th Link (the 8th bot) failed JKRHeap::alloc (027EC0AC) of its
+ * model's material block in J3DModel::entryModelData (027F4404 -> 027DE5BC -> 027DD9B0, DCZeroRange
+ * of a null base). A Link's heap comes from the game heap 0 (fopAcM_entrySolidHeapRegister 025D63E8,
+ * decomp f_op_actor_mng_2.cpp: process names 0x26, 0xA5, 0xA8, 0x191, 0x1B5-0x1B6 there), made
+ * 0xA00000 at boot (m_Do_machine.cpp mDoExt_createGameHeap(0, 0xA00000)): ten MiB for the local Link
+ * and every puppet (573-691 KiB each, log 0.3.53). The puppets' heaps are cut from this one instead
+ * (actor_sync.h as_solid_heap), made at the end of sead's root heap next to the skins' heap. */
+#define HG_PUPPET_HEAP_SIZE 0x02000000u
+static u32 hg_puppet_heap;
+static char hg_puppet_heap_name[] = "MpPuppetHeap";
+static u32 hg_puppet_heap_key[2];
+static u32 hg_puppet_heap_get(void) { return hg_puppet_heap; }
 static u32 hg_skin_heap_top;
 #define HG_LOW_LIMIT 0x50000000u
 #define HG_LOW_GUARD 0x00100000u
@@ -266,6 +280,14 @@ static u32 hg_skin_heap_make(void) {
         hg_skin_heap = hg_create_exp_heap_original(size, (u32)hg_skin_heap_key, hg_root, 1, 0); /* at the head */
         hg_watch_root = 4;
     } else {
+        if (size > HG_PUPPET_HEAP_SIZE + HG_SKIN_HEAP_MIN) { /* the puppets' heap first, at the very end */
+            hg_puppet_heap_key[0] = (u32)hg_puppet_heap_name;
+            hg_puppet_heap_key[1] = skin_string_vtable();
+            hg_puppet_heap = hg_create_exp_heap_original(HG_PUPPET_HEAP_SIZE, (u32)hg_puppet_heap_key, hg_root, 0xFFFFFFFFu, 0);
+            if (hg_puppet_heap) size -= HG_PUPPET_HEAP_SIZE;
+            wwhd_log_hex(hg_puppet_heap ? "multiplayer: heaps: puppets' heap made (32 MiB) at"
+                                        : "multiplayer: heaps: the puppets' heap could not be made", hg_puppet_heap);
+        }
         hg_skin_heap = hg_create_exp_heap_original(size, (u32)hg_skin_heap_key, hg_root, 0xFFFFFFFFu, 0); /* at the end */
     }
     if (hg_skin_heap) {

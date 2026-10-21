@@ -81,6 +81,29 @@ static int ev_generic(const char* name) {
     return 0;
 }
 
+/* 0.3.62: only the cutscenes an enemy starts bring the room's players (the user's rule: a boss, the
+ * Bokoblin of the Forbidden Woods, the Kargaroc's Bokoblins; not a door, a chest, a talk, a switch,
+ * a place). The event's actors: dEvt_control_c at play + 0x51D0 (d_com_inf_game.h PLAY_EVTCTRL;
+ * mMode +0xC2 is WWHD_PLAY_EVENT_RUNNING_OFFSET 0x5292), mPt1 +0xC4 and mPt2 +0xC8 the process ids
+ * of the order's two actors (d_event.cpp setParam 0253F138, called right after
+ * dEvent_manager_c::order; startProc runs later, in runProc, so they are set here). Either one in
+ * the enemies' group (fopAc_ac_c::group, fopAc_ENEMY_e 2) makes it a cutscene of the room. */
+#define EV_PLAY_PT1 0x5294
+#define EV_PLAY_PT2 0x5298
+#define EV_GROUP_ENEMY 2
+
+static int ev_actor_is_enemy(u32 pcid) {
+    if (pcid == 0 || pcid == 0xFFFFFFFFu) return 0;
+    u32 actor = 0;
+    if (!wwhd_fopAcM_SearchByID(pcid, (u32)&actor) || !actor) return 0;
+    return ((const fopAc_ac_c*)actor)->group == EV_GROUP_ENEMY;
+}
+
+static int ev_by_enemy(const u8* play) {
+    return ev_actor_is_enemy(*(const volatile u32*)(play + EV_PLAY_PT1)) ||
+           ev_actor_is_enemy(*(const volatile u32*)(play + EV_PLAY_PT2));
+}
+
 static int ev_is_recent(const char* name) {
     for (int i = 0; i != EV_RECENT; ++i)
         if (ev_recent[i][0] && ev_same(name, ev_recent[i]) && wwhd_logic_step() - ev_recent_step[i] < EV_RECENT_STEPS)
@@ -109,8 +132,9 @@ WWHD_HOOK(0x02543C6C, ev_start, (u32 self, u32 event)) {
     }
     name[n] = 0;
     if (!n || ev_generic(name) || ev_is_recent(name)) return;
-    ev_note_recent(name);
     const u8* play = wwhd_play_get();
+    if (!play || !ev_by_enemy(play)) return; /* not started by an enemy: this player's own */
+    ev_note_recent(name);
     const fopAc_ac_c* link = dh_link ? (const fopAc_ac_c*)dh_link : 0;
     if (!play || !link || state != READY || local_uid == MP_NO_ID || session.client_player_event == MP_NO_ID) return;
     mp_event e;
@@ -136,6 +160,10 @@ static void ev_received(const mp_u8* body, mp_u32 length) {
     mp_event e;
     if (!mp_read_event(body, length, &e)) {
         wwhd_log("multiplayer: malformed cutscene skipped");
+        return;
+    }
+    if (e.name[0] == '#') { /* not a cutscene: item_share.h (0.3.56) */
+        share_received(&e);
         return;
     }
     const u8* play = wwhd_play_get();

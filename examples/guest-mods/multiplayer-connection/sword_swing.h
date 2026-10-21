@@ -40,7 +40,7 @@
 #define SWING_LINK_FAN_WIND 0x7EC4     /* daPy_lk_c::mFanWindCps (d_a_player_main.h), the Deku Leaf's gust */
 #define SWING_PLAY_MASS 0x4EF8         /* play + 0x4EF8: dCcMassS_Mng */
 #define SWING_PRIORITY 1               /* the priority of Link's own sword */
-#define SWING_PLAYERS 8
+#define SWING_PLAYERS 16 /* 0.3.55: MAX_REMOTES 15 (8 before) */
 #define SWING_AT_VS_ENEMY 2u           /* cCcD_AtSPrm_VsEnemy_e, VsPlayer 4, VsOther 8 (pvp.h) */
 #define SWING_AT_VS_PLAYER 4u
 #define SWING_AT_VS_OTHER 8u

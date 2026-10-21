@@ -19,7 +19,16 @@
  *
  * The hero's clothes are worn only once they are the player's (playerInit's own rule: save event
  * 0x2A80, read with the game's dSv_event_c::isEventBit 025B8B94 on *(0x101F84DC) + 0x644): until
- * then a player who chose "hero" stays in the casual clothes. */
+ * then a player who chose "hero" stays in the casual clothes.
+ *
+ * 0.3.63 (the user's decision after the friends' session: pyjama and hero's clothes mixed, at random,
+ * at the pyjama -> hero's clothes moment): no choice any more. outfit_wanted is always OUTFIT_AUTO
+ * (the game's own flag, set by playerInit from save event 0x2A80, which the shared progression gives
+ * every player as soon as one has it), and the puppets no longer write their player's clothes
+ * around their draw (outfit_puppet_begin / outfit_puppet_end unused): every Link of a game wears its
+ * local Link's clothes. The local step still writes the clothes its flag says into the shared
+ * entries (the repair of the 0.3.27 note: a puppet's playerInit / playerDelete swapping them). The
+ * launcher's pyjama box is locked and shows hero_clothes. */
 #pragma once
 #include "wwhd_guest.h"
 #include "wwhd/link.h"
@@ -37,7 +46,6 @@ enum { OUTFIT_AUTO = -1, OUTFIT_HERO = 0, OUTFIT_CASUAL_WANTED = 1 };
 
 static int outfit_wanted = OUTFIT_AUTO;
 static u32 outfit_local;    /* the local Link, from its step */
-static u32 outfit_logged;
 
 #define OUTFIT_EVENT 0x644          /* dSv_event_c from the save pointer (playerInit) */
 #define OUTFIT_HERO_EVENT 0x2A80u   /* the hero's clothes received */
@@ -50,161 +58,116 @@ static int outfit_hero_unlocked(void) {
 }
 
 static u32 outfit_ld32(u32 a) { return *(const volatile u32*)a; }
-static void outfit_st32(u32 a, u32 v) { *(volatile u32*)a = v; }
 
 static int outfit_is_casual(u32 link) {
     return link && (outfit_ld32(link + OUTFIT_FLG1) & OUTFIT_CASUAL) != 0;
 }
 
-/* 0.3.27: the clothes are written, never swapped. The model data is shared by every Link and each
- * Link's playerInit / playerDelete swaps it with its own copies (+0x48C): a puppet created or deleted
- * while the table held other clothes left mixed headers (the pyjama texture on the hero's clothes).
- * So the mod keeps, for each listed entry k, a header of each clothes, told apart by their HD texture
- * object (the casual one is getRes("Link", 0x71)'s, outfit_casual_texture), learnt from the local
- * Link's entries and copies; the casual one, when not seen, is made as playerInit makes it
- * (setResTIMG: the 0x71 header, palette and image offsets moved to the entry, its HD object).
- * Headers hold offsets from their own entry (playerInit copies them in place): a header kept for
- * entry k is written only to entry k of the same model data. Then:
- *  - each step of the local Link: its entries get its clothes, its copies the other ones (what
- *    playerDelete expects), its flag (hat) follows;
- *  - around a puppet's draw: the entries get the puppet's clothes, then the local Link's again.
- * A header is written only when it differs (the table's dirty mask as setResTIMG does). */
-static u8 outfit_kept[2][OUTFIT_MAX][OUTFIT_HEADER]; /* [casual][entry] */
-static u32 outfit_known[2];                           /* bit per entry */
-static u32 outfit_data;                               /* the model data they belong to */
+/* 0.3.69: nothing is written any more. Seen after the hero's clothes came (friends' session,
+ * 2026-10-22): the hero's model with the pyjama's textures. The game keeps the shared table right by
+ * itself for one Link (playerInit copies the table's headers, writes the casual one, swaps back for
+ * the hero's clothes; playerDelete swaps back for the casual ones), and the puppets' creation and
+ * deletion keep it untouched (puppet.h puppet_phase_2 / puppet_delete: puppet_texture_table saves
+ * the headers and puts them back). What still wrote into it was this file's outfit_local_step,
+ * every step: headers learnt once per model data (outfit_known, cleared only when the model data
+ * pointer changed), with their absolute HD texture object at +0x20, written again after the Link
+ * archive came back at the same address (an area change, the hero's clothes): stale headers. So
+ * the local Link's clothes are the game's, untouched; this file only reads them. */
 static u32 outfit_casual_res;                         /* getRes("Link", 0x71), puppet.h */
 static u32 outfit_casual_texture(void);              /* its HD object, puppet.h */
 
-typedef struct { u32 table, res, headers, count; } outfit_list;
+/* The local Link's step: nothing to do any more (kept for mod.c). */
+static void outfit_local_step(u32 link) { outfit_local = link; }
 
-static int outfit_list_of(u32 link, outfit_list* o) {
-    const daPy_lk_c* l = (const daPy_lk_c*)link;
-    u32 list = link ? l->mpCurrLinktex : 0;
-    u32 data = link ? (u32)l->mpCLModelData : 0;
-    if (!list || !data) return 0;
-    o->table = outfit_ld32(data + OUTFIT_TABLE);
-    o->res = o->table ? outfit_ld32(o->table + 4) : 0;
-    o->count = outfit_ld32(list);
-    o->headers = outfit_ld32(list + 8);
-    if (!o->res || !o->headers || !o->count) return 0;
-    if (o->count > OUTFIT_MAX) o->count = OUTFIT_MAX;
-    if (data != outfit_data) { /* another model data: its own headers */
-        outfit_data = data;
-        outfit_known[0] = outfit_known[1] = 0;
-    }
-    return 1;
+/* 0.3.71: each puppet drawn in the clothes of its own flag (its playerInit: the save's event
+ * 0x2A80, the same for every player with the shared progression; the flag also hides or shows its
+ * hat). Seen (2026-10-22, both games): after the hero's clothes came, the puppets with their hat but
+ * the pyjama's textures. The shared table a puppet draws with is the local Link's only when the
+ * local Link wears no skin: a skinned local Link changes the clothes of its skin's table (the
+ * cutscene's swap, d_a_player_main_03.cpp setDemoData), and nothing changes the shared one (the
+ * puppets' creation and deletion keep it, puppet.h). So around a puppet's draw only the HD texture
+ * object of each clothes entry (+0x20, as tunic.h swaps its colour copies) is the one of its
+ * clothes: the casual object (getRes("Link", 0x71), outfit_casual_texture) or the hero's, taken
+ * from the entry or the puppet's own copies (+0x48C), whichever is not the casual one, and kept
+ * per entry for the model data. Put back after the draw. */
+#define OUTFIT_LIST_MAX 10
+#define OUTFIT_HEADER_BYTES 0x24
+#define OUTFIT_HD 0x20
+#define OUTFIT_TABLE_RES 4
+/* 0.3.74: the hero's objects per model data (Link's and each skin's) */
+#define OUTFIT_DATAS 16
+static u32 outfit_hero_data[OUTFIT_DATAS];
+static u32 outfit_hero_all[OUTFIT_DATAS][OUTFIT_LIST_MAX];
+static u32 outfit_hero_next;
+static u32 outfit_swap_table, outfit_swap_count;
+static u32 outfit_swap_entry[OUTFIT_LIST_MAX], outfit_swap_old[OUTFIT_LIST_MAX], outfit_swap_index[OUTFIT_LIST_MAX];
+
+static u32* outfit_hero_for(u32 data) {
+    for (u32 i = 0; i != OUTFIT_DATAS; ++i)
+        if (outfit_hero_data[i] == data) return outfit_hero_all[i];
+    u32 i = outfit_hero_next++ % OUTFIT_DATAS;
+    outfit_hero_data[i] = data;
+    for (u32 k = 0; k != OUTFIT_LIST_MAX; ++k) outfit_hero_all[i][k] = 0;
+    return outfit_hero_all[i];
 }
 
-static u32 outfit_entry(const outfit_list* o, u32 k) {
-    u32 entry = outfit_ld32(o->headers + k * 4);
-    if (!entry || entry < o->res || (entry - o->res) % OUTFIT_HEADER) return 0;
-    return entry;
-}
-
-/* 1 casual, 0 hero, -1 neither (no HD object). */
-static int outfit_kind(u32 header, u32 casual) {
-    u32 hd = outfit_ld32(header + 0x20);
-    if (!hd || !casual) return -1;
-    return hd == casual;
-}
-
-static void outfit_learn(u32 header, u32 k, u32 casual) {
-    int kind = outfit_kind(header, casual);
-    if (kind < 0 || (outfit_known[kind] >> k & 1)) return;
-    for (u32 w = 0; w != OUTFIT_HEADER; w += 4) *(u32*)&outfit_kept[kind][k][w] = outfit_ld32(header + w);
-    outfit_known[kind] |= 1u << k;
-}
-
-/* playerInit's casual header for an entry (d_a_player_main_04b.cpp, setResTIMG). */
-static void outfit_make_casual(u32 entry, u32 k) {
-    u32 src = outfit_casual_res;
-    if (!src || (outfit_known[1] >> k & 1)) return;
-    u32* dst = (u32*)outfit_kept[1][k];
-    for (u32 w = 0; w != OUTFIT_HEADER; w += 4) dst[w / 4] = outfit_ld32(src + w);
-    dst[0x0C / 4] += src - entry; /* paletteOffset */
-    dst[0x1C / 4] += src - entry; /* imageOffset */
-    outfit_known[1] |= 1u << k;
-}
-
-static int outfit_write(u32 at, const u8* header) {
-    int changed = 0;
-    for (u32 w = 0; w != OUTFIT_HEADER; w += 4) {
-        u32 v = *(const u32*)&header[w];
-        if (outfit_ld32(at + w) != v) {
-            outfit_st32(at + w, v);
-            changed = 1;
-        }
-    }
-    return changed;
-}
-
-/* The entries of the Link's model data get the given clothes (and the Link's copies the other ones
- * when copies is set); 0 when a header is not known. */
-static int outfit_force(u32 link, int casual, int copies) {
-    outfit_list o;
-    if (!outfit_list_of(link, &o)) return 0;
-    for (u32 k = 0; k != o.count; ++k) {
-        if (!outfit_entry(&o, k)) continue;
-        if (!(outfit_known[casual] >> k & 1)) return 0;
-    }
-    for (u32 k = 0; k != o.count; ++k) {
-        u32 entry = outfit_entry(&o, k);
-        if (!entry) continue;
-        if (outfit_write(entry, outfit_kept[casual][k])) tunic_mark_dirty(o.table, (entry - o.res) / OUTFIT_HEADER);
-        if (copies && (outfit_known[!casual] >> k & 1))
-            outfit_write(link + OUTFIT_COPIES + k * OUTFIT_HEADER, outfit_kept[!casual][k]);
-    }
-    return 1;
-}
-
-/* Learns both clothes from the Link's entries and copies. */
-static void outfit_learn_link(u32 link) {
-    u32 casual = outfit_casual_texture();
-    outfit_list o;
-    if (!casual || !outfit_list_of(link, &o)) return;
-    for (u32 k = 0; k != o.count; ++k) {
-        u32 entry = outfit_entry(&o, k);
-        if (!entry) continue;
-        outfit_learn(entry, k, casual);
-        outfit_learn(link + OUTFIT_COPIES + k * OUTFIT_HEADER, k, casual);
-        outfit_make_casual(entry, k);
-    }
-}
-
-/* The local Link's step: the chosen clothes (auto: the game's flag). */
-static void outfit_local_step(u32 link) {
-    outfit_local = link;
-    if (!link) return;
-    outfit_learn_link(link);
-    int wanted = outfit_wanted;
-    if (wanted == OUTFIT_HERO && !outfit_hero_unlocked()) wanted = OUTFIT_CASUAL_WANTED; /* not unlocked yet */
-    int casual = wanted == OUTFIT_AUTO ? outfit_is_casual(link) : wanted == OUTFIT_CASUAL_WANTED;
-    if (!outfit_force(link, casual, 1)) return;
-    volatile u32* flags = (volatile u32*)(link + OUTFIT_FLG1);
-    if (casual != outfit_is_casual(link)) {
+/* casual_object: the casual clothes' object of the model data the puppet draws with (Link's,
+ * outfit_casual_texture, or its skin's, skin_casual_object). 0.3.74: also for the skinned puppets
+ * (before, only the others: a skinned puppet draws with its skin's table, which its own playerInit
+ * set once, in the clothes of that moment). */
+static void outfit_puppet_draw_begin(u32 puppet, int casual, u32 casual_object) {
+    outfit_swap_table = outfit_swap_count = 0;
+    if (puppet) { /* 0.3.73: its flag (hat and buckle, daPy_lk_c::draw) follows its player's clothes */
+        volatile u32* flags = (volatile u32*)(puppet + OUTFIT_FLG1);
         if (casual) *flags |= OUTFIT_CASUAL;
         else *flags &= ~OUTFIT_CASUAL;
-        if (outfit_logged++ < 4) wwhd_log_int("multiplayer: clothes set, casual", casual);
     }
+    const daPy_lk_c* l = (const daPy_lk_c*)puppet;
+    u32 data = puppet ? (u32)l->mpCLModelData : 0;
+    u32 list = puppet ? l->mpCurrLinktex : 0;
+    { /* 0.3.74: logged at each change of a model's wanted clothes (the skinned puppets' hunt) */
+        static u32 last_data, last_state = 0xFFFFFFFFu, logged;
+        u32 state = (u32)casual | (casual_object ? 2u : 0u) | (list ? 4u : 0u);
+        if ((data != last_data || state != last_state) && logged++ < 24) {
+            wwhd_log_hex("multiplayer: clothes: puppet model data", data);
+            wwhd_log_int("multiplayer: clothes:   casual wanted", casual);
+            wwhd_log_hex("multiplayer: clothes:   casual object", casual_object);
+            wwhd_log_int("multiplayer: clothes:   clothes entries listed", list ? (int)outfit_ld32(list) : -1);
+        }
+        last_data = data;
+        last_state = state;
+    }
+    if (!data || !list || !casual_object) return;
+    u32 table = outfit_ld32(data + OUTFIT_TABLE);
+    u32 res = table ? outfit_ld32(table + OUTFIT_TABLE_RES) : 0;
+    u32 count = outfit_ld32(list), headers = outfit_ld32(list + 8);
+    if (!res || !headers) return;
+    if (count > OUTFIT_LIST_MAX) count = OUTFIT_LIST_MAX;
+    u32* outfit_hero = outfit_hero_for(data);
+    for (u32 k = 0; k != count; ++k) {
+        u32 entry = outfit_ld32(headers + k * 4);
+        if (!entry || entry < res || (entry - res) % OUTFIT_HEADER_BYTES) continue;
+        u32 now = outfit_ld32(entry + OUTFIT_HD);
+        u32 copy = outfit_ld32(puppet + OUTFIT_COPIES + k * OUTFIT_HEADER_BYTES + OUTFIT_HD);
+        if (now && now != casual_object) outfit_hero[k] = now; /* learnt from what the table shows */
+        else if (copy && copy != casual_object) outfit_hero[k] = copy;
+        u32 want = casual ? casual_object : outfit_hero[k];
+        if (!want || want == now) continue;
+        outfit_swap_entry[outfit_swap_count] = entry;
+        outfit_swap_old[outfit_swap_count] = now;
+        outfit_swap_index[outfit_swap_count] = (entry - res) / OUTFIT_HEADER_BYTES;
+        ++outfit_swap_count;
+        *(volatile u32*)(entry + OUTFIT_HD) = want;
+        tunic_mark_dirty(table, (entry - res) / OUTFIT_HEADER_BYTES);
+    }
+    if (outfit_swap_count) outfit_swap_table = table;
 }
 
-/* Around a puppet's draw: its clothes in the shared entries. Returns 1 when written
- * (outfit_puppet_end must follow). */
-static int outfit_puppet_begin(int remote_casual) {
-    if (!outfit_local) return 0;
-    return outfit_force(outfit_local, remote_casual, 0);
-}
-
-static void outfit_puppet_end(int written) {
-    if (written) outfit_force(outfit_local, outfit_is_casual(outfit_local), 0);
-}
-
-/* "auto", "hero" or "casual" (option and launcher.cfg "outfit"). */
-static int outfit_parse(const char* text, int fallback) {
-    if (text[0] == 'h' && text[1] == 'e' && text[2] == 'r' && text[3] == 'o' && !text[4]) return OUTFIT_HERO;
-    if (text[0] == 'c' && text[1] == 'a' && text[2] == 's' && text[3] == 'u' && text[4] == 'a' && text[5] == 'l' &&
-        !text[6])
-        return OUTFIT_CASUAL_WANTED;
-    if (text[0] == 'a' && text[1] == 'u' && text[2] == 't' && text[3] == 'o' && !text[4]) return OUTFIT_AUTO;
-    return fallback;
+static void outfit_puppet_draw_end(void) {
+    if (!outfit_swap_table) return;
+    for (u32 k = 0; k != outfit_swap_count; ++k) {
+        *(volatile u32*)(outfit_swap_entry[k] + OUTFIT_HD) = outfit_swap_old[k];
+        tunic_mark_dirty(outfit_swap_table, outfit_swap_index[k]);
+    }
+    outfit_swap_table = outfit_swap_count = 0;
 }

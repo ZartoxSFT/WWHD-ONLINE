@@ -15,7 +15,8 @@
 
 namespace guestmods::hud {
 using Handle = uint32_t;
-inline constexpr uint32_t kMaxCommands=1024, kMaxImages=32, kMaxLists=2, kMaxVertices=32768, kMaxClipDepth=16;
+// 0.3.55 (multiplayer, 16 players): 4096 elements and 131072 vertices (1024 and 32768 before), 32 per element as before
+inline constexpr uint32_t kMaxCommands=4096, kMaxImages=32, kMaxLists=2, kMaxVertices=131072, kMaxClipDepth=16;
 inline constexpr size_t kMaxPixels=16*1024*1024, kMaxText=64*1024;
 struct Image { uint32_t width,height; std::vector<uint8_t> rgba; };
 enum class Anchor : uint32_t { Center,TopLeft,Top,TopRight,Left,Right,BottomLeft,Bottom,BottomRight };

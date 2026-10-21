@@ -47,7 +47,7 @@
 #include "sword_swing.h"
 #include "dungeon_map.h"
 
-#define MAX_REMOTES 8
+#define MAX_REMOTES 15 /* 0.3.55: 16 players (8 before); puppet.h PUPPET_MAX holds them, the bodies and the bots */
 #define CFG_PERIOD 1.0      /* launcher.cfg re-read interval, seconds */
 #define UPDATE_PERIOD 0.1   /* ActorBaseSync::sUpdateRate */
 #define PLAYER_PERIOD (1.0 / 30.0) /* ActorPlayerSync updates, at most one per 30 fps frame */
@@ -69,16 +69,91 @@
 
 enum { IDLE, WAIT_INIT, READY, FAILED };
 
+/* 0.3.76: the remote players' places, interpolated. Before, the shown place went a third of the way
+ * to the last received one each step: a lag that grew with the speed, an overshoot at each stop or
+ * turn, and the rotations snapped. Now each received place is kept with the time it arrived
+ * (RS_SAMPLES), and the puppet is shown RS_DELAY in the past, on the straight line between the two
+ * places around that time (rotations the shortest way). Later than the newest place, the place
+ * holds (a player who stops sends nothing more: no move carried past it). A jump of more
+ * than RS_SNAP (a teleport, an area change) is taken at once. The player carrying the local Link
+ * is shown at its newest place (carry.h). */
+#define RS_SAMPLES 6
+#define RS_DELAY 0.075            /* about two sends (ActorPlayerSync, at most 30 a second) */
+#define RS_SNAP 1500.0f
+
 typedef struct remote_player {
     int active;
     mp_u32 uid;
     int has_transform;
     mp_transform transform; /* last received */
     int has_display;
-    mp_transform display;   /* smoothed towards transform every logic step */
+    mp_transform display;   /* shown: interpolated between the received ones (0.3.76) */
+    mp_transform hist[RS_SAMPLES]; /* the last received places, oldest first */
+    double hist_t[RS_SAMPLES];     /* their arrival times (rs_clock) */
+    int hist_n;
     int has_look;
     mp_player_look look;    /* ActorPlayerSync: tunic colours, map cursor */
 } remote_player;
+
+static double rs_clock; /* seconds, advanced each logic step (update_markers) */
+
+static void rs_push(remote_player* r, const mp_transform* t) {
+    if (r->hist_n) {
+        const mp_transform* last = &r->hist[r->hist_n - 1];
+        f32 dx = t->pos[0] - last->pos[0], dy = t->pos[1] - last->pos[1], dz = t->pos[2] - last->pos[2];
+        if (dx * dx + dy * dy + dz * dz > RS_SNAP * RS_SNAP) { /* a jump: no line through it */
+            r->hist_n = 0;
+            r->has_display = 0;
+        }
+    }
+    if (r->hist_n == RS_SAMPLES) {
+        for (int i = 1; i != RS_SAMPLES; ++i) {
+            r->hist[i - 1] = r->hist[i];
+            r->hist_t[i - 1] = r->hist_t[i];
+        }
+        --r->hist_n;
+    }
+    r->hist[r->hist_n] = *t;
+    r->hist_t[r->hist_n] = rs_clock;
+    ++r->hist_n;
+}
+
+static s16 rs_angle(s16 a, s16 b, f32 k) {
+    s32 d = (s32)b - (s32)a;
+    if (d > 32767) d -= 65536;
+    if (d < -32768) d += 65536;
+    return (s16)(a + (s32)((f32)d * k));
+}
+
+static void rs_lerp(const mp_transform* a, const mp_transform* b, f32 k, mp_transform* out) {
+    for (int i = 0; i != 3; ++i) {
+        out->pos[i] = a->pos[i] + (b->pos[i] - a->pos[i]) * k;
+        out->rot[i] = rs_angle(a->rot[i], b->rot[i], k);
+    }
+}
+
+/* The place at time t (rs_clock seconds). */
+static void rs_sample(const remote_player* r, double t, mp_transform* out) {
+    int n = r->hist_n;
+    if (!n) {
+        *out = r->transform;
+        return;
+    }
+    if (n == 1 || t <= r->hist_t[0]) {
+        *out = r->hist[t <= r->hist_t[0] ? 0 : n - 1];
+        return;
+    }
+    for (int i = 1; i != n; ++i) {
+        if (t > r->hist_t[i]) continue;
+        double span = r->hist_t[i] - r->hist_t[i - 1];
+        f32 k = span > 0.0 ? (f32)((t - r->hist_t[i - 1]) / span) : 1.0f;
+        rs_lerp(&r->hist[i - 1], &r->hist[i], k, out);
+        return;
+    }
+    /* later than the newest: it holds there (a player who stopped sends nothing more: going on
+     * with its last move would leave it past its place) */
+    *out = r->hist[n - 1];
+}
 
 typedef struct marker {
     int visible;
@@ -88,10 +163,17 @@ typedef struct marker {
     char label[MP_NAME_MAX + 1];
     u32 label_bytes;
     int dead;             /* a ghost (death.h): the skull instead of the name */
+    int name_shown;       /* within NAME_HIDE_DISTANCE (0.3.59: the marker reaches farther for an item) */
 } marker;
 
 /* 1 MiB transport payload limit plus its VLQ length prefix. */
-static unsigned char incoming[1024 * 1024 + 8];
+/* 0.3.62: 256 KiB (1 MiB before). The mod's region is its code and data plus its 8 MiB heap; at
+ * 0.3.61 it reached 0xA20000 and no longer fitted in the 10 MiB its older versions had reserved
+ * before story-notebook (placed at 7FA00000): "Guest mod memory region is full", the mod not
+ * loaded (runtime/src/mods/packages.cpp assign_guest_region). The server's frames are a few KiB
+ * (tables, saves, positions; skins go through the launcher, port 10015). A frame larger than this
+ * would stay in the transport's queue (network_transport.cpp receive returns 0). */
+static unsigned char incoming[256 * 1024 + 8];
 /* An ActorPlayerSync update with every event list and the sword swings full takes about 2.2 KiB. */
 static mp_u8 payload[4096];
 static mp_u8 frame[4096 + 16];
@@ -107,6 +189,14 @@ static mp_transform last_sent;
 static double update_clock;
 static double log_clock;
 static remote_player remotes[MAX_REMOTES];
+static int cy_is_carrier(mp_u32 uid); /* carry.h: the player carrying the local Link (0.3.72) */
+
+/* actor_sync.h (0.3.65): the local player and the connected others, for the barrels per player. */
+static int mp_player_count(void) {
+    int n = 1;
+    for (int i = 0; i != MAX_REMOTES; ++i) n += remotes[i].active != 0;
+    return n;
+}
 static int area_settle;
 static mp_player_look local_look; /* colours and cursor from the launcher/options */
 static mp_player_look sent_look;  /* last ActorPlayerSync sent, with item and proc */
@@ -129,6 +219,7 @@ static int hud_hidden;    /* launcher "hide the HUD" (hide_hud), else the option
  * windows). 0.2.47 skipped dMeter_Draw (02593630), the GameCube meter's draw: it changed nothing
  * on screen. The port's own hook on it (story notebook) stays outside the mods' layer. */
 static int chart_menu_open(void);
+static void gf_draw(u32 list); /* gale_follow.h */
 WWHD_GAME_ORIGINAL(0x02715CA0, void, hud_screens_draw_original, (u32 self, u32 info));
 WWHD_REPLACE(0x02715CA0, void, hud_screens_draw, (u32 self, u32 info)) {
     const u8* play = wwhd_play_get();
@@ -196,6 +287,7 @@ static remote_player* find_remote(mp_u32 uid, int create) {
     free_slot->uid = uid;
     free_slot->has_transform = 0;
     free_slot->has_display = 0;
+    free_slot->hist_n = 0;
     free_slot->has_look = 0;
     return free_slot;
 }
@@ -277,6 +369,11 @@ static int el_remote_room(const remote_player* r, s8* room) {
 #include "death.h"    /* no game over while another player of the stage lives */
 static void cy_received(const mp_u8* body, mp_u32 length); /* carry.h */
 static void ev_received(const mp_u8* body, mp_u32 length); /* event_sync.h */
+static void share_received(const mp_event* e);              /* item_share.h */
+static u32 share_item_of(int remote_index);                  /* item_share.h */
+static u32 share_rupees(u32 item);
+static int share_model_shown(int remote_index);              /* item_share.h */
+#define SHARE_ITEM_DISTANCE 4000.0f /* an item held up is shown up to 40 m (the names: NAME_HIDE_DISTANCE) */
 #include "pvp.h"      /* the players who turned PvP on fight each other */
 
 static void handle_frame(const unsigned char* item, u32 size) {
@@ -306,6 +403,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         if (actor.has_transform) {
             remote->transform = actor.transform;
             remote->has_transform = 1;
+            remote->hist_n = 0; /* a new player: its first place */
+            rs_push(remote, &actor.transform);
         }
         if (actor.has_look) {
             remote->look = actor.look;
@@ -329,6 +428,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
             if (actor.has_transform) {
                 remote->transform = actor.transform;
                 remote->has_transform = 1;
+                rs_push(remote, &actor.transform);
             }
             if (actor.has_look) {
                 remote->look = actor.look;
@@ -396,6 +496,10 @@ static mp_player_look current_look(const daPy_lk_c* link) {
     if (outfit_is_casual((u32)link)) look.extras |= MP_EXTRA_CASUAL;
     /* the Mirror Shield sends light back (daPyRFlg0_LIGHT_REFLECT, puppet.h puppet_light) */
     if (*(const volatile u32*)((const u8*)link + PUPPET_RESET_FLG0) & PUPPET_LIGHT_REFLECT) look.extras |= MP_EXTRA_LIGHT;
+    { /* 0.3.73: under a barrel (checkGrabBarrel's test: mActorKeepGrab.mActor +0x65A4, an Obj_Barrel 0x1C8) */
+        u32 grab = *(const volatile u32*)((const u8*)link + 0x65A4);
+        if (grab && *(const volatile s16*)(grab + 8) == 0x1C8) look.extras |= MP_EXTRA_BARREL;
+    }
     /* the skin the local Link wears (bound at its creation, skin.h): a new choice shows at the
      * next area, for everybody at once */
     int skin = skin_of((u32)link);
@@ -473,8 +577,7 @@ static f32 marker_sqrt(f32 x) {
 /* Smooths each remote position towards the last received one (updates come every 0.1 s,
  * like ActorBaseSync's remote interpolation) and projects it with the game's own camera. */
 static void update_markers(double dt, const fopAc_ac_c* local) {
-    f32 blend = (f32)(dt / UPDATE_PERIOD);
-    if (blend > 1.0f) blend = 1.0f;
+    rs_clock += dt;
     const u8* play = wwhd_play_get();
     int view = play && *(const volatile u32*)(play + PLAY_VIEW_OFFSET) != 0;
     f32 screen_w = WWHD_GAME_DATA(ADDR_mDoLib_screenWidth, f32);
@@ -485,14 +588,10 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         marker* m = &markers[i];
         m->visible = 0;
         if (!r->active || !r->has_transform) continue;
-        if (!r->has_display) {
-            r->display = r->transform;
-            r->has_display = 1;
-        } else {
-            for (int k = 0; k != 3; ++k)
-                r->display.pos[k] += (r->transform.pos[k] - r->display.pos[k]) * blend;
-            for (int k = 0; k != 3; ++k) r->display.rot[k] = r->transform.rot[k];
-        }
+        /* the player carrying the local Link: its newest place (0.3.72); the others interpolated */
+        if (!r->has_display || cy_is_carrier(r->uid)) r->display = r->transform;
+        else rs_sample(r, rs_clock - RS_DELAY, &r->display);
+        r->has_display = 1;
         puppet_set_target(r->uid, &r->display);
         if (r->has_look) puppet_set_look(r->uid, (mp_u16)r->look.colors[0], (mp_u16)r->look.colors[1], r->look.proc,
                                          r->look.item, r->look.extras, r->look.skin);
@@ -511,9 +610,11 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         f32 dy = at[1] - local->current.pos.y;
         f32 dz = at[2] - local->current.pos.z;
         f32 distance2 = dx * dx + dy * dy + dz * dz;
-        if (!(distance2 < NAME_HIDE_DISTANCE * NAME_HIDE_DISTANCE)) continue;
+        f32 reach = share_item_of(i) ? SHARE_ITEM_DISTANCE : NAME_HIDE_DISTANCE; /* 0.3.59 */
+        if (!(distance2 < reach * reach)) continue;
+        m->name_shown = distance2 < NAME_HIDE_DISTANCE * NAME_HIDE_DISTANCE;
         f32 opacity = 1.0f;
-        if (distance2 > NAME_FADE_START * NAME_FADE_START) {
+        if (m->name_shown && distance2 > NAME_FADE_START * NAME_FADE_START) {
             f32 distance = marker_sqrt(distance2);
             opacity = (NAME_HIDE_DISTANCE - distance) / (NAME_HIDE_DISTANCE - NAME_FADE_START);
         }
@@ -885,16 +986,21 @@ static void draw_markers(u32 list) {
     pb_draw(list); /* the Debug page's bot (push_bot.h) */
     dl_draw(list); /* the players a locked door waits for (door_lock.h) */
     gp_draw(list); /* the Golden Pig on the HUD's D-pad (golden_pig.h) */
+    gf_draw(list); /* another player's Ballad of Gales: hold A to follow (gale_follow.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
     /* not during a cutscene or a dialogue (both are events: play's event running flag) */
     const u8* event_play = wwhd_play_get();
-    if (names_hidden || chart_menu_open() || !event_play || event_play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
+    if (chart_menu_open() || !event_play || event_play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
+    int shown = 0;
+    for (int i = 0; i != MAX_REMOTES; ++i) shown += markers[i].visible && markers[i].name_shown && !markers[i].dead;
+    name_bands = shown > NAME_FULL_NAMES ? 1 : NAME_BANDS; /* name_tag.h: under the HUD list's limit */
     for (int i = 0; i != MAX_REMOTES; ++i) {
         const marker* m = &markers[i];
         if (!m->visible) continue;
-        u32 skull = m->dead ? sv_dead_icon() : 0;
+        int names = m->name_shown && !names_hidden; /* the items held up show without the names (0.3.59) */
+        u32 skull = m->dead && names ? sv_dead_icon() : 0;
         if (skull) { /* a ghost: the skull (50 x 44), bottom at the name's baseline */
             f32 h = 44.0f * m->scale * 1.3f, w = 50.0f * m->scale * 1.3f;
             marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
@@ -904,14 +1010,43 @@ static void draw_markers(u32 list) {
             wwhd_hud_emit(list, &marker_element);
             continue;
         }
-        name_draw(list, m->x, m->y, m->label, m->label_bytes, m->rgb, m->scale, m->opacity);
+        if (names) name_draw(list, m->x, m->y, m->label, m->label_bytes, m->rgb, m->scale, m->opacity);
+        u32 item = m->dead ? 0 : share_item_of(i); /* the item this player holds up (item_share.h) */
+        u32 icon = item && !share_model_shown(i) ? sv_icon(item) : 0; /* the 3D model shows instead (0.3.60) */
+        u32 rupees = item ? share_rupees(item) : 0;
+        if (!icon && rupees) { /* no inventory icon for a rupee: "+amount", gold */
+            char text[8];
+            int n = 0;
+            char digits[6];
+            int d = 0;
+            for (u32 rest = rupees; rest && d != 6; rest /= 10) digits[d++] = (char)('0' + rest % 10);
+            text[n++] = '+';
+            while (d) text[n++] = digits[--d];
+            name_draw(list, m->x, m->y - 30.0f * m->scale, text, (u32)n, 0xF9C74Fu, m->scale * 1.2f, m->opacity);
+        }
+        if (icon) {
+            f32 size = 56.0f * m->scale;
+            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+                                                .x = m->x - size * 0.5f, .y = m->y - size - 34.0f * m->scale, .w = size,
+                                                .h = size, .thickness = 1, .u1 = 1, .v1 = 1,
+                                                .rgba = 0xFFFFFF00u | (u32)(m->opacity * 255.0f), .image = icon};
+            wwhd_hud_emit(list, &marker_element);
+        }
     }
 }
 
 /* ------------------------------------------------------------------ lifecycle */
 
+/* 0.3.67: launcher.cfg always exists in the mod's Data folder, the launcher's to fill (an empty
+ * one made at the first read when it is missing: the launcher only has to find the recomp folder). */
 static void read_launcher_cfg(void) {
     s32 n = wwhd_file_read("launcher.cfg", cfg_text, sizeof(cfg_text));
+    if (n < 0) {
+        static const char header[] = "# written by the Wind Waker Online launcher\n";
+        static int made;
+        if (!made++ && wwhd_file_write("launcher.cfg", header, sizeof(header) - 1) >= 0)
+            wwhd_log("multiplayer: launcher.cfg made (empty)");
+    }
     if (n < 0 || !mp_parse_launcher_cfg(cfg_text, (unsigned int)n, &cfg)) {
         mp_launcher_cfg empty = {0};
         cfg = empty;
@@ -1017,13 +1152,7 @@ static void refresh_launcher_settings(const daPy_lk_c* link, double dt) {
     sense_enabled = wwhd_config_bool("actors_see_puppets", 1);
     as_enabled = wwhd_config_bool("sync_actors", 1);
     as_hit_stop = wwhd_config_bool("hit_stop", 0);
-    if (cfg.has_outfit) {
-        outfit_wanted = cfg.outfit;
-    } else {
-        char outfit[16] = {0};
-        wwhd_config_string("outfit", outfit, sizeof(outfit));
-        outfit_wanted = outfit_parse(outfit, OUTFIT_AUTO);
-    }
+    outfit_wanted = OUTFIT_AUTO; /* 0.3.63: no choice of clothes (launcher "outfit" ignored) */
     refresh_ship_color_setting();
     mp_player_look look = wanted_look();
     if (!same_look(&look, &local_look)) {
@@ -1473,11 +1602,13 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
  * start point -1, the save's restart room dSv_restart_c::mRestartRoom, then the restart param), with
  * daPy_lk_c::startRestartRoom's mode 5 and event info 0xC9 (d_a_player_main_03.cpp). Link stands at
  * his restart place (where he entered the room), the room's actors are made again. Not while riding
- * the ship, during an event, a stage change or as a ghost. */
+ * the ship, during a stage change or as a ghost. 0.3.63: also during an event (a cutscene stuck
+ * with another player's, a soft lock): the stage load starts a new event control. */
 static const char* room_reset_try(u8* play) {
     u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
     if (!save) return "no_save";
-    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_stage_wait) return "busy";
+    if (teleport_stage_wait) return "busy";
+    if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) wwhd_log("multiplayer: room reset during an event (a stuck cutscene)");
     if (*(const volatile u32*)(play + PUPPET_PLAY_STATUS0) & PUPPET_STATUS0_RIDE) return "riding";
     if (dh_local_dead()) return "dead";
     s8 room = *(const volatile s8*)(save + SAVE_RESTART); /* mRestartRoom */
@@ -2302,6 +2433,11 @@ static void multiplayer_connection_step(void* link) {
 #include "golden_pig.h" /* the shop's Golden Pig, called with the D-pad's down */
 #include "carry.h" /* the players catch, carry and throw each other */
 #include "event_sync.h" /* a cutscene plays for the whole room */
+#include "item_share.h" /* items held up shown, rupees shared, the pigs' anger */
+#include "path_guard.h" /* a path point outside its path does not stop the game */
+#include "switch_sync.h" /* the dungeon and room switches shared with the room */
+#include "last_place.h" /* back where one left the server */
+#include "gale_follow.h" /* follow another player's Ballad of Gales */
 #include "heap_grow.h" /* bigger game heaps for the skins of many players */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
@@ -2313,6 +2449,7 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     if (puppet_is(i_this)) {
         s32 result = puppet_execute(i_this);
         pvp_puppet_after(i_this); /* lock-on on a PvP player (pvp.h) */
+        cy_after_carrier(i_this); /* the local Link it carries, at its place of this step (carry.h) */
         skin_leave(skin);
         return result;
     }
@@ -2325,6 +2462,9 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     skin_leave(skin);
     cy_step(i_this); /* before the place is sent */
     ev_step(i_this); /* a cutscene of another player of the room (event_sync.h) */
+    share_step(i_this); /* the item held up, the pigs' anger (item_share.h) */
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) lp_step((const fopAc_ac_c*)i_this, wwhd_play_get());
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) gf_step(i_this); /* Ballad of Gales (gale_follow.h) */
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());

@@ -534,6 +534,22 @@ static void skin_unbind(u32 actor) {
 
 static int skin_bound(u32 actor) { return skin_binding(actor) != 0; }
 
+/* 0.3.74: a skinned Link's casual clothes texture object: its playerInit reads getRes("Link", 0x71)
+ * with the skin's archive in place of "Link" (skin_key_for), so it is that archive's 0x71 HD object
+ * (+0x20), 0 when the skin has none. */
+static u32 skin_casual_object(u32 actor) {
+    int i = skin_of(actor);
+    if (i < 0) return 0;
+    skin_archive* a = &skin_archives[i];
+    if (a->state != SKIN_LOADED) return 0;
+    u32 control = WWHD_GAME_DATA(0x101F4F28, u32);
+    if (!control) return 0;
+    a->key[0] = (u32)a->arc;
+    a->key[1] = skin_string_vtable();
+    u32 res = skin_get_res_original(control, (u32)a->key, 0x71);
+    return res ? *(const volatile u32*)(res + 0x20) : 0;
+}
+
 /* The skin's code window: what getRes answers for "Link" while a Link runs. */
 static int skin_enter(u32 actor) {
     int previous = skin_current;
