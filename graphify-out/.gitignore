@@ -1,0 +1,5 @@
+# graphify (docs/multiplayer/claude.md): the graph is rebuilt on each machine
+# (graphify extract . --code-only from WWONLINE, about 5 min); only the report is pushed.
+*
+!.gitignore
+!GRAPH_REPORT.md

@@ -950,10 +950,10 @@ static void ck_emit(u32 list, u32 image, u32 pane, u32 rgb, f32 alpha) {
     if (!image || !bonus_ptr(pane)) return;
     f32 x, y, w, h;
     bonus_rect(pane, 0, &x, &y, &w, &h);
-    y -= CK_HUD_LIFT;
+    y -= CK_HUD_LIFT / bonus_hud_k(); /* layout units (0.3.101) */
     if (!(x > -4096.0f && x < 4096.0f && y > -4096.0f && y < 4096.0f && w > 0.0f && w < 1024.0f && h > 0.0f && h < 1024.0f))
         return;
-    ck_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+    ck_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                     .x = x, .y = y, .w = w, .h = h, .thickness = 1, .u1 = 1, .v1 = 1,
                                     .rgba = (rgb << 8) | (u32)(alpha * 255.0f), .image = image};
     wwhd_hud_emit(list, &ck_element);
@@ -1009,7 +1009,7 @@ static void ck_draw(u32 list) {
     /* the count: two digits, as the game writes its own, at the game's number moved up */
     f32 tx, ty, tw, th;
     bonus_rect(ck_numkey, 0, &tx, &ty, &tw, &th);
-    ty -= CK_HUD_LIFT;
+    ty -= CK_HUD_LIFT / bonus_hud_k(); /* layout units (0.3.101) */
     u32 n = (u32)ck_hud_count > 99u ? 99u : (u32)ck_hud_count;
     u32 digits[2] = {n / 10u, n % 10u};
     if (ck_digit_failed || !ck_digit_h || !ck_digit[digits[0]] || !ck_digit[digits[1]]) {
@@ -1026,7 +1026,7 @@ static void ck_draw(u32 list) {
     for (u32 i = 0; i != 2; ++i) {
         u32 d = digits[i];
         f32 gx = pen + (f32)ck_digit_left[d] * k, gw = (f32)ck_digit_w[d] * k, gh = (f32)ck_digit_h * k;
-        ck_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+        ck_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                         .x = gx, .y = top, .w = gw, .h = gh, .thickness = 1, .u1 = 1, .v1 = 1,
                                         .rgba = 0xFFFFFF00u | (u32)(alpha * 255.0f), /* the colours are in the image (0.3.86) */
                                         .image = ck_digit[d]};

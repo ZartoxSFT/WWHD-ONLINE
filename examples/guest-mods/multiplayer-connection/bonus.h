@@ -1082,16 +1082,33 @@ static f32 bonus_alpha(u32 pane) {
     return a;
 }
 
+/* 0.3.101: layout space to the mod's HUD at any aspect ratio. The runtime (aspect.cpp) keeps the
+ * HD layouts' 16:9 space centred in the TV picture, moves the HUD panes out to the new edges (their
+ * global matrices hold the moved places) and fits the layout space: a wider screen shows more layout
+ * units across at the same height, a taller one (16:10, 4:3) shows 720 * ky units down, ky = (16/9) /
+ * aspect. The mod's HUD (guest_hud.h anchored) is 720 units tall whatever the shape and, anchored at
+ * the centre, keeps x 640 at the picture's centre: a layout point (lx, ly) is at 640 + lx / ky,
+ * 360 - ly / ky, sizes / ky. The aspect: the main camera's View::mAspect (play + 0x5FA4 mpView,
+ * +0xD8, d_drawlist.h), which the runtime sets to the game's aspect every step (aspect.cpp
+ * store_aspect). Until 0.3.100 the places were taken as 1280 x 720 from the top left: right only at
+ * 16:9. Every element placed from the game's panes is drawn anchored at the centre. */
+#define BONUS_ASPECT_16_9 (16.0f / 9.0f)
+static f32 bonus_hud_k(void) {
+    f32 a = hud_view_aspect(); /* mod.c */
+    return a < BONUS_ASPECT_16_9 ? BONUS_ASPECT_16_9 / a : 1.0f;
+}
+
 /* A picture in TV coordinates: left, top, width, height (origin given: centre or left). */
 static void bonus_rect(u32 pane, int left_origin, f32* x, f32* y, f32* w, f32* h) {
     const volatile f32* m = (const volatile f32*)(pane + BONUS_PANE_MTX);
     const volatile f32* size = (const volatile f32*)(pane + BONUS_PANE_SIZE);
-    *w = size[0] * m[0];
-    *h = size[1] * m[5];
+    f32 k = bonus_hud_k();
+    *w = size[0] * m[0] / k;
+    *h = size[1] * m[5] / k;
     if (*w < 0.0f) *w = -*w;
     if (*h < 0.0f) *h = -*h;
-    *x = 640.0f + m[3] - (left_origin ? 0.0f : *w * 0.5f);
-    *y = 360.0f - m[7] - *h * 0.5f;
+    *x = 640.0f + m[3] / k - (left_origin ? 0.0f : *w * 0.5f);
+    *y = 360.0f - m[7] / k - *h * 0.5f;
 }
 
 /* One element; anything the runtime would refuse (it then drops the mod's whole list, names and
@@ -1099,16 +1116,17 @@ static void bonus_rect(u32 pane, int left_origin, f32* x, f32* y, f32* w, f32* h
 /* A pane's centre on the TV and its drawn scale (x axis of its global matrix). */
 static void bonus_center(u32 pane, f32* x, f32* y, f32* scale) {
     const volatile f32* m = (const volatile f32*)(pane + BONUS_PANE_MTX);
-    *x = 640.0f + m[3];
-    *y = 360.0f - m[7];
-    *scale = m[0] < 0.0f ? -m[0] : m[0];
+    f32 k = bonus_hud_k();
+    *x = 640.0f + m[3] / k;
+    *y = 360.0f - m[7] / k;
+    *scale = (m[0] < 0.0f ? -m[0] : m[0]) / k;
 }
 
 static void bonus_emit(u32 list, u32 image, f32 x, f32 y, f32 w, f32 h, f32 part, u32 rgb, f32 alpha) {
     if (!image || !(alpha > 0.0f) || alpha > 1.0f) return;
     if (!(x > -4096.0f && x < 4096.0f && y > -4096.0f && y < 4096.0f)) return;      /* NaN too */
     if (!(w > 0.0f && w < 4096.0f && h > 0.0f && h < 4096.0f && part > 0.0f && part <= 1.0f)) return;
-    bonus_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+    bonus_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                        .x = x, .y = y, .w = w * part, .h = h, .thickness = 1.0f, .u1 = part,
                                        .v1 = 1.0f, .rgba = (rgb << 8) | (u32)(alpha * 255.0f),
                                        .image = image};
@@ -1120,7 +1138,7 @@ static void bonus_emit_uv(u32 list, u32 image, f32 x, f32 y, f32 w, f32 h, f32 u
     if (!image || !(alpha > 0.0f) || alpha > 1.0f) return;
     if (!(x > -4096.0f && x < 4096.0f && y > -4096.0f && y < 4096.0f)) return;
     if (!(w > 0.0f && w < 4096.0f && h > 0.0f && h < 4096.0f)) return;
-    bonus_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+    bonus_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                        .x = x + w * u0, .y = y + h * v0, .w = w * (u1 - u0), .h = h * (v1 - v0),
                                        .thickness = 1.0f, .u0 = u0, .v0 = v0, .u1 = u1, .v1 = v1,
                                        .rgba = 0xFFFFFF00u | (u32)(alpha * 255.0f), .image = image};
@@ -1252,7 +1270,8 @@ static void bonus_draw(u32 list) {
         }
         /* The game draws its hearts small but its current one: the yellow hearts are small but the
          * last, which also takes the glow (the game's big heart lost both: bonus_shrink_current). */
-        f32 small = bonus_small_scale, big = bonus_big_scale;
+        f32 hud_k = bonus_hud_k();
+        f32 small = bonus_small_scale / hud_k, big = bonus_big_scale / hud_k; /* layout scales (bonus_shrink_current) */
         if (bonus_current < 0 || !(small > 0.0f)) {
             small = big = 0.0f;
             u32 measured = first >= 2u && first <= BONUS_SLOTS ? first : BONUS_SLOTS;
@@ -1276,7 +1295,7 @@ static void bonus_draw(u32 list) {
             if (quarters > 4u) quarters = 4u;
             if (i + 1u == count && bonus_current >= 0 && bonus_light[0] && bonus_light_scale > 0.0f) {
                 const volatile f32* light_size = (const volatile f32*)(bonus_light[0] + BONUS_PANE_SIZE);
-                f32 lw = light_size[0] * bonus_light_scale, lh = light_size[1] * bonus_light_scale;
+                f32 lw = light_size[0] * bonus_light_scale / hud_k, lh = light_size[1] * bonus_light_scale / hud_k;
                 bonus_emit(list, bonus_light_image, cx - lw * 0.5f, cy - lh * 0.5f, lw, lh, 1.0f, 0xFFFFFFu,
                            alpha * bonus_light_alpha);
             }
@@ -1294,8 +1313,9 @@ static void bonus_draw(u32 list) {
             bonus_rect(bonus_frame[k], 1, &fx, &fy, &fw, &fh);
             bonus_rect(bonus_fill[k], 1, &gx, &gy, &gw, &gh);
             const volatile f32* m = (const volatile f32*)(bonus_fill[k] + BONUS_PANE_MTX);
-            f32 unit = BONUS_MAGIC_UNIT * m[0];
-            f32 start = fx + fw + 4.0f * m[0];   /* a second meter right after the game's frame */
+            f32 mk = m[0] / bonus_hud_k();       /* layout units to HUD units */
+            f32 unit = BONUS_MAGIC_UNIT * mk;
+            f32 start = fx + fw + 4.0f * mk;     /* a second meter right after the game's frame */
             f32 inner = gx - fx;                 /* the fill's inset in its frame */
             bonus_emit(list, bonus_frame_image, start, fy, unit * (f32)BONUS_MAGIC_MAX + 2.0f * inner, fh, 1.0f, 0x2A2000u,
                        alpha * (220.0f / 255.0f));

@@ -482,14 +482,16 @@ static int dh_project(const float* pos, f32 lift, f32* x, f32* y) {
     wwhd_mDoLib_project((u32)&project_in, (u32)&project_out);
     *x = project_out.x / screen_w * HUD_WIDTH;
     *y = project_out.y / screen_h * HUD_HEIGHT;
-    return *x > -40.0f && *x < HUD_WIDTH + 40.0f && *y > -40.0f && *y < HUD_HEIGHT + 40.0f;
+    int shown = *x > -40.0f && *x < HUD_WIDTH + 40.0f && *y > -40.0f && *y < HUD_HEIGHT + 40.0f;
+    *x = hud_projected_x(*x); /* mod.c: any aspect ratio (0.3.102), drawn anchored at the centre */
+    return shown;
 }
 
 static wwhd_hud_element dh_element;
 
 static void dh_rect(u32 list, f32 x, f32 y, f32 w, f32 h, u32 rgba) {
     if (!(w > 0.0f && h > 0.0f)) return;
-    dh_element = (wwhd_hud_element){.kind = WWHD_HUD_RECT, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+    dh_element = (wwhd_hud_element){.kind = WWHD_HUD_RECT, .anchor = WWHD_HUD_CENTER, /* centred bars (0.3.102) */ .blend = WWHD_HUD_ALPHA,
                                     .x = x, .y = y, .w = w, .h = h, .thickness = 1.0f, .rgba = rgba};
     wwhd_hud_emit(list, &dh_element);
 }

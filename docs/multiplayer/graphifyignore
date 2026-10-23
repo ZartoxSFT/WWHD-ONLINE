@@ -1,0 +1,42 @@
+# graphify: what the knowledge graph leaves out (gitignore syntax)
+
+# toolchains, the released build, third-party code
+jdk-17.0.12/
+javafx/
+WindWakerHD-v0.3.0-windows-x86_64/
+WWHD-ONLINE/runtime/third_party/
+WWHD-ONLINE/cemu/
+
+# build output and caches
+WWHD-ONLINE/build/
+**/target/
+**/.gradle/
+**/out/
+**/__pycache__/
+**/node_modules/
+.metadata/
+**/captures/
+*.elf
+*.exe
+*.dll
+*.class
+*.jar
+
+# game data and anything derived from it (CLAUDE.md rule 9): never read
+WWHD-ONLINE/game
+WWHD-ONLINE/tools/skin/
+*.rpx
+*.wux
+*.wud
+*.key
+*.iso
+*.rvz
+*.szs
+*.sarc
+*.pack
+*.bfres
+*.bflim
+*.arc
+*.dzr
+*.bin
+*.sav

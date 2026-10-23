@@ -1546,6 +1546,7 @@ static void el_update_crowns(const u8* play) {
         wwhd_mDoLib_project((u32)&el_project_in, (u32)&el_project_out);
         f32 x = el_project_out.x / screen_w * HUD_WIDTH, y = el_project_out.y / screen_h * HUD_HEIGHT;
         if (x < -40.0f || x > HUD_WIDTH + 40.0f || y < -40.0f || y > HUD_HEIGHT + 40.0f) continue;
+        x = hud_projected_x(x); /* mod.c: any aspect ratio (0.3.102) */
         f32 scale = 600.0f / depth;
         if (scale < 0.35f) scale = 0.35f;
         if (scale > 1.2f) scale = 1.2f;
@@ -1576,7 +1577,7 @@ static void el_draw_crowns(u32 list) {
         if (!texture) continue;
         f32 w = (e->kind == EL_KIND_CURSED ? 50.0f : 64.0f) * e->crown_scale;
         f32 h = (e->kind == EL_KIND_CURSED ? 44.0f : 48.0f) * e->crown_scale;
-        el_crown_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+        el_crown_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                               .x = e->crown_x - w * 0.5f, .y = e->crown_y - h, .w = w, .h = h,
                                               .thickness = 1, .u1 = 1, .v1 = 1,
                                               .rgba = 0xFFFFFF00u | (u32)(e->crown_alpha * 255.0f),

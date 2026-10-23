@@ -252,6 +252,8 @@ typedef struct mp_session {
     mp_u32 server_player_carry;     /* WWHD extension: the same, from another player */
     mp_u32 client_player_event;     /* WWHD extension (WWClient): a cutscene started here */
     mp_u32 server_player_event;     /* WWHD extension: a cutscene another player started */
+    mp_u32 client_player_pay;       /* WWHD extension (WWClient): rupees paid to a player of the directory */
+    mp_u32 server_player_pay;       /* WWHD extension: rupees another player paid us */
     /* the SaveServer initializer's map (SaveServer.writeMap): runs of {type, length in bytes} */
     mp_u32 save_map_count;
     mp_u8 save_map_type[MP_SAVE_MAP_MAX];
@@ -512,6 +514,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->client_player_revive = s->server_player_revive = MP_NO_ID;
     s->client_player_carry = s->server_player_carry = MP_NO_ID;
     s->client_player_event = s->server_player_event = MP_NO_ID;
+    s->client_player_pay = s->server_player_pay = MP_NO_ID;
     s->save_map_count = 0;
     s->client_init = s->client_change_manager = s->client_leave_manager = MP_NO_ID;
     s->client_create = s->client_update = s->client_remove = MP_NO_ID;
@@ -544,6 +547,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "SERVER_PLAYER_REVIVE", &s->server_player_revive);
         mp_assign_id(name, n, i, "SERVER_PLAYER_CARRY", &s->server_player_carry);
         mp_assign_id(name, n, i, "SERVER_PLAYER_EVENT", &s->server_player_event);
+        mp_assign_id(name, n, i, "SERVER_PLAYER_PAY", &s->server_player_pay);
     }
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -562,6 +566,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
         mp_assign_id(name, n, i, "CLIENT_PLAYER_REVIVE", &s->client_player_revive);
         mp_assign_id(name, n, i, "CLIENT_PLAYER_CARRY", &s->client_player_carry);
         mp_assign_id(name, n, i, "CLIENT_PLAYER_EVENT", &s->client_player_event);
+        mp_assign_id(name, n, i, "CLIENT_PLAYER_PAY", &s->client_player_pay);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_ADD", &s->client_exclusive_add);
         mp_assign_id(name, n, i, "CLIENT_ACTOR_EXCLUSIVE_REMOVE", &s->client_exclusive_remove);
     }
@@ -1949,6 +1954,35 @@ static inline int mp_read_summon(const mp_u8* payload, mp_u32 size, mp_u8* creat
     const char* text = mp_read_string(&r, &n);
     if (!r.ok || r.pos != r.size || *creature >= MP_SUMMON_CREATURES) return 0;
     mp_copy_text(buyer, MP_NAME_MAX + 1, text, n);
+    return 1;
+}
+
+/* ------------------------------------------------------------------ shop payments */
+
+/* WWHD extension (0.3.103): the launcher's shop pays rupees to another player of the directory.
+ * CLIENT_PLAYER_PAY: VLQ the target's directory id, VLQ rupees (1 to MP_PAY_MAX), VLQ the payment's
+ *   number (the launcher's shop.cfg id: a payment delivered twice is credited once), string the
+ *   payer's name.
+ * SERVER_PLAYER_PAY (WWClient.java, to the target only): VLQ rupees, VLQ the number, string the
+ *   payer's name. The payer's game took the rupees already. */
+#define MP_PAY_MAX 5000u /* the biggest wallet */
+
+static inline void mp_write_pay_request(mp_writer* w, mp_u32 target, mp_u32 rupees, mp_u32 number, const char* payer) {
+    mp_write_vlq(w, target);
+    mp_write_vlq(w, rupees);
+    mp_write_vlq(w, number);
+    mp_write_string(w, payer);
+}
+
+/* SERVER_PLAYER_PAY; 0 when malformed (payer: MP_NAME_MAX + 1 bytes, printable). */
+static inline int mp_read_pay(const mp_u8* payload, mp_u32 size, mp_u32* rupees, mp_u32* number, char* payer) {
+    mp_reader r = mp_reader_make(payload, size);
+    *rupees = mp_read_vlq(&r);
+    *number = mp_read_vlq(&r);
+    mp_u32 n;
+    const char* text = mp_read_string(&r, &n);
+    if (!r.ok || r.pos != r.size || *rupees == 0 || *rupees > MP_PAY_MAX) return 0;
+    mp_copy_text(payer, MP_NAME_MAX + 1, text, n);
     return 1;
 }
 

@@ -1464,6 +1464,39 @@ static void test_summon(void) {
     assert(s.server_player_summon == MP_NO_ID && s.client_player_summon == MP_NO_ID);
 }
 
+static void test_pay(void) {
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_pay_request(&w, 300, 50, 7, "Tetra");
+    mp_reader r = mp_reader_make(buffer, w.size);
+    assert(mp_read_vlq(&r) == 300 && mp_read_vlq(&r) == 50 && mp_read_vlq(&r) == 7);
+    mp_u32 n;
+    const char* text = mp_read_string(&r, &n);
+    assert(r.ok && r.pos == r.size && n == 5 && memcmp(text, "Tetra", 5) == 0);
+    mp_writer a = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&a, 1234);
+    mp_write_vlq(&a, 99);
+    mp_write_string(&a, "Medli");
+    mp_u32 answer_size = a.size;
+    mp_u8 answer[64];
+    memcpy(answer, buffer, answer_size);
+    mp_u32 rupees = 0, number = 0;
+    char payer[MP_NAME_MAX + 1];
+    assert(mp_read_pay(answer, answer_size, &rupees, &number, payer) && rupees == 1234 && number == 99 &&
+           strcmp(payer, "Medli") == 0);
+    for (mp_u32 cut = 0; cut != answer_size; ++cut) assert(!mp_read_pay(answer, cut, &rupees, &number, payer));
+    answer[answer_size] = 0;
+    assert(!mp_read_pay(answer, answer_size + 1, &rupees, &number, payer)); /* trailing byte */
+    mp_u8 none[] = {0x00, 0x01, 'A', 0};
+    assert(!mp_read_pay(none, sizeof(none), &rupees, &number, payer)); /* nothing paid */
+    mp_writer big = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_vlq(&big, MP_PAY_MAX + 1);
+    mp_write_vlq(&big, 1);
+    mp_write_string(&big, "A");
+    assert(!mp_read_pay(buffer, big.size, &rupees, &number, payer)); /* more than a wallet */
+    mp_session s = parsed_session(); /* an init without them: not available */
+    assert(s.server_player_pay == MP_NO_ID && s.client_player_pay == MP_NO_ID);
+}
+
 /* The skin (WWHD extension after the particles): a string, kept only when it is a valid id. */
 static void test_skin(void) {
     mp_session s = parsed_session();
@@ -1824,6 +1857,7 @@ int main(void) {
     test_skin();
     test_directory();
     test_summon();
+    test_pay();
     test_death();
     test_sounds();
     test_carry();

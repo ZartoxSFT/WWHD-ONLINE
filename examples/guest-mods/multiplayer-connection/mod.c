@@ -60,6 +60,24 @@
 #define ADDR_mDoLib_screenHeight 0x10058FAC /* m_Do_lib.cpp data screenHeight */
 #define HUD_WIDTH 1280.0f                   /* wwhd_hud base coordinates (TV) */
 #define HUD_HEIGHT 720.0f
+/* 0.3.102: the HUD at any aspect ratio. The game's camera projects with the TV picture's aspect
+ * (the runtime sets View::mAspect, +0xD8 of play + 0x5FA4, d_drawlist.h, every step: aspect.cpp
+ * store_aspect; Hor+ wider, Vert+ taller), and mDoLib_project spreads that picture over the whole
+ * 1280 x 720 screen rectangle. The mod's HUD (guest_hud.h anchored) is 720 units tall; anchored at
+ * the centre, x 640 is the picture's centre and its width is 1280 * aspect / (16/9) units. A point
+ * at x on the 16:9 scale (0..1280) is at 640 + (x - 640) * aspect / (16/9); y does not change. Until
+ * 0.3.101 x was kept as is: names drawn towards the centre on a wider screen, past the sides on a
+ * taller one. Everything placed this way is drawn anchored at the centre. */
+#define HUD_VIEW_ASPECT 0xD8
+#define HUD_ASPECT_16_9 (16.0f / 9.0f)
+static f32 hud_view_aspect(void) {
+    const u8* play = wwhd_play_get();
+    u32 view = play ? *(const volatile u32*)(play + 0x5FA4) : 0; /* PLAY_VIEW_OFFSET */
+    if (view < 0x10000000u || view >= 0x60000000u || (view & 3u)) return HUD_ASPECT_16_9;
+    f32 a = *(const volatile f32*)(view + HUD_VIEW_ASPECT);
+    return a >= 1.0f && a <= 4.0f ? a : HUD_ASPECT_16_9; /* NaN too */
+}
+static f32 hud_projected_x(f32 x) { return HUD_WIDTH * 0.5f + (x - HUD_WIDTH * 0.5f) * (hud_view_aspect() / HUD_ASPECT_16_9); }
 #define MARKER_HEIGHT 140.0f                /* name baseline above the remote Link's feet */
 /* Name fade with the distance between the two Links, in game units (deduced: 1 unit = 1 cm,
  * Link stands about 140 units tall): 0.3.21: opaque up to 7 m, fading out between 7 and 10 m, hidden
@@ -381,6 +399,7 @@ static void handle_init(const unsigned char* item, u32 size) {
 
 static void directory_received(const mp_u8* body, mp_u32 length); /* the launcher map section */
 static void shop_received(const mp_u8* body, mp_u32 length);      /* the launcher shop section */
+static void shop_pay_received(const mp_u8* body, mp_u32 length);  /* the same: rupees paid to us */
 static char shop_notice[64];  /* "X sent you a Moblin!" (shop section), drawn by draw_markers */
 static u32 shop_notice_bytes;
 static int shop_notice_steps;
@@ -515,6 +534,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         directory_received(body, length);
     } else if (id == session.server_player_summon) {
         shop_received(body, length);
+    } else if (id == session.server_player_pay) {
+        shop_pay_received(body, length);
     } else if (id == session.server_player_revive) {
         dh_revived(body, length);
     } else if (id == session.server_player_carry) {
@@ -690,6 +711,7 @@ static void update_markers(double dt, const fopAc_ac_c* local) {
         f32 x = project_out.x / screen_w * HUD_WIDTH;
         f32 y = project_out.y / screen_h * HUD_HEIGHT;
         if (x < -40.0f || x > HUD_WIDTH + 40.0f || y < -40.0f || y > HUD_HEIGHT + 40.0f) continue;
+        x = hud_projected_x(x); /* on the 16:9 scale until here */
 
         /* name height: 0.7 x the 40 px atlas up close, down to 0.25 x far away */
         f32 scale = 400.0f / depth;
@@ -1088,7 +1110,7 @@ static void draw_markers(u32 list) {
         u32 skull = m->dead && names ? sv_dead_icon() : 0;
         if (skull) { /* a ghost: the skull (50 x 44), bottom at the name's baseline */
             f32 h = 44.0f * m->scale * 1.3f, w = 50.0f * m->scale * 1.3f;
-            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                                 .x = m->x - w * 0.5f, .y = m->y - h, .w = w, .h = h, .thickness = 1,
                                                 .u1 = 1, .v1 = 1, .rgba = 0xFFFFFF00u | (u32)(m->opacity * 255.0f),
                                                 .image = skull};
@@ -1111,7 +1133,7 @@ static void draw_markers(u32 list) {
         }
         if (icon) {
             f32 size = 56.0f * m->scale;
-            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_TOP_LEFT, .blend = WWHD_HUD_ALPHA,
+            marker_element = (wwhd_hud_element){.kind = WWHD_HUD_IMAGE, .anchor = WWHD_HUD_CENTER, .blend = WWHD_HUD_ALPHA,
                                                 .x = m->x - size * 0.5f, .y = m->y - size - 34.0f * m->scale, .w = size,
                                                 .h = size, .thickness = 1, .u1 = 1, .v1 = 1,
                                                 .rgba = 0xFFFFFF00u | (u32)(m->opacity * 255.0f), .image = icon};
@@ -1485,7 +1507,7 @@ static double dir_clock;
 static f32 local_sea[2];
 static int local_sea_known;
 /* a teleport to another stage: the stage asked for, then the hop to the target */
-static mp_u32 teleport_target;
+static mp_u32 teleport_target __attribute__((unused)); /* set, read nowhere: kept for clang 23 -Wunused-but-set-global */
 static char teleport_stage[STAGE_NAME_BYTES + 1];
 static unsigned long long teleport_stage_since;
 static int teleport_stage_wait;
@@ -1956,6 +1978,68 @@ static const char* shop_try(const fopAc_ac_c* link, u8* play, u32 item, u32 targ
     return "sent";
 }
 
+/* 0.3.103: the shop's "Pay a player" tab. shop.cfg item SHOP_PAY_ITEM, target (a directory id),
+ * amount (rupees): taken here through the game's rupee counter as every purchase, sent through the
+ * server (CLIENT_PLAYER_PAY, mp_protocol.h) with the shop.cfg id as the payment's number; the other
+ * player's game adds them to its counter (SERVER_PLAYER_PAY, shop_pay_received) and shows
+ * "X sent you N rupees!". The counter stops at that player's wallet (d_meter): what does not fit is
+ * lost, as for any rupee picked up with a full wallet. Answers: "paid", "self" (oneself chosen),
+ * "amount" (0 or more than MP_PAY_MAX), "price", "offline", "server", "no_target", "failed". */
+#define SHOP_PAY_ITEM 100u
+#define SHOP_PAY_SEEN 8
+static u32 shop_paid_pending; /* rupees received, given at the next step of Link */
+static char shop_paid_from[MP_NAME_MAX + 1];
+static u32 shop_paid_seen[SHOP_PAY_SEEN];
+static char shop_paid_seen_from[SHOP_PAY_SEEN][MP_NAME_MAX + 1];
+static u32 shop_paid_seen_next;
+
+static const char* shop_try_pay(u8* play, u32 target, u32 amount, u32 number) {
+    if (!target || (directory_valid && target == directory.self)) return "self";
+    if (!amount || amount > MP_PAY_MAX) return "amount";
+    s32 rupees = (s32)map_rupees() + *(const volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    if (rupees < (s32)amount) return "price";
+    if (state != READY) return "offline";
+    if (session.client_player_pay == MP_NO_ID) return "server";
+    const mp_dir_entry* e = directory_find(target);
+    if (!e) return "no_target";
+    mp_writer body = mp_writer_make(payload, sizeof(payload));
+    mp_write_pay_request(&body, target, amount, number, local_look.name);
+    if (!send_payload(session.client_player_pay, &body)) return "failed";
+    volatile s32* counter = (volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+    *counter = *counter - (s32)amount;
+    wwhd_log_int("multiplayer: shop: rupees paid", (int)amount);
+    wwhd_log(e->name);
+    return "paid";
+}
+
+/* SERVER_PLAYER_PAY: given at the next step of Link (the counter is play's). */
+static void shop_pay_received(const mp_u8* body, mp_u32 length) {
+    mp_u32 rupees, number;
+    char payer[MP_NAME_MAX + 1];
+    if (!mp_read_pay(body, length, &rupees, &number, payer)) {
+        drop_frame("multiplayer: malformed payment skipped", body, length);
+        return;
+    }
+    for (u32 i = 0; i != SHOP_PAY_SEEN; ++i) { /* the same payment delivered twice: credited once */
+        if (shop_paid_seen[i] != number) continue;
+        int same = 1;
+        for (u32 k = 0; k != MP_NAME_MAX + 1; ++k) {
+            if (shop_paid_seen_from[i][k] != payer[k]) same = 0;
+            if (!payer[k]) break;
+        }
+        if (same) {
+            wwhd_log("multiplayer: shop: the same payment received twice, credited once");
+            return;
+        }
+    }
+    shop_paid_seen[shop_paid_seen_next] = number;
+    for (u32 k = 0; k != MP_NAME_MAX + 1; ++k) shop_paid_seen_from[shop_paid_seen_next][k] = payer[k];
+    shop_paid_seen_next = (shop_paid_seen_next + 1) % SHOP_PAY_SEEN;
+    shop_paid_pending += rupees;
+    for (u32 k = 0; k != MP_NAME_MAX + 1; ++k) shop_paid_from[k] = payer[k];
+    wwhd_log_int("multiplayer: shop: rupees received", (int)rupees);
+}
+
 /* CLIENT_WORLD (world_sync.h wd_report); a server without it ignores the sailor's clock. */
 static int wd_send_world(const mp_world* w) {
     if (state != READY || session.client_world == MP_NO_ID) return 0;
@@ -2008,6 +2092,18 @@ static void shop_notice_set(const char* buyer, const char* what) {
 /* Every step of the local Link: the creatures others bought for this player. */
 static void shop_step(const fopAc_ac_c* link, const u8* play) {
     if (shop_notice_steps > 0) --shop_notice_steps;
+    if (shop_paid_pending) { /* rupees another player paid (0.3.103) */
+        u32 paid = shop_paid_pending;
+        shop_paid_pending = 0;
+        volatile s32* counter = (volatile s32*)(play + PLAY_ITEM_RUPEE_COUNT);
+        *counter = *counter + (s32)paid;
+        char what[16];
+        map_out w = {what, 0, sizeof(what) - 1};
+        map_put_uint(&w, paid);
+        map_put(&w, paid == 1 ? " rupee" : " rupees");
+        what[w.size] = 0;
+        shop_notice_set(shop_paid_from, what);
+    }
     if (!shop_gift_count || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
     shop_gift g = shop_gifts[0];
     for (u32 i = 1; i != shop_gift_count; ++i) shop_gifts[i - 1] = shop_gifts[i];
@@ -2286,8 +2382,14 @@ static void map_step(void* link_actor, double dt) {
         } else if (id && id != shop_last_id) {
             shop_last_id = id;
             shop_result_id = id;
-            shop_result = shop_try(link, play, map_cfg_number(shop_text, (u32)got, "item"),
-                                   map_cfg_number(shop_text, (u32)got, "target"));
+            u32 item = map_cfg_number(shop_text, (u32)got, "item");
+            u32 target = map_cfg_number(shop_text, (u32)got, "target");
+            if (item == SHOP_PAY_ITEM) /* the "Pay a player" tab (0.3.103) */
+                shop_result = play[WWHD_PLAY_EVENT_RUNNING_OFFSET]
+                                  ? "busy"
+                                  : shop_try_pay(play, target, map_cfg_number(shop_text, (u32)got, "amount"), id);
+            else
+                shop_result = shop_try(link, play, item, target);
         }
     }
     shop_read_once = 1;

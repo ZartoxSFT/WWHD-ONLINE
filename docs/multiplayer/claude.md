@@ -6,7 +6,8 @@ Porter le mod multijoueur historique de The Legend of Zelda: The Wind Waker
 vers WWHDRecomp sans casser le protocole réseau ni supprimer le travail
 existant.
 
-Lire `context.md` à la racine avant toute modification. Ce fichier contient
+Lire `WWHD-ONLINE/docs/multiplayer/context.md` (chemin depuis la racine WWONLINE) avant toute
+modification. Ce fichier contient
 l'inventaire, les contraintes, les dépendances connues et l'ordre de migration.
 
 ## Contraintes impératives
@@ -176,3 +177,29 @@ travail futur :
 - **Copies d'acteurs portés** : le jeu place un objet porté avec
   `dComIfGp_getPlayer(0)`. Une copie portée par un autre joueur doit tourner
   avec son puppet comme joueur 0 (`actor_sync.h as_swap_in`).
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Mise en place (vérifiée le 2026-10-23, graphify 0.9.94) : le graphe couvre toute la racine WWONLINE
+(WWHD-ONLINE, WindWakerServer, WindWakerClient, mmb, MMBServerCommon), extrait depuis la racine avec
+`graphify extract . --code-only` (analyse AST locale, rien n'est envoyé, environ 5 min). Il est
+rangé dans `WWHD-ONLINE/graphify-out/` ; `WWONLINE/graphify-out` est une jonction Windows vers ce
+dossier, si bien que toutes les commandes graphify se lancent depuis la racine. `graph.json` (environ
+207 Mo, plus que la limite de 100 Mo de GitHub) et le cache ne sont pas poussés : seul
+`GRAPH_REPORT.md` l'est (`graphify-out/.gitignore`). Chaque machine reconstruit le graphe. Les
+exclusions sont dans `WWONLINE/.graphifyignore` (copie suivie : `docs/multiplayer/graphifyignore`).
+Sur une autre machine, depuis WWONLINE : `python -m pip install --user uv`, puis
+`python -m uv tool install --python 3.12 graphifyy` et `python -m uv tool update-shell` ; copier
+`WWHD-ONLINE/docs/multiplayer/graphifyignore` en `.graphifyignore` ; créer la jonction
+(`cmd /c mklink /J graphify-out WWHD-ONLINE\graphify-out`) ; `graphify install --project
+--platform claude` ; `graphify extract . --code-only` ; `graphify cluster-only . --no-viz --no-label`
+pour le rapport. Après une modification de code : `graphify update .`.
+
+Rules:
+- When graphify-out/graph.json exists, run `graphify query "<question>"` before your first grep, search or source-file read for a codebase question, and put this rule in every subagent prompt that explores code. Read raw files only for lines the graph or an earlier read already located. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- A committed graphify-out/graph.json is rewritten whole on every build, so a large diff to it in a pull request is expected. Do not flag it as churn or suggest skipping the graph rebuild or its hooks.

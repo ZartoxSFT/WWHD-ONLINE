@@ -6215,3 +6215,54 @@ et pseudos ensemble sur `chart_menu_open()`, et les pseudos quand la carte marin
 (`chart_menus_to_tv`). **Implémenté** : journal « hud diag » (300 lignes au plus) à chaque changement
 de ce qui arrête le dessin, avec le pas. **À faire** : journal de la dist avec logFile=1.
 Mod 0.3.100 compilé (355 fonctions, 133 hooks), installé instances 1 et 3 ; dist non modifiée.
+
+## 0.3.102 : pseudos et marqueurs bien placés dans tous les formats
+
+Suite de 0.3.101, demandé par l'utilisateur.
+**Vérifié dans les sources** : la caméra projette avec l'aspect de l'image TV (`View::mAspect`,
+réglé par le runtime). `mDoLib_project` étale l'image sur tout le rectangle 1280 × 720 (screenWidth
+/ screenHeight). Le mod gardait x tel quel, sur une échelle 16:9 : en `WWHD_HUD_CENTER`, c'était
+juste en 16:9 seulement. Les pseudos se resserraient vers le centre sur un écran plus large et
+débordaient sur les côtés sur un écran plus haut.
+**Implémenté** (`mod.c hud_view_aspect` / `hud_projected_x`) : x → 640 + (x - 640) × aspect / (16/9),
+y inchangé, test « hors écran » toujours fait sur l'échelle 16:9. Appliqué à :
+- `update_markers` : pseudos, crânes et icônes d'objet tenu, passés en ancrage centre ;
+- `death.h dh_project` : corps, « Your body », compteurs de `door_lock.h`, `heavy.h`, `push_bot.h`
+  et de la porte des touches de couleur, tous dessinés par `name_draw` (déjà au centre). La barre de
+  réanimation (`dh_rect`) passe au centre : elle était décalée à gauche sur un écran large ;
+- `elite.h` : couronnes, crânes et yeux des élites, passés au centre.
+`bonus_hud_k` (0.3.101) lit maintenant l'aspect par `hud_view_aspect`.
+La taille des pseudos ne change pas avec le format.
+**Testé** : calcul de contrôle (points à 10 %, 50 %, 90 % de la largeur) : position du jeu = position
+du mod en 16:9, 16:10, 4:3, 21:9 et 32:9. Mod 0.3.102 compilé (133 hooks), vérifications OK,
+installé instance 1. **Non testé en jeu.**
+Non traité : les éléments fixes ancrés en haut à gauche dans `gale_follow.h` et `save_sync.h`.
+
+## 0.3.103 : shop, onglet « PAY A PLAYER »
+
+Demande : une nouvelle catégorie du shop, payer un joueur en rubis.
+**Constaté** : aucun transfert vers un joueur choisi. `item_share.h` donne les rubis ramassés à
+tous. `CLIENT_PLAYER_SUMMON` ne porte qu'un u8 (< 32, refusé au-delà par le serveur et le mod).
+**Implémenté** :
+- protocole (`mp_protocol.h`, extension WWHD) : `CLIENT_PLAYER_PAY` (VLQ id annuaire de la cible,
+  VLQ rubis 1 à `MP_PAY_MAX` 5000, VLQ numéro du paiement, chaîne nom du payeur) et
+  `SERVER_PLAYER_PAY` (VLQ rubis, VLQ numéro, chaîne nom), ids par nom comme les autres
+  extensions. Un serveur sans ces paquets → réponse « server », rien n'est débité ;
+- serveur (`WWClient.receivePay`, `ActorFilter.PacketTypesList.SERVER_PLAYER_PAY`) : vérifie le
+  montant et le nom, relaie à la seule cible, journal « X paid N rupees to … » ;
+- mod (`mod.c shop_try_pay` / `shop_pay_received`) : `shop.cfg` item 100 (`SHOP_PAY_ITEM`),
+  `target`, `amount`. Débit par le compteur différé (`PLAY_ITEM_RUPEE_COUNT`) après l'envoi
+  réussi. Crédit au pas suivant de Link par le même compteur, notification « X sent you N
+  rupees! ». Le numéro (= id de `shop.cfg`) et le nom du payeur évitent un double crédit si le
+  paquet arrive deux fois (8 derniers gardés ; même cause possible que les summons doublés de
+  0.2.99). Réponses : paid, self, amount, price, busy, offline, server, no_target, failed ;
+- launcher (`LauncherUI`) : 4e onglet PAY A PLAYER : joueur (les autres seulement), montant (champ
+  numérique, +10/+50/+100/+500, CLEAR), PAY actif seulement si le jeu tourne, un joueur est choisi
+  et le montant est entre 1 et min(5000, rubis possédés) ; messages pour chaque réponse.
+**Limite** : le compteur du receveur s'arrête à la taille de sa bourse (`d_meter`). Le surplus est
+perdu, comme un rubis ramassé bourse pleine. Le payeur ne connaît pas la bourse de l'autre.
+**Testé** : `mp_protocol_test` OK (nouveau `test_pay` : écriture, lecture, troncatures, octet en
+trop, 0 et > 5000 refusés, ids absents par défaut) ; mod 0.3.103 compilé (133 hooks),
+vérifications OK, installé instance 1 ; `javac` des sources de WindWakerServer OK contre
+`mmb/target/classes` et `MMBServerCommon/target/classes`. **Non testé en jeu** ni avec un serveur
+réel : le serveur doit être recompilé et relancé.
