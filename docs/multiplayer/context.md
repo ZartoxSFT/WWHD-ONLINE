@@ -6200,3 +6200,18 @@ Push de `ZeldaWWHDRecomp` (mod 0.3.77-0.3.99, ce fichier dans docs/multiplayer, 
 Laissés de côté comme avant : les caches `.gradle` et `tools/skin/*` (skins tirés des fichiers du jeu).
 `WindWakerServer` (serveur, launcher : morts, vie partagée, images, 0,5 %) n'est dans aucun dépôt :
 non poussé.
+
+## 0.3.100 : clignotement du HUD sur la dist (enquête)
+
+Signalé : sur la dist (wwhd.exe du 22 octobre, build/rel), cœurs jaunes et pseudos « clignotent »
+toutes les ~3 s ; jamais sur les instances 1 et 3 (exe de dev du 21 octobre). Vérifié :
+- aucune erreur HUD dans le gestionnaire de mods (la liste du mod n'est pas rejetée) ;
+- même code runtime entre les deux exe (aucun fichier de runtime/src modifié entre eux) ;
+- mettre le mod à jour, interpFps 60, échelle 1.0 : sans effet (tests de l'utilisateur) ;
+- la dist n'écrit pas de journal complet : `captures/wwhd.log` seulement avec Graphics > « Write a
+  log file » (logFile=1, main.cpp start_log_file).
+Réglages différents : la dist n'a pas `drcMode=window` (instance 1 oui). Le mod coupe cœurs jaunes
+et pseudos ensemble sur `chart_menu_open()`, et les pseudos quand la carte marine est vue sur la TV
+(`chart_menus_to_tv`). **Implémenté** : journal « hud diag » (300 lignes au plus) à chaque changement
+de ce qui arrête le dessin, avec le pas. **À faire** : journal de la dist avec logFile=1.
+Mod 0.3.100 compilé (355 fonctions, 133 hooks), installé instances 1 et 3 ; dist non modifiée.

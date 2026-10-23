@@ -1176,11 +1176,25 @@ static void bonus_slot_center(u32 j, u32 first, f32* x, f32* y) {
     *y = y0 + sy * (f32)col + ry * (f32)row;
 }
 
+/* 0.3.100: why the yellow hearts are not drawn this step (mod.c hud_diag): 0 drawn, 1 nothing to
+ * draw, 2 no Link this step, 3 the save not ready, 4 an event, 5 the HUD hidden, 6 a menu, 7 the
+ * HUD layout not read */
+static u32 bonus_skip;
 static void bonus_draw(u32 list) {
-    if (!bonus_loaded || (!bonus_hearts && !bonus_magic) || !bonus_link_alive() || !bonus_save_ready()) return;
+    bonus_skip = 1;
+    if (!bonus_loaded || (!bonus_hearts && !bonus_magic)) return;
+    bonus_skip = 2;
+    if (!bonus_link_alive()) return;
+    bonus_skip = 3;
+    if (!bonus_save_ready()) return;
     const u8* play = wwhd_play_get();
-    if (!play || play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || hud_hidden || chart_menu_open()) return;
+    bonus_skip = 4;
+    if (!play || play[WWHD_PLAY_EVENT_RUNNING_OFFSET]) return;
+    bonus_skip = hud_hidden ? 5 : 6;
+    if (hud_hidden || chart_menu_open()) return;
+    bonus_skip = 7;
     if (!bonus_layout_valid()) return;
+    bonus_skip = 0;
     unsigned long long epoch = wwhd_hud_epoch();
     u32 source = bonus_texture_of(bonus_heart[0]);
     if (epoch != bonus_image_epoch || source != bonus_image_source) {

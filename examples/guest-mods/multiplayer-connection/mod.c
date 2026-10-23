@@ -1030,10 +1030,32 @@ static void pb_draw(u32 list); /* push_bot.h, included below */
 static void dl_draw(u32 list); /* door_lock.h, included below */
 static void gp_draw(u32 list); /* golden_pig.h, included below */
 
+/* 0.3.100: the HUD flickering every ~3 s on the dist (yellow hearts and names together), not on
+ * the instances, no HUD error in the mod manager: each change of what stops this mod's drawing is
+ * logged with its step (300 lines at most): bit 0 the Start menu (chart_menu_open), bit 1 the sea
+ * chart shown on the TV (the names replaced by the chart's marks), bit 2 an event, bit 3 the HUD
+ * hidden, bits 4-7 bonus.h bonus_skip. */
+static u32 hud_diag_state = 0xFFFFFFFFu, hud_diag_lines;
+static void hud_diag(u32 state_now) {
+    if (state_now == hud_diag_state || hud_diag_lines >= 300) return;
+    hud_diag_state = state_now;
+    ++hud_diag_lines;
+    wwhd_log_hex("multiplayer: hud diag: what stops the drawing now (menu 1, TV chart 2, event 4, hidden 8, yellow x16)", state_now);
+    wwhd_log_int("multiplayer: hud diag:   at step", (int)(u32)wwhd_logic_step());
+}
+
 static void draw_markers(u32 list) {
     chart_view v;
     sv_draw(list); /* what the other players got, bottom left */
     bonus_draw(list); /* the yellow hearts and magic, next to the game's (bonus.h) */
+    {
+        const u8* p = wwhd_play_get();
+        chart_view dv;
+        u32 s = (chart_menu_open() ? 1u : 0u) |
+                (chart_menus_to_tv() && (chart_on_screen(&dv, 1) || chart_grid_on_screen(&dv, 1)) ? 2u : 0u) |
+                (!p || p[WWHD_PLAY_EVENT_RUNNING_OFFSET] ? 4u : 0u) | (hud_hidden ? 8u : 0u) | (bonus_skip << 4);
+        hud_diag(s);
+    }
     if (!chart_menu_open()) el_draw_crowns(list); /* the elites' crowns, not over the Start menu */
     if (chart_menus_to_tv() && chart_menu_open() && dmap_shown()) draw_dungeon_players(list, 1.0f);
     if (chart_menus_to_tv() && (chart_on_screen(&v, 1) || chart_grid_on_screen(&v, 1))) {
