@@ -80,6 +80,17 @@ enum { IDLE, WAIT_INIT, READY, FAILED };
 #define RS_SAMPLES 6
 #define RS_DELAY 0.075            /* about two sends (ActorPlayerSync, at most 30 a second) */
 #define RS_SNAP 1500.0f
+/* 0.3.77: a sample's time is not its arrival. Each comes from one step of its sender (ActorPlayerSync
+ * at most once a step, PLAYER_PERIOD 1/30 s), but the server holds it until its own loop
+ * (SyncedActorComponent.onRun) and this game reads the network once a step: two often arrived in
+ * the same step, then none, and with the same time the puppet jumped between them ("small
+ * teleports", seen on the GameCube version too). The time between two samples is now a whole
+ * number of sender steps (the arrival gap rounded), pulled slowly (RS_DRIFT) towards the arrival
+ * clock and never more than one step ahead of it; a long pause (a player standing still sends
+ * nothing) starts again from the arrival. */
+#define RS_SENDER_PERIOD (1.0 / 30.0)
+#define RS_DRIFT 0.05
+#define RS_PAUSE_STEPS 8
 
 typedef struct remote_player {
     int active;
@@ -89,8 +100,9 @@ typedef struct remote_player {
     int has_display;
     mp_transform display;   /* shown: interpolated between the received ones (0.3.76) */
     mp_transform hist[RS_SAMPLES]; /* the last received places, oldest first */
-    double hist_t[RS_SAMPLES];     /* their arrival times (rs_clock) */
+    double hist_t[RS_SAMPLES];     /* their times, in sender steps (0.3.77, rs_push) */
     int hist_n;
+    double last_arrival;           /* rs_clock when the newest arrived */
     int has_look;
     mp_player_look look;    /* ActorPlayerSync: tunic colours, map cursor */
 } remote_player;
@@ -106,6 +118,21 @@ static void rs_push(remote_player* r, const mp_transform* t) {
             r->has_display = 0;
         }
     }
+    double time = rs_clock;
+    if (r->hist_n) {
+        double gap = rs_clock - r->last_arrival;
+        double steps = gap / RS_SENDER_PERIOD;
+        int k = (int)(steps + 0.5);
+        if (k < 1) k = 1;
+        if (k <= RS_PAUSE_STEPS) { /* moving: whole sender steps after the last one */
+            time = r->hist_t[r->hist_n - 1] + (double)k * RS_SENDER_PERIOD;
+            time += (rs_clock - time) * RS_DRIFT;
+            if (time > rs_clock + RS_SENDER_PERIOD) time = rs_clock + RS_SENDER_PERIOD;
+            if (time < r->hist_t[r->hist_n - 1] + RS_SENDER_PERIOD * 0.5)
+                time = r->hist_t[r->hist_n - 1] + RS_SENDER_PERIOD * 0.5;
+        }
+    }
+    r->last_arrival = rs_clock;
     if (r->hist_n == RS_SAMPLES) {
         for (int i = 1; i != RS_SAMPLES; ++i) {
             r->hist[i - 1] = r->hist[i];
@@ -114,7 +141,7 @@ static void rs_push(remote_player* r, const mp_transform* t) {
         --r->hist_n;
     }
     r->hist[r->hist_n] = *t;
-    r->hist_t[r->hist_n] = rs_clock;
+    r->hist_t[r->hist_n] = time;
     ++r->hist_n;
 }
 
@@ -190,13 +217,9 @@ static double update_clock;
 static double log_clock;
 static remote_player remotes[MAX_REMOTES];
 static int cy_is_carrier(mp_u32 uid); /* carry.h: the player carrying the local Link (0.3.72) */
+static void cy_note_hands(u32 puppet); /* carry.h (0.3.78) */
 
-/* actor_sync.h (0.3.65): the local player and the connected others, for the barrels per player. */
-static int mp_player_count(void) {
-    int n = 1;
-    for (int i = 0; i != MAX_REMOTES; ++i) n += remotes[i].active != 0;
-    return n;
-}
+static int mp_player_count(void); /* the players on the server (after the directory) */
 static int area_settle;
 static mp_player_look local_look; /* colours and cursor from the launcher/options */
 static mp_player_look sent_look;  /* last ActorPlayerSync sent, with item and proc */
@@ -220,6 +243,10 @@ static int hud_hidden;    /* launcher "hide the HUD" (hide_hud), else the option
  * on screen. The port's own hook on it (story notebook) stays outside the mods' layer. */
 static int chart_menu_open(void);
 static void gf_draw(u32 list); /* gale_follow.h */
+static void ck_draw(u32 list); /* color_key.h (0.3.81) */
+static void sr_draw(u32 list); /* ship_ride.h (0.3.92) */
+static void ck_debug_spawn(void);
+static void ck_step(void* link_actor, double dt);
 WWHD_GAME_ORIGINAL(0x02715CA0, void, hud_screens_draw_original, (u32 self, u32 info));
 WWHD_REPLACE(0x02715CA0, void, hud_screens_draw, (u32 self, u32 info)) {
     const u8* play = wwhd_play_get();
@@ -268,6 +295,13 @@ static void read_transform(const fopAc_ac_c* actor, mp_transform* t) {
     t->rot[0] = actor->shape_angle.x;
     t->rot[1] = actor->shape_angle.y;
     t->rot[2] = actor->shape_angle.z;
+    /* 0.3.90: Link's model turns by shape_angle.y + m34EC (daPy_lk_c::setWorldMatrix, decomp
+     * d_a_player_main_03.cpp, out of ModeFlg_CLIMB 0x10000), m34EC +0x6934. The Hurricane Spin
+     * (procCutRoll 02441DC0, d_a_player_main_08.cpp) and the spin of some jumps turn only m34EC
+     * (-0x36B0 a step), shape_angle.y not before the end: the puppets did not turn. Sent in the
+     * heading, a puppet's m34EC staying 0. Only the local Link comes here. */
+    const daPy_lk_c* l = (const daPy_lk_c*)actor;
+    if (!(l->mModeFlg & 0x10000u)) t->rot[1] = (s16)(actor->shape_angle.y + l->m34EC);
 }
 
 static int same_transform(const mp_transform* a, const mp_transform* b) {
@@ -293,10 +327,12 @@ static remote_player* find_remote(mp_u32 uid, int create) {
 }
 
 static void cy_reset(void); /* carry.h */
+static void sr_reset(void); /* ship_ride.h */
 
 static void clear_area_state(void) {
     for (int i = 0; i != MAX_REMOTES; ++i) remotes[i].active = markers[i].visible = 0;
     cy_reset();
+    sr_reset();
     puppet_clear_all();
     ship_puppet_clear_all();
     swing_clear_all();
@@ -337,6 +373,7 @@ static void handle_init(const unsigned char* item, u32 size) {
     wwhd_log_int("multiplayer: server dynamic scaling", session.dynamic_scaling);
     wwhd_log_int("multiplayer: server elite chance (percent)", (int)session.elite_chance);
     wwhd_log_int("multiplayer: server pvp", session.pvp);
+    wwhd_log_int("multiplayer: server shared life", session.shared_life);
     if (!session.factories_complete) wwhd_log("multiplayer: too many ActorSync factories, placed actors stay local");
     state = READY;
     sv_open(&session); /* the SaveServer map came with the init */
@@ -349,6 +386,29 @@ static u32 shop_notice_bytes;
 static int shop_notice_steps;
 static mp_directory directory; /* the server's player directory (launcher map section) */
 static int directory_valid;
+
+/* actor_sync.h (barrels per player): the players connected to the server. 0.3.65 counted the
+ * remote players known here, rebuilt after each area change: an area was made before they came
+ * back, and the second player into an area had one barrel. 0.3.78: the server's directory (every
+ * player, whatever their area); before it (the game's first area loads before the connection) the
+ * count of the last directory, kept in "players_count.bin". */
+static int mp_players_known;
+static void mp_players_note(int n) {
+    if (n < 1 || n == mp_players_known) return;
+    mp_players_known = n;
+    wwhd_file_write("players_count.bin", &mp_players_known, sizeof(mp_players_known));
+}
+static int mp_player_count(void) {
+    if (directory_valid && directory.count) return (int)directory.count;
+    if (!mp_players_known) {
+        int kept = 0;
+        if (wwhd_file_read("players_count.bin", &kept, sizeof(kept)) == (s32)sizeof(kept) && kept > 0 && kept <= 32)
+            mp_players_known = kept;
+    }
+    int n = 1;
+    for (int i = 0; i != MAX_REMOTES; ++i) n += remotes[i].active != 0;
+    return n > mp_players_known ? n : mp_players_known;
+}
 
 /* elite.h: a remote player's room, from the directory entry of the same name (the directory has no
  * PlayerPuppet uid); 0 when unknown. */
@@ -469,8 +529,8 @@ static void handle_frame(const unsigned char* item, u32 size) {
         wd_received(body, length);
     } else if (id == session.server_mutators) {
         mp_u32 multiplier, elite;
-        int randomizer, scaling, pvp;
-        if (!mp_read_mutators_ex(body, length, &multiplier, &randomizer, &scaling, &elite, &pvp)) {
+        int randomizer, scaling, pvp, shared_life;
+        if (!mp_read_mutators_life(body, length, &multiplier, &randomizer, &scaling, &elite, &pvp, &shared_life)) {
             drop_frame("multiplayer: malformed mutators skipped", body, length);
             return;
         }
@@ -479,6 +539,7 @@ static void handle_frame(const unsigned char* item, u32 size) {
         session.dynamic_scaling = scaling; /* elite.h: the actors follow at their next execute */
         session.elite_chance = elite;      /* for the enemies made from now on */
         session.pvp = pvp;                 /* pvp.h */
+        session.shared_life = shared_life; /* life_share.h */
         as_mutators_changed(); /* the loaded area follows at the next step */
         wwhd_log_int("multiplayer: server mutators changed, enemy multiplier", (int)multiplier);
     }
@@ -987,6 +1048,8 @@ static void draw_markers(u32 list) {
     dl_draw(list); /* the players a locked door waits for (door_lock.h) */
     gp_draw(list); /* the Golden Pig on the HUD's D-pad (golden_pig.h) */
     gf_draw(list); /* another player's Ballad of Gales: hold A to follow (gale_follow.h) */
+    sr_draw(list); /* the prompt to board a friend's ship (ship_ride.h) */
+    ck_draw(list); /* the colour keys: the count left of the rupees, the boss door's (color_key.h) */
     if (shop_notice_steps > 0 && !chart_menu_open()) /* a creature another player sent */
         name_draw(list, CHART_LAYOUT_W * 0.5f, 120.0f, shop_notice, shop_notice_bytes, 0xF9C74Fu, 0.6f,
                   shop_notice_steps < 30 ? (f32)shop_notice_steps / 30.0f : 1.0f);
@@ -1308,7 +1371,7 @@ static int sea_square_of(f32 x, f32 z) {
 WWHD_GAME_FUNC(0x025B9810, void, teleport_set_restart, (u32 restart, u32 position, u32 angle, u32 room));
 
 static double map_clock;
-static char map_text[4096];
+static char map_text[6144]; /* 0.3.92: + the deaths' lines */
 static char teleport_text[256];
 static int teleport_read_once;
 static u32 teleport_last_id;
@@ -1320,6 +1383,8 @@ typedef struct map_out {
     char* data;
     u32 size, capacity;
 } map_out;
+
+static void dc_put(map_out* o); /* death_count.h (0.3.92) */
 
 static void map_put(map_out* o, const char* s) {
     while (*s && o->size + 1 < o->capacity) o->data[o->size++] = *s++;
@@ -1512,6 +1577,7 @@ static void directory_received(const mp_u8* body, mp_u32 length) {
         }
     }
     directory = incoming_directory;
+    mp_players_note((int)directory.count);
     if (!directory_valid) wwhd_log_int("multiplayer: player directory received, players", (int)directory.count);
     directory_valid = 1;
 }
@@ -1553,6 +1619,17 @@ static int teleport_pay(u8* play) {
 /* target: a directory id (the server has the directory), else a remote player of the area by uid
  * (its room unknown: Link's own, in the same stage). The stage is entered as the game's respawn
  * does (teleport_go), then teleport_stage_step reports the arrival. */
+/* 0.3.82: the inside of Beedle's shop ships (Obshop, Abship). Entered through the ship, the game notes
+ * where it was (dStage_changeSceneExitId 025C38B8: dComIfGp mIkadaShipBeforeRoomId +0x4A76, the ship's
+ * id, Link's place); the exit to the sea (exit id 0x3D) asserts that room < 64 and the sea's player
+ * placement (d_stage_2.cpp) asserts the ship is found in it. Entered by a teleport or the last place,
+ * none of that is set (0xFF): the exit stopped the game (crash 2026-10-22, d_stage.cpp 5179). No one
+ * is sent there; there is no right value to make up. */
+static int ship_inside_stage(const char* s) {
+    return (s[0] == 'O' && s[1] == 'b' && s[2] == 's' && s[3] == 'h' && s[4] == 'o' && s[5] == 'p' && !s[6]) ||
+           (s[0] == 'A' && s[1] == 'b' && s[2] == 's' && s[3] == 'h' && s[4] == 'i' && s[5] == 'p' && !s[6]);
+}
+
 static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     if (state != READY) return "offline";
     if (play[WWHD_PLAY_EVENT_RUNNING_OFFSET] || teleport_stage_wait) return "busy";
@@ -1563,6 +1640,7 @@ static const char* teleport_try(fopAc_ac_c* link, u8* play, mp_u32 target) {
     if (e) {
         if (e->id == directory.self || !e->stage[0] || e->room < 0) return "no_target";
         if (e->flags & MP_DIR_DEAD) return "dead";
+        if (ship_inside_stage(e->stage) && !map_same_stage(e->stage, here)) return "ship";
         /* on the Great Sea, or in an island's stage with its last place at sea: that square */
         int at_sea = e->stage[0] == 's' && e->stage[1] == 'e' && e->stage[2] == 'a' && !e->stage[3];
         int square = at_sea ? sea_square_of(e->pos[0], e->pos[2])
@@ -2120,6 +2198,7 @@ static void debug_step(u8* play) {
         if (debug_cfg_value(debug_text, (u32)got, "skinbots", &v) && !v) sb_request_clear();
     }
     debug_spawn(play, debug_text, (u32)got); /* SUMMON AN ACTOR */
+    if (debug_cfg_value(debug_text, (u32)got, "color_key", &v) && v) ck_debug_spawn(); /* SPAWN MY COLOUR KEY */
     if (debug_cfg_value(debug_text, (u32)got, "reset_room", &v) && v) { /* the launcher's RESET THIS ROOM */
         const char* r = room_reset_try(play);
         if (r[0] != 'o') wwhd_log("multiplayer: room not reset:");
@@ -2281,6 +2360,7 @@ static void map_step(void* link_actor, double dt) {
         map_put(&o, shop_result);
         map_put(&o, "\n");
     }
+    dc_put(&o); /* every player's deaths (death_count.h) */
     wwhd_file_write("players.txt", map_text, o.size);
 }
 
@@ -2438,6 +2518,10 @@ static void multiplayer_connection_step(void* link) {
 #include "switch_sync.h" /* the dungeon and room switches shared with the room */
 #include "last_place.h" /* back where one left the server */
 #include "gale_follow.h" /* follow another player's Ballad of Gales */
+#include "color_key.h" /* the players' colour keys for the boss door (0.3.81) */
+#include "ship_ride.h" /* a passenger on a friend's ship (0.3.92) */
+#include "death_count.h" /* every player's deaths, for the launcher (0.3.92) */
+#include "life_share.h" /* the server mutator "shared life" (0.3.92) */
 #include "heap_grow.h" /* bigger game heaps for the skins of many players */
 
 WWHD_GAME_ORIGINAL(WWHD_ADDR_daPy_Execute, s32, daPy_Execute_original, (void* i_this));
@@ -2457,20 +2541,27 @@ WWHD_REPLACE(WWHD_ADDR_daPy_Execute, s32, multiplayer_daPy_Execute, (void* i_thi
     dh_note_link(i_this);    /* its death and revive (death.h) */
     el_link_step(i_this); /* an electric elite's shock, given in Link's own execute (elite.h) */
     cy_before(i_this);    /* carried: in its carrier's hands before the game moves it (carry.h) */
+    sr_before(i_this);    /* a passenger: on its friend's ship (ship_ride.h) */
     s32 result = daPy_Execute_original(i_this);
+    anim_rate_check(i_this); /* an animation's speed set by a proc, not by a call (anim_sync.h) */
     el_link_after(i_this); /* a cursed elite near: the hit's invincibility cut (elite.h) */
     skin_leave(skin);
     cy_step(i_this); /* before the place is sent */
+    sr_after(i_this);
     ev_step(i_this); /* a cutscene of another player of the room (event_sync.h) */
     share_step(i_this); /* the item held up, the pigs' anger (item_share.h) */
     if ((u32)i_this == dh_link && !puppet_is(i_this)) lp_step((const fopAc_ac_c*)i_this, wwhd_play_get());
     if ((u32)i_this == dh_link && !puppet_is(i_this)) gf_step(i_this); /* Ballad of Gales (gale_follow.h) */
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) ck_step(i_this, wwhd_logic_dt()); /* colour keys (color_key.h) */
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) dc_step(); /* deaths counted (death_count.h) */
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) ls_step(); /* one life for all (life_share.h) */
     multiplayer_connection_step(i_this);
     dh_step(i_this, wwhd_logic_dt());
     hv_step(i_this, wwhd_logic_dt());
     pb_step(i_this);
     sb_step(i_this);
     dl_step(wwhd_logic_dt());
+    if ((u32)i_this == dh_link && !puppet_is(i_this)) dl_door_step(i_this); /* through a door another player unlocked */
     gp_step(i_this, wwhd_logic_dt());
     return result;
 }

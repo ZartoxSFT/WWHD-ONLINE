@@ -142,8 +142,9 @@ static void test_init(void) {
 /* The alive byte of the death block (the last one a player component ends with): checked, then
  * dropped, so the bytes before it are tested as a sender before the death block wrote them. */
 static void drop_alive(mp_writer* w) {
-    assert(w->ok && w->size && w->data[w->size - 1] == 0x00);
-    --w->size;
+    /* 0.3.79: the sounds' count after it, dropped too (a sender before both) */
+    assert(w->ok && w->size >= 2 && w->data[w->size - 1] == 0x00 && w->data[w->size - 2] == 0x00);
+    w->size -= 2;
 }
 
 static const mp_transform kTransform = {{1.0f, 2.0f, -1.0f}, {0x1234, -1, 0}};
@@ -239,7 +240,16 @@ static void test_placed_actors(void) {
         static const mp_u8 fight[] = {0x81, 0x00, 0x00, 0x05, 0x01}, extra[] = {0x81, 0x00, 0x00, 0x05, 0x01, 0x00};
         assert(mp_read_mutators_ex(fight, sizeof(fight), &m, &random, &scaling, &elite, &pvp) && pvp == 1 &&
                elite == 5);
-        assert(!mp_read_mutators_ex(extra, sizeof(extra), &m, &random, &scaling, &elite, &pvp));
+        /* 0.3.92: the shared life byte after the pvp one (extra: 0); nothing after it */
+        int life = 7;
+        static const mp_u8 shared[] = {0x81, 0x00, 0x00, 0x05, 0x01, 0x01},
+                           too_long[] = {0x81, 0x00, 0x00, 0x05, 0x01, 0x01, 0x00};
+        assert(mp_read_mutators_ex(extra, sizeof(extra), &m, &random, &scaling, &elite, &pvp) && pvp == 1);
+        assert(mp_read_mutators_life(extra, sizeof(extra), &m, &random, &scaling, &elite, &pvp, &life) && life == 0);
+        assert(mp_read_mutators_life(shared, sizeof(shared), &m, &random, &scaling, &elite, &pvp, &life) && life == 1 &&
+               pvp == 1 && elite == 5);
+        assert(mp_read_mutators_life(fight, sizeof(fight), &m, &random, &scaling, &elite, &pvp, &life) && life == 0);
+        assert(!mp_read_mutators_life(too_long, sizeof(too_long), &m, &random, &scaling, &elite, &pvp, &life));
         assert(mp_read_mutators(ext, sizeof(ext), &m, &random) && m == 3);
     }
     assert(s.factories_complete && s.factory_count == 4); /* Default, Bk, Spawned, Pl */
@@ -462,6 +472,7 @@ static void test_client_packets(void) {
         0x00,                                     /* WWHD extension: no particles */
         0x00,                                     /* WWHD extension: no skin */
         0x00,                                     /* WWHD extension: alive */
+        0x00,                                     /* WWHD extension: no sounds (0.3.79) */
     };
     expect_bytes(&payload, create, sizeof(create));
 
@@ -495,6 +506,7 @@ static void test_client_packets(void) {
         0x00,                                     /* no particles */
         0x00,                                     /* no skin */
         0x00,                                     /* alive */
+        0x00,                                     /* no sounds */
     };
     expect_bytes(&payload, look_update, sizeof(look_update));
 
@@ -503,12 +515,13 @@ static void test_client_packets(void) {
     payload = mp_writer_make(buffer, sizeof(buffer));
     mp_write_look_update(&payload, &s, 300, 5, &red);
     assert(payload.ok && payload.size == sizeof(look_update) + 5);
-    assert(memcmp(payload.data + sizeof(look_update) - 8, "Tetra", 6) == 0);
-    assert(payload.data[payload.size - 7] == 0x00 && payload.data[payload.size - 6] == 0x00 &&
+    assert(memcmp(payload.data + sizeof(look_update) - 9, "Tetra", 6) == 0);
+    assert(payload.data[payload.size - 8] == 0x00 && /* no sounds (0.3.79) */
+           payload.data[payload.size - 7] == 0x00 && payload.data[payload.size - 6] == 0x00 &&
            payload.data[payload.size - 5] == 0x00 && payload.data[payload.size - 4] == 0x00 &&
            payload.data[payload.size - 3] == 0x00 && payload.data[payload.size - 2] == 0x00 &&
            payload.data[payload.size - 1] == 0x00);
-    /* no ship, no extras, no swings, no strikes, no particles, no skin, alive */
+    /* no ship, no extras, no swings, no strikes, no particles, no skin, alive, no sounds */
 
     /* without an ActorBaseSync in the factory an update cannot be encoded */
     mp_session no_base = s;
@@ -727,6 +740,7 @@ static void write_player_by_hand(mp_writer* w, const mp_player_look* l) {
     mp_write_u8(w, 0);                                    /* WWHD extension: no particles */
     mp_write_u8(w, 0);                                    /* WWHD extension: no skin */
     mp_write_u8(w, 0);                                    /* WWHD extension: alive */
+    mp_write_u8(w, 0);                                    /* WWHD extension: no sounds (0.3.79) */
 }
 
 static void sample_events(mp_anim_events* e) {
@@ -1266,6 +1280,57 @@ static void test_save_sync(void) {
 
 /* The launcher's shop: a creature bought for another player (CLIENT_PLAYER_SUMMON) and the one
  * received (SERVER_PLAYER_SUMMON, WWClient.receiveSummon). */
+/* 0.3.79: Link's sounds after the death block (anim_sync.h): written, read back, a sender before them. */
+static void test_sounds(void) {
+    static mp_u8 buffer[2048];
+    static mp_anim_events e, got_e;
+    mp_player_look l = mp_player_look_default(), got;
+    mp_anim_events_clear(&e);
+    e.sound[0].kind = MP_SOUND_VOICE;
+    e.sound[0].id = 0x5A01;
+    e.sound[1].kind = MP_SOUND_SWORD;
+    e.sound[1].id = 0x0812;
+    e.sound_count = 2;
+    assert(!mp_anim_events_empty(&e));
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_player_events(&w, &l, &e);
+    static const mp_u8 tail[] = {0x00, 0x02, 0x00, 0x00, 0x00, 0x5A, 0x01, 0x02, 0x00, 0x00, 0x08, 0x12};
+    assert(w.ok && memcmp(w.data + w.size - sizeof(tail), tail, sizeof(tail)) == 0);
+    mp_reader r = mp_reader_make(buffer, w.size);
+    mp_read_player_events(&r, &got, &got_e);
+    assert(r.ok && r.pos == r.size && got_e.sound_count == 2);
+    assert(got_e.sound[0].kind == MP_SOUND_VOICE && got_e.sound[0].id == 0x5A01);
+    assert(got_e.sound[1].kind == MP_SOUND_SWORD && got_e.sound[1].id == 0x0812);
+    /* a sender before the sounds: none */
+    r = mp_reader_make(buffer, w.size - (sizeof(tail) - 1));
+    mp_read_player_events(&r, &got, &got_e);
+    assert(r.ok && r.pos == r.size && got_e.sound_count == 0);
+    puts("sounds ok");
+}
+
+/* 0.3.90: an animation speed set by Link's code goes as one more single animation, index + 0x100
+ * (anim_sync.h ANIM_RATE_FLAG), the frame as its start, the loop frame as its end: both ways. */
+static void test_rate_event(void) {
+    static mp_u8 buffer[2048];
+    static mp_anim_events e, got_e;
+    mp_player_look l = mp_player_look_default(), got;
+    mp_anim_events_clear(&e);
+    e.single[0].anm = 0x100 | 0x41;
+    e.single[0].rate = -0.75f;
+    e.single[0].start = 12.5f;
+    e.single[0].end = 17;
+    e.single[0].morf = 0.0f;
+    e.single_count = 1;
+    mp_writer w = mp_writer_make(buffer, sizeof(buffer));
+    mp_write_player_events(&w, &l, &e);
+    mp_reader r = mp_reader_make(buffer, w.size);
+    mp_read_player_events(&r, &got, &got_e);
+    assert(w.ok && r.ok && r.pos == r.size && got_e.single_count == 1);
+    assert(got_e.single[0].anm == 0x141 && got_e.single[0].rate == -0.75f && got_e.single[0].start == 12.5f);
+    assert(got_e.single[0].end == 17 && got_e.single[0].morf == 0.0f);
+    puts("rate event ok");
+}
+
 /* The death block after the skin (death.h) and the revive packets (WWClient.receiveRevive). */
 static void test_death(void) {
     mp_u8 buffer[256];
@@ -1279,7 +1344,8 @@ static void test_death(void) {
     mp_writer w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_player(&w, &l);
     static const mp_u8 tail[] = {0x01, 0x02, 0xAC, 0x3F, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
-                                 0x40, 0x60, 0x00, 0x00, 0xC0, 0x00};
+                                 0x40, 0x60, 0x00, 0x00, 0xC0, 0x00,
+                                 0x00 /* no sounds (0.3.79) */};
     assert(w.ok && w.size > sizeof(tail) && memcmp(w.data + w.size - sizeof(tail), tail, sizeof(tail)) == 0);
     mp_reader r = mp_reader_make(buffer, w.size);
     mp_read_player(&r, &got);
@@ -1289,20 +1355,22 @@ static void test_death(void) {
     r = mp_reader_make(buffer, w.size - sizeof(tail));
     mp_read_player(&r, &got);
     assert(r.ok && r.pos == r.size && got.death == 0);
-    /* a truncated body fails */
-    r = mp_reader_make(buffer, w.size - 1);
+    /* a truncated body fails (inside the death block) */
+    r = mp_reader_make(buffer, w.size - 2);
     mp_read_player(&r, &got);
     assert(!r.ok);
     /* alive: one byte */
     l.death = 0;
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_player(&w, &l);
-    assert(w.ok && buffer[w.size - 1] == 0x00 && buffer[w.size - 2] == 0x00); /* no skin, alive */
+    assert(w.ok && buffer[w.size - 1] == 0x00 && buffer[w.size - 2] == 0x00 &&
+           buffer[w.size - 3] == 0x00); /* no skin, alive, no sounds */
     /* down (the game's death, no ghost): the flags byte alone, read back as it is */
     l.death = MP_DEATH_DOWN;
     w = mp_writer_make(buffer, sizeof(buffer));
     mp_write_player(&w, &l);
-    assert(w.ok && buffer[w.size - 1] == 0x02 && buffer[w.size - 2] == 0x00);
+    assert(w.ok && buffer[w.size - 1] == 0x00 && buffer[w.size - 2] == 0x02 &&
+           buffer[w.size - 3] == 0x00); /* no skin, down, no sounds */
     r = mp_reader_make(buffer, w.size);
     mp_read_player(&r, &got);
     assert(r.ok && r.pos == r.size && got.death == MP_DEATH_DOWN && got.death_dir == 0);
@@ -1742,6 +1810,7 @@ static void test_split_frame(void) {
 }
 
 int main(void) {
+    test_rate_event();
     test_vlq();
     test_init();
     test_client_packets();
@@ -1756,6 +1825,7 @@ int main(void) {
     test_directory();
     test_summon();
     test_death();
+    test_sounds();
     test_carry();
     test_event();
     test_save_sync();

@@ -241,6 +241,12 @@ static void lp_received(const mp_event* e); /* last_place.h (0.3.70) */
 static void gf_received(const mp_event* e); /* gale_follow.h (0.3.75) */
 
 /* event_sync.h ev_received: a name starting with '#'. */
+static void ck_received(const mp_event* e); /* color_key.h */
+static void sr_received(const mp_event* e); /* ship_ride.h (0.3.92) */
+static void dc_received(const mp_event* e); /* death_count.h (0.3.92) */
+static void ls_received(const mp_event* e); /* life_share.h (0.3.92) */
+static void dl_key_received(const mp_event* e); /* door_lock.h */
+
 static void share_received(const mp_event* e) {
     if (e->sender == local_uid) return;
     const char* n = e->name;
@@ -250,6 +256,26 @@ static void share_received(const mp_event* e) {
     }
     if (n[1] == 'G' && n[2] == 'A' && n[3] == 'L' && n[4] == 'E') { /* a Ballad of Gales (0.3.75) */
         gf_received(e);
+        return;
+    }
+    if (n[1] == 'D' && n[2] == 'K' && !n[3]) { /* a door unlocked with a key (door_lock.h, 0.3.82) */
+        dl_key_received(e);
+        return;
+    }
+    if (n[1] == 'H' && n[2] == 'S' && n[3] == '_') { /* the shared life, from the server (0.3.92) */
+        ls_received(e);
+        return;
+    }
+    if (n[1] == 'D' && n[2] == 'C' && n[3] == '_') { /* a player's deaths, from the server (0.3.92) */
+        dc_received(e);
+        return;
+    }
+    if (n[1] == 'S' && (n[2] == 'B' || n[2] == 'L')) { /* on another player's ship, or off (0.3.92) */
+        sr_received(e);
+        return;
+    }
+    if (n[1] == 'K' && (n[2] == 'A' || n[2] == 'T')) { /* a colour key, made or picked up (0.3.81) */
+        ck_received(e);
         return;
     }
     if (n[1] == 'L' && n[2] == 'P') { /* this player's last place, from the server (0.3.70) */

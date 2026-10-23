@@ -220,6 +220,8 @@ enum {
 #define MP_ELITE_CHANCE_MAX 100
 /* WWHD 0.3.13, the same way: "1" when the players fight each other (pvp.h, a server mutator). */
 #define MP_PVP_ENTRY "#pvp="
+/* WWHD 0.3.92, the same way: "1" when the players share one life (life_share.h, a server mutator). */
+#define MP_SHARED_LIFE_ENTRY "#shared_life="
 
 typedef struct mp_factory {
     char name[MP_ACTOR_NAME_MAX + 1];
@@ -275,6 +277,7 @@ typedef struct mp_session {
     int dynamic_scaling;     /* 0 when the server sends none */
     mp_u32 elite_chance;     /* percent, 0 when the server sends none */
     int pvp;                 /* the players fight each other; 0 when the server sends none */
+    int shared_life;         /* 0.3.92: one life for all the players; 0 when the server sends none */
 } mp_session;
 
 static inline void mp_assign_id(const char* s, mp_u32 n, mp_u32 index, const char* name, mp_u32* id) {
@@ -420,6 +423,10 @@ static inline int mp_read_actor_filter(mp_reader* r, mp_session* s) {
             s->pvp = rest_n == 1 && rest[0] == '1';
             continue;
         }
+        if (mp_entry_value(name, n, MP_SHARED_LIFE_ENTRY, &rest, &rest_n)) {
+            s->shared_life = rest_n == 1 && rest[0] == '1';
+            continue;
+        }
         if (mp_entry_value(name, n, MP_ELITE_ENTRY, &rest, &rest_n)) {
             mp_u32 chance = mp_entry_number(rest, rest_n, MP_ELITE_CHANCE_MAX);
             s->elite_chance = chance > MP_ELITE_CHANCE_MAX ? 0 : chance;
@@ -520,6 +527,7 @@ static inline int mp_parse_init(const mp_u8* payload, mp_u32 size, mp_session* s
     s->dynamic_scaling = 0;
     s->elite_chance = 0;
     s->pvp = 0;
+    s->shared_life = 0;
 
     count = mp_read_vlq(&r);
     for (mp_u32 i = 0; r.ok && i != count; ++i) {
@@ -851,6 +859,18 @@ typedef struct mp_reset_upper {  /* resetActAnimeUpper(upperIdx, i_morf) */
     float morf;
 } mp_reset_upper;
 
+/* 0.3.79: Link's voice and sounds (anim_sync.h), after the death block, optional the same way:
+ * u8 count (bit 7 clear, at most MP_MAX_SOUNDS), each u8 kind (MP_SOUND_*) and u32 the sound id.
+ * The server keeps and forwards them like the other event lists (ActorPlayerSync.java sounds). */
+#define MP_MAX_SOUNDS 16
+#define MP_SOUND_VOICE 0          /* daPy_lk_c::voiceStart */
+#define MP_SOUND_REVERB 1         /* daPy_lk_c::seStartOnlyReverb */
+#define MP_SOUND_SWORD 2          /* daPy_lk_c::seStartSwordCut (played at the puppet) */
+typedef struct mp_sound {
+    mp_u8 kind;
+    mp_u32 id;
+} mp_sound;
+
 typedef struct mp_anim_events {
     mp_u32 move_count, single_count, upper_count, reset_count, sword_count;
     mp_u32 equip_item_count, unequip_count; /* setAnimeEquipItem / setAnimeUnequip: no data */
@@ -867,17 +887,21 @@ typedef struct mp_anim_events {
     mp_swing swing[MP_MAX_SWINGS];
     mp_strike strike[MP_MAX_STRIKES];
     mp_particle particle[MP_MAX_PARTICLES];
+    mp_u32 sound_count;                     /* WWHD extension (0.3.79) */
+    mp_sound sound[MP_MAX_SOUNDS];
 } mp_anim_events;
 
 static inline void mp_anim_events_clear(mp_anim_events* e) {
     e->move_count = e->single_count = e->upper_count = e->reset_count = e->sword_count = 0;
     e->equip_item_count = e->unequip_count = e->hit_count = e->swing_count = e->dropped = 0;
     e->strike_count = e->particle_count = 0;
+    e->sound_count = 0;
 }
 
 static inline int mp_anim_events_empty(const mp_anim_events* e) {
     return !(e->move_count | e->single_count | e->upper_count | e->reset_count | e->sword_count |
-             e->equip_item_count | e->unequip_count | e->swing_count | e->strike_count | e->particle_count);
+             e->equip_item_count | e->unequip_count | e->swing_count | e->strike_count | e->particle_count |
+             e->sound_count);
 }
 
 /* Slot for one more particle (the newest survives in the last slot). */
@@ -927,6 +951,8 @@ static inline void mp_anim_events_append(mp_anim_events* dst, const mp_anim_even
         dst->strike[mp_strike_slot(dst)] = src->strike[i];
     for (mp_u32 i = 0; i != src->particle_count; ++i)
         dst->particle[mp_particle_slot(dst)] = src->particle[i];
+    for (mp_u32 i = 0; i != src->sound_count && dst->sound_count != MP_MAX_SOUNDS; ++i)
+        dst->sound[dst->sound_count++] = src->sound[i];
     dst->equip_item_count += src->equip_item_count;
     dst->unequip_count += src->unequip_count;
     dst->dropped += src->dropped;
@@ -1180,6 +1206,31 @@ static inline void mp_read_death(mp_reader* r, mp_player_look* l) {
     l->corpse_angle = (mp_s16)mp_read_u16(r);
 }
 
+static inline void mp_write_sounds(mp_writer* w, const mp_anim_events* e) {
+    mp_u32 n = e ? e->sound_count : 0;
+    if (n > MP_MAX_SOUNDS) n = MP_MAX_SOUNDS;
+    mp_write_u8(w, (mp_u8)n);
+    for (mp_u32 i = 0; i != n; ++i) {
+        mp_write_u8(w, e->sound[i].kind);
+        mp_write_u32(w, e->sound[i].id);
+    }
+}
+
+static inline void mp_read_sounds(mp_reader* r, mp_anim_events* e) {
+    if (e) e->sound_count = 0;
+    if (!(r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80))) return;
+    mp_u32 n = mp_read_u8(r);
+    for (mp_u32 i = 0; i != n && r->ok; ++i) {
+        mp_u8 kind = mp_read_u8(r);
+        mp_u32 id = mp_read_u32(r);
+        if (e && e->sound_count != MP_MAX_SOUNDS) {
+            e->sound[e->sound_count].kind = kind;
+            e->sound[e->sound_count].id = id;
+            ++e->sound_count;
+        }
+    }
+}
+
 /* ActorPlayerSync::write; events may be null (all eight lists empty). */
 static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l, const mp_anim_events* e) {
     mp_write_u16(w, l->item);
@@ -1196,6 +1247,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
         mp_write_particles(w, 0);
         mp_write_string(w, l->skin);
         mp_write_death(w, l);
+        mp_write_sounds(w, 0);
         return;
     }
     mp_write_vlq(w, e->move_count);
@@ -1236,6 +1288,7 @@ static inline void mp_write_player_events(mp_writer* w, const mp_player_look* l,
     mp_write_particles(w, e);
     mp_write_string(w, l->skin);
     mp_write_death(w, l);
+    mp_write_sounds(w, e);
 }
 
 static inline void mp_write_player(mp_writer* w, const mp_player_look* l) {
@@ -1313,6 +1366,7 @@ static inline void mp_read_player_events(mp_reader* r, mp_player_look* l, mp_ani
     const char* skin = r->ok && r->pos < r->size && !(r->data[r->pos] & 0x80) ? mp_read_string(r, &skin_length) : "";
     mp_set_skin(l, skin, skin_length);
     mp_read_death(r, l); /* then the death, the same way */
+    mp_read_sounds(r, e); /* then Link's sounds (0.3.79) */
     if (!r->ok) mp_anim_events_clear(e);
 }
 
@@ -1721,11 +1775,11 @@ static inline int mp_read_placed_update(const mp_u8* payload, mp_u32 size, const
 }
 
 /* SERVER_MUTATORS (WWHD extension): VLQ enemy multiplier, u8 randomizer, then (0.2.47 servers)
- * u8 dynamic scaling and u8 elite chance (percent), then (0.3.13 servers) u8 pvp. The server sends it
- * to every client when its mutators change while it runs. A body without the last ones (an older
- * server) leaves them at 0; 0 when malformed. */
-static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer,
-                                      int* scaling, mp_u32* elite, int* pvp) {
+ * u8 dynamic scaling and u8 elite chance (percent), then (0.3.13 servers) u8 pvp, then (0.3.92) u8
+ * shared life. The server sends it to every client when its mutators change while it runs. A body
+ * without the last ones (an older server) leaves them at 0; 0 when malformed. */
+static inline int mp_read_mutators_life(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer,
+                                        int* scaling, mp_u32* elite, int* pvp, int* shared_life) {
     mp_reader r = mp_reader_make(payload, size);
     mp_u32 m = mp_read_vlq(&r);
     mp_u8 random = mp_read_u8(&r);
@@ -1735,6 +1789,8 @@ static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32*
         chance = mp_read_u8(&r);
     }
     if (r.ok && r.pos != r.size) fight = mp_read_u8(&r);
+    mp_u8 life = 0;
+    if (r.ok && r.pos != r.size) life = mp_read_u8(&r);
     if (!r.ok || r.pos != r.size) return 0;
     if (m < 1) m = 1;
     if (m > MP_MULTIPLIER_MAX) m = MP_MULTIPLIER_MAX;
@@ -1743,7 +1799,14 @@ static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32*
     *scaling = scale != 0;
     *elite = chance > MP_ELITE_CHANCE_MAX ? MP_ELITE_CHANCE_MAX : chance;
     *pvp = fight != 0;
+    *shared_life = life != 0;
     return 1;
+}
+
+static inline int mp_read_mutators_ex(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer,
+                                      int* scaling, mp_u32* elite, int* pvp) {
+    int life;
+    return mp_read_mutators_life(payload, size, multiplier, randomizer, scaling, elite, pvp, &life);
 }
 
 static inline int mp_read_mutators(const mp_u8* payload, mp_u32 size, mp_u32* multiplier, int* randomizer) {

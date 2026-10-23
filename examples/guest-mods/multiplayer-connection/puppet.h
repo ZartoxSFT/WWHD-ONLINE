@@ -47,6 +47,7 @@
 #include "tunic.h"
 #include "skin.h"
 
+static void cy_note_hands(u32 puppet); /* carry.h (0.3.78) */
 #define PUPPET_MAX 24 /* the remote players (MAX_REMOTES 15), the dead players' bodies (death.h) and the bots (0.3.52: 16, before 8) */
 
 /* outfit.h outfit_force: the casual clothes' HD texture object, as playerInit reads it
@@ -843,6 +844,7 @@ WWHD_REPLACE(0x023DBBE4, s32, puppet_draw, (void* i_this)) {
     ghost_drawing = puppet_slots[slot].ghost; /* a dead player's ghost: translucent */
     s32 result = puppet_draw_original(i_this);
     ghost_restore();
+    cy_note_hands((u32)i_this); /* its hands as drawn, for the local Link it carries (carry.h, 0.3.78) */
     if (camera) *camera = camera_saved;
     puppet_drawing = -1;
     skin_leave(skin);
@@ -1034,13 +1036,33 @@ static int puppet_item_has_model(mp_u16 item) {
     }
 }
 
+/* 0.3.93: a stick held (mEquipItem daPyItem_BOKO_e 0x101). The stick is an actor of its own; while
+ * Link holds it, its code takes its place from its model's matrix (daBoko_c::procCarry 020C3480,
+ * d_a_boko.cpp), which Link's setItemModel (02403C24, d_a_player_main_04.cpp) writes from his left
+ * hand when mActorKeepEquip.mActor (+0x6594, mID +0x6590) is the stick and mEquipItem is 0x101. The
+ * puppet showed no item for 0x101: the copy of the stick (actor_sync.h) kept its model where it was
+ * made, never in the hand ("weapon diag" 0.3.92: the copy's place at the hand, nothing seen).
+ * Now the puppet holds its owner's copy the same way, and setItemModel in its tail places it.
+ * deleteEquipItem (023DC7AC, d_a_player_main_01.cpp) deletes the actor kept unless the item is a
+ * stick: the kept actor is cleared before every change of item. */
+#define PUPPET_ITEM_BOKO 0x101
+#define PUPPET_KEEP_EQUIP_ID 0x6590
+#define PUPPET_KEEP_EQUIP_ACTOR 0x6594
+static u32 as_boko_copy_of(mp_u32 owner); /* actor_sync.h: the owner's stick copy, 0 when none */
+
+static void puppet_keep_equip(void* link, u32 actor) {
+    *(volatile u32*)((u8*)link + PUPPET_KEEP_EQUIP_ACTOR) = actor;
+    *(volatile u32*)((u8*)link + PUPPET_KEEP_EQUIP_ID) = actor ? *(const volatile u32*)(actor + 4) : 0xFFFFFFFFu;
+}
+
 static void puppet_apply_item(void* link, puppet_slot* s) {
     mp_u16 want = s->remote_item;
     if (s->remote_proc == PUPPET_PROC_FAN_SWING) want = PUPPET_ITEM_FAN_SWING;
     else if (!puppet_item_has_model(want) && want != PUPPET_ITEM_SWORD && want != PUPPET_ITEM_FAN_FLY &&
-             want != PUPPET_ITEM_HOOKSHOT) want = PUPPET_ITEM_NONE;
+             want != PUPPET_ITEM_HOOKSHOT && want != PUPPET_ITEM_BOKO) want = PUPPET_ITEM_NONE;
     if (want != s->shown_item) {
         daPy_lk_c* l = (daPy_lk_c*)link;
+        puppet_keep_equip(link, 0); /* never deleted with the item (deleteEquipItem) */
         if (s->shown_item != PUPPET_ITEM_NONE) {
             l->mEquipItem = PUPPET_ITEM_NONE; /* never the sword case (it stops the sword music) */
             wwhd_daPy_lk_c__deleteEquipItem(link, 0);
@@ -1054,6 +1076,12 @@ static void puppet_apply_item(void* link, puppet_slot* s) {
          * for player 0, d_a_player_main_01.cpp): its chain is the owner's copy (actor_sync.h) */
         else if (want == PUPPET_ITEM_HOOKSHOT) wwhd_daPy_lk_c__setHookshotModel(link);
         s->shown_item = want;
+    }
+    { /* the stick copy in the hand, found again every step (it may come after the item) */
+        u32 stick = s->shown_item == PUPPET_ITEM_BOKO ? as_boko_copy_of(s->uid) : 0;
+        puppet_keep_equip(link, stick);
+        static int logged;
+        if (stick && logged++ < 3) wwhd_log("multiplayer: weapon: a stick in a puppet's hand (setItemModel)");
     }
     volatile u32* flags = (volatile u32*)((u8*)link + PUPPET_NO_RESET_FLG0);
     if (s->remote_extras & MP_EXTRA_HEAVY_BOOTS) *flags |= PUPPET_HEAVY_BOOTS;
@@ -1081,8 +1109,31 @@ WWHD_REPLACE(0x025E1E2C, u32, puppet_shield_sound, (u32 a, u32 b)) {
     return puppet_in_tail ? 0 : puppet_shield_sound_original(a, b);
 }
 
+/* 0.3.80: the sounds of the puppet's animations. Most of Link's sounds (steps, attack shouts, the
+ * sword's swoosh) are not code calls but the sound tracks of his animations: setMoveAnime and
+ * setSingleMoveAnime (023E0E50, 023E0A04, replayed on the puppet by anim_sync.h) prepare it
+ * (setSeAnime 023E07E4: mJAIZelAnime +0x64F0, mpSeAnmFrameCtrl +0x6A94), then execute plays it each
+ * frame (generated code 0240DC24-0240DCBC, daPy_lk_c::execute 0240CDD0: if 025E20F8 returns 0,
+ * setAnimSound 0201BF08 (mJAIZelAnime, &current.pos +0x314, f1 = frame control +4, f2 = +0,
+ * mMtrlSndId +0x6A74, (s8)mReverb +0x68DB)). The puppet does not run that part of execute: it is
+ * run here, with no ground material (the puppet does not follow the floor). */
+static int puppet_anim_sound_logged;
+static void puppet_anim_sound(void* i_this) {
+    u8* self = (u8*)i_this;
+    u32 fc = *(const volatile u32*)(self + 0x6A94);
+    if (!fc || wwhd_audio_zero_20F8()) return;
+    f32 a = *(const volatile f32*)(fc + 4), b = *(const volatile f32*)(fc + 0);
+    s32 reverb = (s32)*(const volatile s8*)(self + 0x68DB);
+    wwhd_setAnimSound((u32)(self + 0x64F0), (u32)(self + 0x314), a, b, 0, reverb);
+    if (!puppet_anim_sound_logged) {
+        puppet_anim_sound_logged = 1;
+        wwhd_log("multiplayer: sounds: a puppet plays its animation's sounds");
+    }
+}
+
 /* Replaces daPy_lk_c::execute for a puppet: network pose, then the visual tail only. */
 static int cy_place_puppet(mp_u32 uid, fopAc_ac_c* actor); /* carry.h */
+static int sr_place_puppet(mp_u32 uid, fopAc_ac_c* actor); /* ship_ride.h: a passenger on a ship */
 
 static s32 puppet_execute(void* i_this) {
     fopAc_ac_c* actor = (fopAc_ac_c*)i_this;
@@ -1121,6 +1172,7 @@ static s32 puppet_execute(void* i_this) {
         actor->current.angle.y = s->target.rot[1];
     }
     if (owner != 0xFFFFFFFFu) cy_place_puppet(owner, actor); /* carried: in its carrier's hands */
+    if (owner != 0xFFFFFFFFu) sr_place_puppet(owner, actor); /* 0.3.92: a passenger, on its ship */
 
     u8* play = wwhd_play_get();
     volatile u32* play_ship = play ? (volatile u32*)(play + PUPPET_PLAY_SHIP) : 0;
@@ -1148,6 +1200,7 @@ static s32 puppet_execute(void* i_this) {
     }
     ++puppet_in_tail;
     wwhd_daPy_lk_c__animeUpdate(i_this);
+    puppet_anim_sound(i_this);
     wwhd_daPy_lk_c__setWorldMatrix(i_this);
     wwhd_daPy_lk_c__setWaistAngle(i_this);
     wwhd_daPy_lk_c__setHatAngle(i_this);

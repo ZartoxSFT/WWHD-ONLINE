@@ -69,7 +69,11 @@ static int lp_same_text(const char* a, const char* b, u32 size) {
     return 1;
 }
 
+static int ship_inside_stage(const char* s); /* mod.c: Beedle's ship inside, never a last place */
 static int lp_can_stand(const u8* play) {
+    char stage[STAGE_NAME_BYTES + 1];
+    map_stage(play, stage);
+    if (ship_inside_stage(stage)) return 0;
     return !play[WWHD_PLAY_EVENT_RUNNING_OFFSET] && !teleport_stage_wait && !dh_local_dead() &&
            !(*(const volatile u32*)(play + PUPPET_PLAY_STATUS0) & PUPPET_STATUS0_RIDE);
 }
@@ -143,6 +147,7 @@ static int lp_return(const fopAc_ac_c* link, const u8* play, const lp_record* r)
     char here[STAGE_NAME_BYTES + 1];
     map_stage(play, here);
     int same_stage = map_same_stage(here, r->stage);
+    if (ship_inside_stage(r->stage)) return 1; /* kept by an older version: not taken (0.3.82) */
     f32 dx = link->current.pos.x - r->pos[0], dy = link->current.pos.y - r->pos[1], dz = link->current.pos.z - r->pos[2];
     if (same_stage && link->current.roomNo == r->room && dx * dx + dy * dy + dz * dz < LP_NEAR * LP_NEAR) return 1;
     if (!lp_can_stand(play)) return 0;
@@ -191,7 +196,7 @@ WWHD_HOOK_RETURN(0x025ADC60, lp_change_game_scene, (u32 unused)) {
     if (!cfg.has_host) return; /* not an online player */
     lp_record r;
     u32 save = WWHD_GAME_DATA(SAVE_POINTER, u32);
-    if (!save || !lp_read_kept(&r)) return;
+    if (!save || !lp_read_kept(&r) || ship_inside_stage(r.stage)) return;
     for (int i = 0; i != STAGE_NAME_BYTES + 1; ++i) teleport_stage[i] = r.stage[i];
     teleport_pos.x = r.pos[0];
     teleport_pos.y = r.pos[1];

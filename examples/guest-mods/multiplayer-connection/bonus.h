@@ -353,9 +353,9 @@ static int bonus_magic_full(void) { bonus_load(); return bonus_magic + BONUS_MAG
  * execItemGet(m_itemNo), 0254DA38): for a yellow one, execItemGet gives the yellow heart or magic
  * (bonus_buy_*) instead of the red heart or the magic. Drawn recoloured in gold like an elite
  * (elite.h el_draw_begin: the heart's red, the jar's main colour). */
-#define BONUS_DROP_HEART 4          /* per thousand loots that dropped something (0.2.83: 3 % of
+#define BONUS_DROP_HEART 5          /* per thousand loots that dropped something (0.3.90: 0.5 %; before 4; 0.2.83: 3 % of
                                      * every call: cutting grass gave many) */
-#define BONUS_DROP_MAGIC 4
+#define BONUS_DROP_MAGIC 5
 /* the yellow heart's chance per thousand loots: BONUS_DROP_HEART, changed for tests from the
  * launcher's Debug page (debug.cfg yellow_heart=, 0-1000; back to the default at the next start) */
 static u32 bonus_drop_heart = BONUS_DROP_HEART;
@@ -912,8 +912,10 @@ static void bonus_cross_draw(u32 self) {
 
 /* hdParts_c::draw (026F8B54): the HUD screen, found once (again after a state load); before the game
  * draws it, its big heart is made small while yellow hearts follow (bonus_shrink_current). */
+static void ck_parts_draw(u32 self); /* color_key.h: the HUD's rupees (0.3.81) */
 WWHD_HOOK(0x026F8B54, bonus_parts_draw, (u32 self, u32 viewport)) {
     (void)viewport;
+    ck_parts_draw(self);
     if (bonus_pigs) bonus_cross_draw(self);
     if (!bonus_hearts && !bonus_magic && bonus_light_hidden < 0) return;
     if (!bonus_layout_valid() && (bonus_hearts || bonus_magic)) {

@@ -43,7 +43,9 @@ static const tc_u32 ec_palette[EC_PALETTE] = {
     0xF5F5F5u, /* white */    0xA9B0BAu, /* silver */  0x3B3D42u, /* dark grey */ 0x1B1B22u, /* obsidian */
 };
 
-enum { EC_NONE = 0, EC_HUE = 1, EC_GREY = 2 };
+/* EC_ALL (0.3.83, color_key.h): every texel and material colour takes the target at its own
+ * brightness (ref_b: the brightness that gives the target's own), the whole model in one colour. */
+enum { EC_NONE = 0, EC_HUE = 1, EC_GREY = 2, EC_ALL = 3 };
 
 typedef struct ec_hist {
     tc_u32 bins[EC_BINS];
@@ -181,9 +183,22 @@ static inline tc_u32 ec_paint(const ec_plan* p, float d, float s, float b, int g
     return tc_hsb_to_rgb(ec_wrap(p->target.h + d), ns, nb);
 }
 
+/* EC_ALL: any colour, in the target at its brightness; the brightest keep a light shine. */
+static inline tc_u32 ec_paint_all(const ec_plan* p, tc_hsb px) {
+    float nb = tc_clamp01(p->target.b * (px.b / p->ref_b));
+    float ns = p->target.s;
+    if (px.b > 0.85f && px.s < 0.2f) ns = tc_clamp01(ns * (1.0f - (px.b - 0.85f) * 3.0f));
+    return tc_hsb_to_rgb(p->target.h, ns, nb);
+}
+
 /* 1 and *out set when rgb is of the primary colour; 0 otherwise (textures). */
 static inline int ec_recolor_rgb(const ec_plan* p, tc_u32 rgb, tc_u32* out) {
     tc_hsb px = tc_rgb_to_hsb(rgb);
+    if (p->mode == EC_ALL) {
+        if (px.b < 0.03f) return 0; /* black stays */
+        *out = ec_paint_all(p, px);
+        return 1;
+    }
     if (p->mode == EC_HUE) {
         float d = ec_delta(px.h, p->hue);
         if (px.s < EC_BAND_SATURATION_MIN || px.b < EC_BAND_BRIGHTNESS_MIN || d > EC_BAND || d < -EC_BAND) return 0;
@@ -202,6 +217,11 @@ static inline int ec_recolor_rgb(const ec_plan* p, tc_u32 rgb, tc_u32* out) {
  * offset to the primary hue and its ratio to the reference; greys (the lights) stay. */
 static inline int ec_paint_rgb(const ec_plan* p, tc_u32 rgb, tc_u32* out) {
     tc_hsb px = tc_rgb_to_hsb(rgb);
+    if (p->mode == EC_ALL) {
+        if (px.b < 0.03f) return 0;
+        *out = ec_paint_all(p, px);
+        return 1;
+    }
     if (p->mode != EC_HUE || px.s < EC_PAINT_SATURATION_MIN || px.b < EC_BAND_BRIGHTNESS_MIN) return 0;
     *out = ec_paint(p, ec_delta(px.h, p->hue), px.s, px.b, 0);
     return 1;

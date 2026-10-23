@@ -334,16 +334,48 @@ static int cy_is_carrier(mp_u32 uid) {
     return uid != MP_NO_ID && uid == cy_carried_by;
 }
 
+/* 0.3.78: the carrier's hands from its body, as its first draw of a step put them (its model's
+ * matrices are made at the draw). The local Link goes to the puppet's place plus that offset,
+ * before or after the puppet's update: before, run before the puppet in a step, it took the hands
+ * of the last draw as they were (a step behind) and trailed. */
+static u32 cy_hands_puppet;
+static f32 cy_hands_off[3];
+static unsigned long long cy_hands_step = ~0ull;
+static int cy_hands(u32 link_actor, f32* out);
+static void cy_note_hands(u32 puppet) {
+    if (cy_carried_by == MP_NO_ID || cy_puppet_of(cy_carried_by) != puppet) return;
+    unsigned long long now = wwhd_logic_step();
+    if (now == cy_hands_step && cy_hands_puppet == puppet) return; /* the step's first draw only */
+    f32 h[3];
+    if (!cy_hands(puppet, h)) return;
+    const fopAc_ac_c* c = (const fopAc_ac_c*)puppet;
+    cy_hands_off[0] = h[0] - c->current.pos.x;
+    cy_hands_off[1] = h[1] - c->current.pos.y;
+    cy_hands_off[2] = h[2] - c->current.pos.z;
+    cy_hands_puppet = puppet;
+    cy_hands_step = now;
+}
+
+/* The carried Link's place: the puppet's place and its hands' offset (cy_note_hands), else its hands. */
+static int cy_carry_place(u32 puppet, f32* out) {
+    const fopAc_ac_c* c = (const fopAc_ac_c*)puppet;
+    if (cy_hands_puppet == puppet) {
+        out[0] = c->current.pos.x + cy_hands_off[0];
+        out[1] = c->current.pos.y + cy_hands_off[1];
+        out[2] = c->current.pos.z + cy_hands_off[2];
+        return 1;
+    }
+    return cy_hands(puppet, out);
+}
+
 static void cy_after_carrier(void* puppet) {
     if (cy_carried_by == MP_NO_ID || !dh_link || cy_puppet_of(cy_carried_by) != (u32)puppet) return;
     fopAc_ac_c* a = (fopAc_ac_c*)dh_link;
     if (!cy_can_act(a) || state != READY) return;
     const fopAc_ac_c* c = (const fopAc_ac_c*)puppet;
     f32 hands[3];
-    if (!cy_hands((u32)puppet, hands)) return;
-    f32 x = hands[0] - c->old.pos.x + c->current.pos.x;
-    f32 y = hands[1] - c->old.pos.y + c->current.pos.y;
-    f32 z = hands[2] - c->old.pos.z + c->current.pos.z;
+    if (!cy_carry_place((u32)puppet, hands)) return;
+    f32 x = hands[0], y = hands[1], z = hands[2];
     a->current.pos.x = a->old.pos.x = x;
     a->current.pos.y = a->old.pos.y = y;
     a->current.pos.z = a->old.pos.z = z;
@@ -371,7 +403,7 @@ static void cy_place_local(void* self) {
     const fopAc_ac_c* c = (const fopAc_ac_c*)carrier;
     f32 hands[3];
     f32 x, y, z;
-    if (cy_hands(carrier, hands)) {
+    if (cy_carry_place(carrier, hands)) {
         x = hands[0];
         y = hands[1];
         z = hands[2];

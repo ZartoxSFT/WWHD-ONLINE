@@ -1079,6 +1079,21 @@ static int el_clone_texture(el_clone* c, u32 gx2, const ec_plan* plan) {
     return 1;
 }
 
+/* 0.3.82: seeds from 0x80 are exact colours (color_key.h ck_exact_rgb: a player's tunic, its keys),
+ * the others the palette's (ec_set_target). */
+static int ck_exact_rgb(u8 seed, u32* rgb);
+static void el_target(ec_plan* plan, u8 seed) {
+    u32 rgb;
+    if (seed >= 0x80 && ck_exact_rgb(seed, &rgb)) { /* 0.3.83: the whole model, in that colour */
+        plan->target = tc_rgb_to_hsb(rgb);
+        plan->mode = EC_ALL;
+        plan->ref_b = 0.7f;
+        if (plan->target.b < 0.35f) plan->target.b = 0.35f; /* a very dark colour still shows */
+        return;
+    }
+    ec_set_target(plan, seed);
+}
+
 static int el_build_set(el_set* s, u32 model_data, u8 seed) {
     s->used = 1;
     s->seed = seed;
@@ -1086,8 +1101,8 @@ static int el_build_set(el_set* s, u32 model_data, u8 seed) {
     s->count = 0;
     ec_plan plan = el_plan_of(model_data);
     s->plan = plan;
-    if (plan.mode == EC_NONE) return 1; /* nothing to recolour: an empty set */
-    ec_set_target(&plan, seed);
+    if (plan.mode == EC_NONE && seed < 0x80) return 1; /* nothing to recolour: an empty set */
+    el_target(&plan, seed);
     s->plan = plan;
     u32 count, res;
     if (!el_table(model_data, &count, &res)) return 1;
@@ -1327,8 +1342,8 @@ static void el_paint_instance(u32 model, u32 seed) {
         ++n;
     }
     ec_plan plan = ec_dominant(&h);
-    if (plan.mode != EC_HUE) return; /* no coloured material: the textures carry its colour */
-    ec_set_target(&plan, seed);
+    el_target(&plan, (u8)seed);
+    if (plan.mode != EC_HUE && plan.mode != EC_ALL) return; /* no coloured material: the textures carry its colour */
     in->count = 0;
     for (u32 i = 0; i != n; ++i) {
         el_found* f = &found[i];
@@ -1418,10 +1433,21 @@ static int gp_is_golden(const void* actor);         /* golden_pig.h: the shop's 
 static const u8 el_elemental_seeds[4] = {0, 0 /* fire: crimson */, 7 /* ice: azure */, 16 /* light: white */};
 static el_actor el_yellow_paint; /* the colours of the elites' recolouring, nothing else of an elite */
 
+static u32 ck_paint_seed(const void* actor); /* color_key.h: a colour key's palette colour + 1 */
+
 static el_actor* el_draw_begin(void* actor) {
     el_actor* e = el_find(actor);
     el_drawing = e && e->elite ? e : 0;
     el_growing = el_drawing != 0;
+    u32 key = el_drawing ? 0 : ck_paint_seed(actor);
+    if (key) { /* a colour key: its owner's colour (0.3.81) */
+        el_yellow_paint.elite = 1;
+        el_yellow_paint.seed = (u8)(key - 1u);
+        el_drawing = &el_yellow_paint;
+        el_growing = 0;
+        el_paint_priority = 0;
+        return el_drawing;
+    }
     u32 elemental = el_drawing ? 0 : bonus_elemental_of(actor);
     if (elemental) bonus_elemental_fx(actor);
     el_paint_priority = !el_drawing && gp_is_golden(actor);

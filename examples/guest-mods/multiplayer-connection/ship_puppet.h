@@ -119,8 +119,9 @@ typedef struct ship_puppet_slot {
     mp_ship_state target;  /* last received */
     mp_ship_state display; /* smoothed towards target once per frame (ship_slot_advance) */
     f32 mtx[12];           /* the ship's base matrix from display, the same for the ship and its rider */
-    int ship_ahead;        /* the ship advanced first this frame: its rider takes the same matrix */
-    int link_ahead;        /* its riding Link puppet advanced first: the ship takes the same matrix */
+    /* 0.3.92: the logic step of the last advance (was ship_ahead / link_ahead, for one rider): the
+     * ship, its riding Link puppet and a passenger (ship_ride.h) all take the step's one matrix */
+    unsigned long long advanced_step;
 } ship_puppet_slot;
 
 static ship_puppet_slot ship_slots[SHIP_PUPPET_MAX];
@@ -159,6 +160,14 @@ static void ship_slot_advance(ship_puppet_slot* s) {
     ship_mtx[7] = s->display.pos[1];
     ship_mtx[11] = s->display.pos[2];
     memcpy(s->mtx, ship_mtx, sizeof(s->mtx));
+}
+
+/* The step's advance, done once whoever comes first. */
+static void ship_slot_sync(ship_puppet_slot* s) {
+    unsigned long long now = wwhd_logic_step();
+    if (s->advanced_step == now + 1) return;
+    ship_slot_advance(s);
+    s->advanced_step = now + 1; /* + 1: 0 is "never" */
 }
 
 static int ship_puppet_is(const void* actor) {
@@ -231,12 +240,7 @@ static int ship_puppet_matrix(mp_u32 uid, f32* m) {
     for (int i = 0; i != SHIP_PUPPET_MAX; ++i) {
         ship_puppet_slot* s = &ship_slots[i];
         if (!s->used || s->uid != uid || !s->actor || !s->has_target) continue;
-        if (s->ship_ahead) {
-            s->ship_ahead = 0; /* the ship already advanced this frame: its matrix */
-        } else {
-            ship_slot_advance(s);
-            s->link_ahead = 1;
-        }
+        ship_slot_sync(s);
         memcpy(m, s->mtx, sizeof(s->mtx));
         return 1;
     }
@@ -485,12 +489,7 @@ WWHD_REPLACE(0x0247AE78, s32, ship_puppet_execute, (void* i_this)) {
     for (int i = 0; i != SHIP_PUPPET_MAX; ++i) {
         ship_puppet_slot* s = &ship_slots[i];
         if (!s->used || s->actor != ship || !s->has_target) continue;
-        if (s->link_ahead) {
-            s->link_ahead = 0; /* its rider already advanced this frame */
-        } else {
-            ship_slot_advance(s);
-            s->ship_ahead = 1;
-        }
+        ship_slot_sync(s);
         frame_mtx = s->mtx;
         actor->old.pos = actor->current.pos;
         actor->current.pos.x = s->display.pos[0];
@@ -599,7 +598,7 @@ static ship_puppet_slot* ship_slot_for(mp_u32 uid, int create) {
     free_slot->actor = 0;
     free_slot->retries = 0;
     free_slot->has_target = 0;
-    free_slot->ship_ahead = free_slot->link_ahead = 0;
+    free_slot->advanced_step = 0;
     return free_slot;
 }
 

@@ -190,6 +190,7 @@ static void dh_after_death_anim(void* link) {
 
 static void cy_after_stick(void* self); /* carry.h */
 static void ev_after_stick(void* self); /* event_sync.h */
+static int sr_after_stick(void* self);  /* ship_ride.h (0.3.92) */
 
 /* daPy_lk_c::setStickData: a ghost's buttons do nothing; by a body, A only revives; else the
  * players carry each other (carry.h). */
@@ -202,7 +203,7 @@ WWHD_HOOK_RETURN(0x023F32E4, dh_after_stick, (void* self)) {
         *button = 0;
     } else if (dh_prompt) {
         *trigger = (u8)(*trigger & ~1u);
-    } else {
+    } else if (!sr_after_stick(self)) { /* A boards a friend's ship, or jumps off it (ship_ride.h) */
         cy_after_stick(self);
         ev_after_stick(self);
     }

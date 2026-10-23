@@ -388,6 +388,8 @@ static void el_note_create(void* actor, u32 prm);
 static el_actor* el_execute_begin(void* actor);
 static void el_execute_end(el_actor* e);
 static el_actor* el_delete_begin(const void* actor);
+static void ck_note_create(void* actor, u32 prm);      /* color_key.h (0.3.81) */
+static void ck_actor_deleted(const void* actor, s8 health);
 static void el_delete_end(el_actor* e, s8 health);
 static el_actor* el_draw_begin(void* actor);
 static void el_draw_end(void);
@@ -1095,6 +1097,8 @@ static void as_swap_out(const as_player_swap* w) {
     if (*w->link == w->puppet) *w->link = w->old_link;
 }
 
+static void as_boko_note_taken(const fopAc_ac_c* copy); /* 0.3.80 */
+
 /* A copy created by fopAcM_create in as_step: found by the process id the request returned. */
 static int as_bind_replica(void* actor) {
     u32 pcid = *(const volatile u32*)((const u8*)actor + AS_PC_ID);
@@ -1106,6 +1110,7 @@ static int as_bind_replica(void* actor) {
         if (s->spawn.proc == AS_PROC_BOKO) {
             static u32 logged;
             if (logged++ < 8) wwhd_log("multiplayer: weapon copy made");
+            if (s->spawn.variant & 1) as_boko_note_taken((const fopAc_ac_c*)actor); /* 0.3.80 */
         }
         if (s->dropped) { /* removed meanwhile: deleted as soon as made */
             s->state = AS_REMOVED;
@@ -1358,6 +1363,7 @@ WWHD_REPLACE(0x025D4C70, s32, as_create, (void* actor)) {
         if (prm) {
             as_track_enemy(actor, prm); /* live mutators, also before the connection */
             el_note_create(actor, prm); /* dynamic scaling and elites (elite.h) */
+            ck_note_create(actor, prm); /* an object a colour key may lie next to (color_key.h) */
         }
     }
     as_player_swap swap;
@@ -1456,15 +1462,23 @@ static void as_on_deleted(as_slot* s, s8 health, const fopAc_ac_c* a) {
     if (!as_removed_logged++) wwhd_log("multiplayer: a synchronised enemy died, removed for everyone");
 }
 
+static u32 as_boko_diag_lines;
 WWHD_REPLACE(0x025D4B4C, s32, as_delete, (void* actor)) {
     as_slot* s = actor ? as_find(actor) : 0;
     s8 health = actor ? ((const fopAc_ac_c*)actor)->health : 0;
+    if (s && s->replica && s->kind == AS_KIND_SPAWNED && s->spawn.proc == AS_PROC_BOKO && as_boko_diag_lines < 40) {
+        ++as_boko_diag_lines; /* 0.3.90: a stick copy deleted (by its owner's removal, or the game's own code) */
+        wwhd_log_int("multiplayer: weapon diag: a copy deleted, uid", (int)s->uid);
+        wwhd_log_int("multiplayer: weapon diag:   its slot state (2 synced, 3 removed by its owner)", (int)s->state);
+        wwhd_log_int("multiplayer: weapon diag:   mode", *(const volatile u8*)((const u8*)actor + AS_BOKO_MODE));
+    }
     el_actor* elite = actor ? el_delete_begin(actor) : 0;
     u8 saved = as_context;
     if (actor) as_context = as_context_of(actor, s); /* drops made while dying */
     s32 result = as_delete_original(actor);
     as_context = saved;
     if (result) el_delete_end(elite, health); /* a dead elite explodes (elite.h) */
+    if (actor && result) ck_actor_deleted(actor, health); /* a dead enemy may drop a colour key (color_key.h) */
     if (actor && result) {
         if (as_inherit_count) as_ctx_drop(as_inherit, &as_inherit_count, actor);
         if (as_kill_count) as_ctx_drop(as_kill, &as_kill_count, actor);
@@ -1506,10 +1520,10 @@ static int as_carried_place(const as_slot* s, f32* out) {
     out[1] = (l[7] + r[7]) * 0.5f;
     out[2] = (l[11] + r[11]) * 0.5f;
     s16 carried_proc = *(const volatile s16*)((const u8*)s->actor + AS_PROC_NAME);
-    if (carried_proc == AS_PROC_BOKO) { /* 0.3.72: a weapon in the right hand */
-        out[0] = r[3];
-        out[1] = r[7];
-        out[2] = r[11];
+    if (carried_proc == AS_PROC_BOKO) { /* 0.3.93: in the left hand, where setItemModel puts its model (puppet.h) */
+        out[0] = l[3];
+        out[1] = l[7];
+        out[2] = l[11];
     } else if (carried_proc == AS_PROC_BARREL) { /* a barrel over its player: 0.3.72 at its feet, 0.3.73 a fifth back up */
         f32 feet = ((const fopAc_ac_c*)link)->current.pos.y;
         out[0] = ((const fopAc_ac_c*)link)->current.pos.x;
@@ -1561,6 +1575,15 @@ static void as_apply_carry(const as_slot* s, fopAc_ac_c* a) {
     }
     if (s->owner != as_local_uid && !as_carry_trusted(s)) bits = 0; /* 0.3.62: not carried any more */
     a->actor_status = (a->actor_status & ~AS_CARRY_BITS) | bits;
+    /* 0.3.91: a stick carried by another player's Link. Its game's Link sets the stick's mode to
+     * PLAYER_CARRY when he takes it (decomp d_a_player_main_02.cpp: setNowMode(Mode_PLAYER_CARRY_e));
+     * a copy got only the carry bit, and the stick's own code (d_a_boko.cpp, 0x2000 set and the mode
+     * not PLAYER_CARRY) put it in ENEMY_CARRY: as_boko_after took it for an enemy's and let the copy
+     * go (journal 0.3.90 "weapon diag": mode 2, at the puppet's right hand). Set as Link does; its
+     * code runs with the carrier's puppet as player 0 (as_swap_in). */
+    if ((bits & 0x2000u) && s->kind == AS_KIND_SPAWNED && s->replica &&
+        *(const volatile s16*)((const u8*)a + AS_PROC_NAME) == AS_PROC_BOKO)
+        *(volatile u8*)((u8*)a + AS_BOKO_MODE) = AS_BOKO_PLAYER_CARRY;
 }
 
 /* A boomerang copy is thrown as the owner's: daBoomerang_c::procWait (020CF4CC) starts the flight
@@ -3018,18 +3041,119 @@ static void as_boko_share(void* actor) {
     if (logged++ < 4) wwhd_log("multiplayer: an enemy's weapon fell, shared");
 }
 
+/* 0.3.80: a weapon of each game's own (lying in the stage, or one fallen that stayed local: most of
+ * the sticks, by the logs) taken by the local Link is shared at once, so that the others see it in
+ * its puppet's right hand (as_carried_place). In the others, their own weapon at that place is the
+ * same one: deleted when the copy comes (as_boko_taken_at, the copy's first place, within
+ * AS_BOKO_TAKEN_REACH, for AS_BOKO_TAKEN_STEPS). */
+#define AS_BOKO_TAKEN_REACH 300.0f
+#define AS_BOKO_TAKEN_STEPS 90
+#define AS_BOKO_TAKEN_MAX 4
+typedef struct { f32 pos[3]; unsigned long long step; u8 used; } as_boko_taken;
+static as_boko_taken as_boko_taken_at[AS_BOKO_TAKEN_MAX];
+
+static void as_boko_note_taken(const fopAc_ac_c* copy) {
+    as_boko_taken* t = &as_boko_taken_at[0];
+    for (u32 i = 0; i != AS_BOKO_TAKEN_MAX; ++i)
+        if (!as_boko_taken_at[i].used || as_boko_taken_at[i].step < t->step) t = &as_boko_taken_at[i];
+    t->pos[0] = copy->current.pos.x;
+    t->pos[1] = copy->current.pos.y;
+    t->pos[2] = copy->current.pos.z;
+    t->step = wwhd_logic_step();
+    t->used = 1;
+}
+
+/* 1: this game's own lying weapon is the one another player took (deleted). */
+static int as_boko_check_taken(void* actor) {
+    const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
+    unsigned long long now = wwhd_logic_step();
+    for (u32 i = 0; i != AS_BOKO_TAKEN_MAX; ++i) {
+        as_boko_taken* t = &as_boko_taken_at[i];
+        if (!t->used) continue;
+        if (now - t->step > AS_BOKO_TAKEN_STEPS) {
+            t->used = 0;
+            continue;
+        }
+        f32 dx = a->current.pos.x - t->pos[0], dy = a->current.pos.y - t->pos[1], dz = a->current.pos.z - t->pos[2];
+        if (dx * dx + dy * dy + dz * dz > AS_BOKO_TAKEN_REACH * AS_BOKO_TAKEN_REACH) continue;
+        t->used = 0;
+        as_ctx_add(as_kill, &as_kill_count, AS_MAX_KILL, actor, AS_CTX_FOREIGN);
+        wwhd_log("multiplayer: weapon: another player took this one, its copy is in their hand");
+        return 1;
+    }
+    return 0;
+}
+
+/* 0.3.90: why a stick copy is not seen in a puppet's hand (logs "weapon diag", 40 lines at most,
+ * one sample a second per copy): its mode, carry bits, slot state, its distance to the owner's
+ * puppet's right hand and to the local Link, then its deletion (as_delete). */
+static void as_boko_diag(const as_slot* s, const void* actor) {
+    static u32 last_uid;
+    static unsigned long long last_step;
+    unsigned long long now = wwhd_logic_step();
+    if (as_boko_diag_lines >= 40 || !s->replica || (s->uid == last_uid && now - last_step < 30)) return;
+    last_uid = s->uid;
+    last_step = now;
+    ++as_boko_diag_lines;
+    const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
+    wwhd_log_int("multiplayer: weapon diag: a copy, uid", (int)s->uid);
+    wwhd_log_int("multiplayer: weapon diag:   mode (2 enemy's hand, 3 Link's hands)", *(const volatile u8*)((const u8*)actor + AS_BOKO_MODE));
+    wwhd_log_hex("multiplayer: weapon diag:   actor status", a->actor_status);
+    wwhd_log_int("multiplayer: weapon diag:   slot state x100 + variant (state 2 synced, 3 removed; variant 1 carried)", (int)(s->state * 100u + s->spawn.variant));
+    wwhd_log_int("multiplayer: weapon diag:   owner uid", (int)s->owner);
+    wwhd_log_int("multiplayer: weapon diag:   owner's carry trusted", as_carry_trusted(s));
+    puppet_slot* p = puppet_slot_for(s->owner, 0);
+    const daPy_lk_c* link = p && p->actor ? (const daPy_lk_c*)p->actor : 0;
+    const f32* r = link && link->mpCLModel ? puppet_anm_mtx(link->mpCLModel, AS_JNT_RIGHT_HAND) : 0;
+    if (r) {
+        f32 dx = a->current.pos.x - r[3], dy = a->current.pos.y - r[7], dz = a->current.pos.z - r[11];
+        wwhd_log_int("multiplayer: weapon diag:   from the puppet's right hand", (int)as_sqrt(dx * dx + dy * dy + dz * dz));
+    } else {
+        wwhd_log("multiplayer: weapon diag:   no puppet for its owner here");
+    }
+    if (as_have_link) {
+        f32 dx = a->current.pos.x - as_link_pos[0], dy = a->current.pos.y - as_link_pos[1], dz = a->current.pos.z - as_link_pos[2];
+        wwhd_log_int("multiplayer: weapon diag:   from the local Link", (int)as_sqrt(dx * dx + dy * dy + dz * dz));
+    }
+}
+
+/* puppet.h puppet_apply_item: the copy of the stick the owner holds, 0 when none here. */
+static u32 as_boko_copy_of(mp_u32 owner) {
+    if (!as_ready_init || owner == MP_NO_ID) return 0;
+    for (u32 i = 0; i != AS_MAX; ++i) {
+        const as_slot* s = &as_slots[i];
+        if (!s->used || !s->actor || s->kind != AS_KIND_SPAWNED || !s->replica || s->owner != owner ||
+            s->spawn.proc != AS_PROC_BOKO || !(s->spawn.variant & 1))
+            continue;
+        if (*(const volatile u32*)((const u8*)s->actor + AS_PC_ID) != s->pcid) continue;
+        return s->actor;
+    }
+    return 0;
+}
+
 static void as_boko_after(as_slot* s, void* actor) {
     if (!as_session || !as_enabled || as_spawn_factory() == MP_NO_ID) return;
     const fopAc_ac_c* a = (const fopAc_ac_c*)actor;
     u8 mode = *(const volatile u8*)((const u8*)actor + AS_BOKO_MODE);
+    if (s && s->kind == AS_KIND_SPAWNED) as_boko_diag(s, actor);
     int carried_in = (a->actor_status & 0x2000u) && mode != AS_BOKO_PLAYER_CARRY; /* in a pot */
+    if (!s && mode == AS_BOKO_PLAYER_CARRY) { /* the local Link took a weapon of this game's own */
+        as_boko* own = as_boko_find(actor, 0);
+        if (own) own->used = 0;
+        as_boko_share(actor);
+        static u32 logged;
+        if (logged++ < 8) wwhd_log("multiplayer: weapon: the local Link took a weapon, shared");
+        return;
+    }
+    if (!s && mode != AS_BOKO_ENEMY_CARRY && !carried_in && as_boko_check_taken(actor)) return;
     if (s) {
         if (s->kind != AS_KIND_SPAWNED || s->state != AS_SYNCED) return;
+        if (s->replica && as_carried_by_other(s)) return; /* 0.3.91: in its carrier's puppet's hand */
         if (s->replica && mode == AS_BOKO_ENEMY_CARRY) { /* an enemy of this game took the copy */
             as_free(s);
             return;
         }
-        if (s->replica && mode == AS_BOKO_PLAYER_CARRY) { /* the local Link took the copy: ours now */
+        if (s->replica && mode == AS_BOKO_PLAYER_CARRY && as_carried_by_local(a)) { /* the local Link took the copy: ours now */
             as_send_uid(as_session->client_remove, s->uid);
             u8 prm[AS_PRM_BYTES];
             as_boko_prm(prm, a);
@@ -3082,6 +3206,32 @@ static void as_boko_after(as_slot* s, void* actor) {
         b->used = 0;
         as_ctx_add(as_kill, &as_kill_count, AS_MAX_KILL, actor, AS_CTX_FOREIGN); /* the other game's comes */
     }
+}
+
+/* 0.3.78: the wooden crates (daObjMovebox of a breakable type) break for everyone. Their Execute
+ * (02378638, d_a_obj_movebox.cpp) breaks one hit (its collider) or rolled into
+ * (mbRollCrash +0x7D4, set by Link's code, d_a_player_main_05.cpp): make_item (02378150, the item
+ * table), eff_break (023781C8), sound_break (023782D8), then its deletion; eff_break runs only for
+ * that. Broken here (an entry hook on eff_break, not while a copy breaks): its deletion removes it
+ * for everyone (as_on_deleted, as a pot); in another game its copy breaks the same way, effects and
+ * sound, without its item (the breaker's game made it). */
+WWHD_GAME_FUNC(0x023781C8, void, as_box_eff_break, (void* self));
+WWHD_GAME_FUNC(0x023782D8, void, as_box_sound_break, (void* self));
+WWHD_HOOK(0x023781C8, as_box_broken, (void* self)) {
+    if (as_breaking_copy || !self) return;
+    as_slot* s = as_find(self);
+    if (s && s->kind == AS_KIND_PLACED && s->state == AS_SYNCED && s->uid != MP_NO_ID) s->broken = 1;
+}
+
+static void as_break_box(as_slot* s, fopAc_ac_c* a) {
+    as_breaking_copy = 1;
+    as_box_eff_break(a);
+    as_box_sound_break(a);
+    as_breaking_copy = 0;
+    s->deleting = 1;
+    wwhd_fopAcM_delete_actor((u32)a);
+    static u32 logged;
+    if (!logged++) wwhd_log("multiplayer: a crate broken in another game broke here");
 }
 
 static void as_break_pot(as_slot* s, fopAc_ac_c* a) {
@@ -3252,6 +3402,11 @@ static void as_step(double dt, mp_u32 local_uid, const fopAc_ac_c* link) {
         if (s->state == AS_REMOVED && !s->deleting && s->kind == AS_KIND_PLACED &&
             *(const volatile s16*)((const u8*)a + AS_PROC_NAME) == AS_PROC_TSUBO) {
             as_break_pot(s, (fopAc_ac_c*)(u32)a); /* broken in another game */
+            continue;
+        }
+        if (s->state == AS_REMOVED && !s->deleting && s->kind == AS_KIND_PLACED &&
+            *(const volatile s16*)((const u8*)a + AS_PROC_NAME) == AS_PROC_MOVEBOX) {
+            as_break_box(s, (fopAc_ac_c*)(u32)a); /* a crate broken in another game (0.3.78) */
             continue;
         }
         if (s->state == AS_REMOVED) {

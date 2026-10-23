@@ -5781,3 +5781,422 @@ joueur arrêté n'envoie plus rien). Saut de plus de 15 m (téléportation, chan
 tout de suite. Le porteur du Link local : sa place la plus récente (0.3.72). Protocole et serveur
 inchangés. Ennemis et objets synchronisés : lissage inchangé (as_step).
 Mod 0.3.76 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## Publication du 22 octobre
+
+`ZeldaWWHDRecomp` commit `ef78ec4` poussé sur `origin/main` : le mod (0.3.53 à 0.3.76, dont les
+nouveaux gale_follow.h, item_share.h, last_place.h, path_guard.h, switch_sync.h),
+`docs/multiplayer/context.md` et `runtime/src/mods/guest_hud.h`. Laissés de côté : les fichiers
+`.gradle` (caches d'outils) et `tools/skin/*` (skins de l'utilisateur, tirés des fichiers du jeu).
+`WindWakerServer` (serveur, launcher) n'est dans aucun dépôt : ses changements ne sont pas poussés.
+
+## 0.3.77 : les « mini téléportations » des puppets (cause et correction)
+
+Testé 0.3.76 par l'utilisateur : pas de grande différence, petits sauts (déjà vus sur la version
+GameCube, attribués au HLE). **Vérifié** : l'expéditeur envoie sa place une fois par pas (1/30 s,
+`PLAYER_PERIOD`) ; le serveur ne la relaie pas à l'arrivée mais à son propre tour de boucle
+(`SyncedActorComponent.onRun`, MMB `logicFrameRate` 144, minuteries Windows d'environ 16 ms) ; le
+jeu qui reçoit ne lit le réseau qu'une fois par pas. Deux places arrivent souvent dans le même pas
+puis aucune : avec l'heure d'arrivée comme temps (0.3.76), même temps pour les deux, le puppet
+sautait. Ce n'est pas le HLE. **Corrigé** (`rs_push`) : l'écart entre deux places est arrondi à un
+nombre entier de pas de l'expéditeur, tiré lentement vers l'horloge d'arrivée (5 %), jamais plus
+d'un pas en avance ; après une pause de plus de 8 pas (joueur immobile), on repart de l'arrivée.
+Mod 0.3.77 compilé (125 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.78-0.3.79 : sauvegardes du serveur, voix des puppets, caisses, porté collé, tonneaux, enfants de Mercantîle
+
+- **Sauvegardes du serveur** (`MMBServerCommon AbstractSaveServer`) : copie de `save.ktml` et `users/`
+  dans `User/SaveServer/backups/auto-<date>/` au démarrage du serveur puis toutes les 20
+  sauvegardes automatiques (20 min, `saveRate` 60 s), les 12 plus récentes gardées. Compilé.
+- **Voix et sons des puppets** (0.3.79). **Vérifié** (`d_a_player_main_08.cpp voiceStart` 02443880 :
+  startLinkVoice à son eyePos ; `d_a_player_main.cpp seStartOnlyReverb` 023DC0F4 à sa place,
+  `seStartSwordCut` 024072F4 à la pointe de son épée). Hooks d'entrée (pas de remplacement) sur ces
+  trois fonctions pour le Link local (`anim_is_local`), envoyés dans un nouveau bloc
+  d'ActorPlayerSync après la mort (`mp_protocol.h` : u8 nombre, chaque u8 type + u32 id, 16 au plus ;
+  optionnel comme les autres extensions) ; le serveur les relaie (`ActorPlayerSync.java sounds`) ;
+  le puppet les rejoue sur lui-même (`anim_apply` : voiceStart, sinon seStartOnlyReverb à sa place,
+  l'épée comprise). Pas les sons du sol (`seStartMapInfo`, lit le sol sous Link). Test protocole
+  `runtime/tools/mp_protocol_test.c` mis à jour (octet final, `drop_alive`) et `test_sounds`
+  ajouté : passe.
+- **Caisses cassées** (0.3.78). **Vérifié** (`d_a_obj_movebox.cpp Execute` 02378638 : collisionneur
+  touché ou `mbRollCrash` +0x7D4 mis par la roulade de Link : make_item 02378150, eff_break 023781C8,
+  sound_break 023782D8, suppression). Hook d'entrée sur eff_break : cassée ici, sa suppression la
+  retire pour tous ; ailleurs la copie casse avec effets et son, sans objet (`as_break_box`).
+  « Kkiba », « KkibaB » sont déjà dans la liste du serveur.
+- **Joueur local porté** (0.3.78) : décalage des mains du porteur noté à son premier dessin du pas
+  (`cy_note_hands`), le Link local placé à la place du puppet + ce décalage, avant ou après la mise
+  à jour du puppet (avant : mains du dessin précédent, un pas de retard).
+- **Tonneaux** (0.3.78) : nombre = joueurs de l'annuaire du serveur (tous, quelle que soit la zone),
+  gardé dans `players_count.bin` pour le premier chargement avant la connexion. Avant : joueurs
+  distants connus ici, refaits après chaque changement de zone (le deuxième joueur n'avait pas les
+  copies).
+- **Enfants de Mercantîle** : « Mk », « UkB », « UkC », « UkD », « Um2 » ajoutés à
+  `resources/WWServer/actorList.ktml` (position et santé synchronisées par le propriétaire, le
+  joueur le plus proche). La copie de la dist (`dist/WWHD-Online-Launcher/Resources`) sera mise à
+  jour avec la prochaine dist.
+Mod 0.3.79 compilé (129 hooks), installé instances 1 et 3. **Non testé en jeu.** Le serveur doit
+être recompilé pour les sauvegardes, les sons et les enfants (un ancien serveur ignore le bloc des
+sons).
+
+## 0.3.80-0.3.81 : sons d'animation des puppets, bâtons ramassés, clés de couleur
+
+- **Sons (0.3.80)**. Journal 0.3.79 : aucun son. La classe `ActorPlayerSync` du serveur lancé
+  n'avait pas le relais des sons (compilée avant la modification, ou serveur de la dist) : **le
+  serveur doit être recompilé**. Surtout, la plupart des sons de Link (pas, cris d'attaque, épée)
+  ne passent pas par `voiceStart` / `seStartOnlyReverb` mais par la piste son de ses animations.
+  **Vérifié** : `setMoveAnime` 023E0E50 et `setSingleMoveAnime` 023E0A04 (rejouées sur le puppet par
+  anim_sync.h) appellent `setSeAnime` 023E07E4 (mJAIZelAnime +0x64F0, mpSeAnmFrameCtrl +0x6A94) ;
+  `daPy_lk_c::execute` (0240CDD0, code généré 0240DC24-0240DCBC) joue ensuite chaque image
+  `setAnimSound` 0201BF08 (anime, &current.pos +0x314, f1 = contrôle +4, f2 = +0, mMtrlSndId +0x6A74,
+  (s8)mReverb +0x68DB) si 025E20F8 rend 0. Le puppet ne passe pas par là : `puppet_anim_sound`
+  l'appelle après son `animeUpdate`, sans matière de sol. Journaux « sounds: ... » ajoutés.
+  **Non testé en jeu.**
+- **Bâtons (0.3.80)**. Journal : la plupart des bâtons au sol sont « stays local » (propres à
+  chaque jeu, pas de pot ni d'ennemi synchronisé connu), donc rien n'était envoyé quand Link en
+  prenait un. Maintenant un bâton propre au jeu que le Link local prend (mNowMode PLAYER_CARRY) est
+  partagé aussitôt (`as_boko_share`) : les autres le voient dans la main droite du puppet
+  (`as_carried_place`). Chez eux, leur propre bâton au même endroit (300 unités autour de la
+  première place de la copie, 3 s) est supprimé (`as_boko_note_taken` / `as_boko_check_taken`).
+  **Non testé en jeu.**
+- **Clés de couleur (0.3.81)**, `color_key.h`. Chaque joueur a, dans chaque donjon, 3 clés lâchées
+  par des ennemis morts (8 % par mort, +8 % par mort sans clé, 50 % au plus) et 3 clés posées à
+  côté d'un objet du stage (35 % par salle entrée, 2 s après l'entrée). La porte du boss (en plus
+  de la clé du boss) ne s'ouvre que quand chaque joueur présent dans ce donjon (annuaire, même
+  stage) a ramassé 3 de ses clés. Seul le propriétaire ramasse sa clé (90 unités) ; tout le monde
+  la voit à sa couleur ; elle ne disparaît jamais.
+  **Vérifié** : donjon = `dStage_stagInfo_GetSTType` == 1 (stag info +0xC >> 16 & 7, code de
+  Link d_a_player_main_01.cpp) ; porte du boss = daDoor10 de type 1 et daDoor12 de type 3
+  (`dDoor_info_c::getType` 0252AA2C, `setEventPrm` 02127080 / 0212919C) ; modèle = daDitem 0x101
+  de la petite clé (0x15) avec FLAG_UNK01 | FLAG_UNK08, comme item_share.h ; couleur = la
+  recoloration des élites (`el_draw_begin`, couleur de palette la plus proche de la tunique) ;
+  compteur à gauche de la partie `L_Rupy_00` du layout `Main_00` (lu localement dans le pack 2D :
+  (525, -319), 256 x 54, échelle 0.6 ; `L_DungeonKey_00` au-dessus), icône `assets/color_key.png`
+  (dessin original généré, teinté à la couleur du joueur).
+  **Serveur** (`WWClient.java`) : événements « #KA_ii_o_<nom> » (avec place) et « #KT_ii_<nom> »,
+  gardés dans `User/ColorKeys.txt`, relayés, renvoyés à chaque joueur qui rejoint. **Launcher** :
+  page Debug, « SPAWN MY COLOUR KEY » (`debug.cfg color_key=1`).
+  **Déduit, non testé** : une clé posée près d'un objet peut tomber dans un endroit difficile
+  (objet en hauteur, tag invisible) ; une clé lâchée au-dessus du vide reste là ; le modèle de la
+  petite clé hors donjon (bouton Debug) dépend du chargement de sa ressource par daDitem.
+Mod 0.3.81 compilé (334 fonctions, 129 hooks), installé instances 1 et 3. Serveur et launcher
+compilés (javac, dossier de contrôle). **Rien testé en jeu.** Le serveur et le launcher lancés
+doivent être reconstruits (sons, clés, bouton Debug) ; la dist n'est pas touchée.
+
+## 0.3.82 : crash Obshop, voix, clés comme le jeu, coffres, portes à clé
+
+- **Crash (instance 3, 2026-10-22 16:31)** : assertion `dComIfGp_getIkadaShipBeforeRoomId() < 64`
+  (d_stage.cpp 5179) à la sortie de `Obshop` après une téléportation du launcher. **Vérifié** :
+  `dStage_changeSceneExitId` (025C38B8) note la salle de mer d'origine, l'id du bateau et la place
+  en entrant par le bateau de Beedle (+0x4A76..) ; la sortie (exit 0x3D) les exige, et le placement
+  en mer cherche ce bateau dans la salle. Entré par téléportation, rien n'est noté (0xFF). Aucune
+  valeur sûre à inventer : la téléportation vers `Obshop` / `Abship` est refusée (« ship »,
+  message du launcher), et ces stages ne sont jamais retenus ni repris comme dernière place.
+- **Voix** : journal 0.3.81, les voix partent et sont rejouées (`voiceStart`), mais placées à
+  `eyePos` du puppet. Déduit : cet `eyePos` peut être loin (pas encore calculé) ; il est remis près
+  de la tête avant chaque voix (journal de la distance). **Non vérifié en jeu.**
+- **Clés de couleur, HUD comme le jeu** : le bloc `L_DungeonKey_00` du jeu (`P_DungeonKeySh_00`,
+  `P_DungeonKey_00`, `T_NumKey_00`) est copié 44 unités au-dessus. Le nombre est dessiné par le jeu
+  lui-même dans sa police : retour de `lyt::TextBox::DrawSelf` (028785C8, arité lue dans le code
+  généré), nouvel appel avec notre nombre (TextBox +0xA4 texte, +0xCE longueur, +0xFC liste de
+  glyphes dont l'octet +6 à 0 force la reconstruction : offsets du runtime button_glyphs.cpp et du
+  code généré) puis tout est remis. L'icône est la texture du jeu (`wwhd_hud_game_pixels`), son
+  gris passé à la couleur du joueur, avec son ombre. L'icône maison `assets/color_key.png` est
+  retirée.
+- **Clé 3D à la couleur exacte** : seeds ≥ 0x80 de la recoloration des élites = couleur RVB exacte
+  (`el_target`, `ck_exact_rgb`), au lieu de la couleur de palette la plus proche.
+- **Son au ramassage** : `JA_SE_SPOILS_GET` 0x87B (butin, d_a_item.cpp) par `mDoAud_seStart_id`
+  025E1988.
+- **Coffres** : un coffre ouvert par un autre joueur (drapeau reçu par la synchro de sauvegarde)
+  ne se propose plus (`daTbox_c::boxCheck` 024B72C8 remplacé : non si `checkOpen` 024B4AB4) : plus
+  de petite clé en double.
+- **Portes à clé** : `dDoor_key2_c::keyInit` (0252B4A4 : switch, clé retirée, son) envoie « #DK »
+  avec la place du Link. Chez les autres de la même salle, la porte verrouillée la plus proche
+  (portes vues par les remplacements de `setEventPrm`) perd son cadenas sans clé dépensée, le Link
+  est placé à la place de l'ouvreur, puis l'événement de porte est demandé comme le fait le A de
+  Link (`fopAcM_orderDoorEvent` 025D7710 puis `changeWaitProc` 023E32AC, d_a_player_main_03.cpp).
+  En événement, mort ou en bateau : le cadenas seul est retiré. **Non testé en jeu.**
+Mod 0.3.82 compilé (341 fonctions, 132 hooks), installé instances 1 et 3 ; serveur et launcher
+compilés. **Rien testé en jeu.**
+
+## 0.3.83 : clé 3D peinte en entier, compteur indépendant, compte des portes pour tous
+
+- **Clé 3D** : la recoloration « teinte relative » des élites (EC_HUE : chaque couleur garde son
+  écart à la teinte principale) donnait du violet pour du jaune sur la clé (couleurs de matériau).
+  Nouveau mode `EC_ALL` (elite_color.h) pour les couleurs exactes (seed ≥ 0x80) : chaque texel et
+  chaque couleur de matériau (slots TEV/konst) prend la couleur du joueur à sa propre luminosité
+  (référence 0.7, reflets clairs un peu désaturés, noir gardé). `elite_color_test` passe.
+- **Compteur** : en 0.3.82 la copie dessinée par `TextBox::DrawSelf` montrait le même nombre que le
+  jeu (le jeu dessine ses listes plus tard depuis le même tampon de glyphes). Maintenant les chiffres
+  0-9 sont lus dans la police de `T_NumKey_00` (TextBox +0xB4) par `Font::GetGlyph` (vtable +0x8C,
+  comme story_notebook_game.cpp), découpés dans la planche décodée (`wwhd_hud_game_pixels`, champs
+  du glyphe de game_glyph.cpp read_glyph) et dessinés par le mod, deux chiffres, jaune et bord
+  sombre pour une police de couverture. Journal : format de la planche. Planche empaquetée (taille
+  logique ≠ physique) ou tranche > 0 : non gérée, repli sur le texte du mod. **Non testé en jeu.**
+- **Compte des portes** : affiché au-dessus de chaque porte verrouillée (4 au plus) dès qu'un joueur
+  de la salle, local ou non, est à moins de 5 m, pour tout le monde ; idem pour le compte des clés
+  de couleur de la porte du boss.
+Mod 0.3.83 compilé (344 fonctions, 131 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.84 : taille des chiffres du compteur de clés de couleur
+
+Journal 0.3.83 : la police du compteur est une planche de couverture BC4 (format 52), cellule de
+74 px ; les chiffres sont bien ceux du jeu mais dessinés à 62 % de la hauteur de la zone de texte,
+environ 60 % de ceux du jeu (capture). Hauteur portée à 100 % de la zone de texte, bord sombre
+épaissi (3 px). Mod 0.3.84 installé instances 1 et 3. **À confirmer en jeu.**
+
+## 0.3.85
+
+Contour des chiffres du compteur de clés de couleur ramené à 1 px (alpha 0.7) : à 3 px ils
+paraissaient gras (capture). Taille confirmée bonne en jeu (0.3.84).
+
+## 0.3.86 : chiffres du compteur rendus comme le jeu
+
+Capture 0.3.85 : chiffres encore gras, couleurs fausses. Cause déduite : la police du compteur
+(couverture BC4) porte déjà son bord ; le mod colorait toute la couverture en jaune et ajoutait
+son propre contour. Maintenant, comme une police à bord de NintendoWare : opacité = 2v, mélange
+bord -> couleur du texte = 2v - 1 (v la valeur du glyphe), couleur du texte en dégradé de la
+couleur du haut à celle du bas de la zone de texte (TextBox +0xAC / +0xB0, `mTextColors`, déduit
+de la disposition +0xA4 texte / +0xB4 police ; journalisé, repli jaune si nul). Couleurs cuites
+dans l'image, plus de contour ajouté. Journal : couleurs lues et répartition bord / remplissage du
+« 0 » pour confirmer. Couleur du bord : noir (couleur noire du matériau non lue). **À confirmer.**
+
+## 0.3.87 : couleur des chiffres, bloc abaissé
+
+Journal 0.3.86 : TextBox +0xAC / +0xB0 = FFFFFFFF (texte blanc) ; le « 0 » a 879 texels de bord et
+618 de remplissage : la police à bord est confirmée (rendu 2v / 2v-1 validé sur capture). Le jaune
+vient donc du matériau (TextBox +0xF8, exigé par DrawSelf) : ses 24 premiers mots sont journalisés
+pour trouver ses couleurs ; en attendant, dégradé échantillonné sur une capture (FFE65A -> F5B21E).
+Bloc relevé de 36 unités au lieu de 44. **À confirmer.**
+
+## 0.3.88 : contour brun des chiffres
+
+Journal 0.3.87, matériau de `T_NumKey_00` (TextBox +0xF8) : +0x00 = 0A020000, +0x04 = FFD817FF, nom
+« T_NumKey_00 » à +0x18. **Vérifié en mémoire** : couleurs noire (bord) et blanche (remplissage) du
+matériau. Le rendu mélange maintenant noir -> blanc selon la valeur v du glyphe (opacité 2v), comme
+l'interpolation du jeu : les valeurs moyennes du bord donnent le brun (~846D0B), le plein FFD817.
+Couleurs lues à chaque chargement (journalisées), repli sur les constantes. **À confirmer.**
+
+## 0.3.89
+
+Capture 0.3.88 : bord des chiffres pas assez brun / trop fin par rapport au jeu. Mélange noir ->
+blanc du matériau pris sur v² au lieu de v (valeurs moyennes du bord plus brunes). Ajustement à
+l'œil, **à confirmer**.
+
+## Dist du 22 octobre (mod 0.3.89), à la demande
+
+- Runtime : `build/rel` (ninja, à jour), `package.py --version v0.3.0-online` (Python embarqué
+  3.14.8 téléchargé, SHA-256 conforme à `toolchains.json` ; `template.bin` de la release
+  officielle copié puis retiré), `guard.py` OK (292 fichiers). `dist/WindWakerHD-v0.3.0-online-windows-x86_64.zip`.
+- **Le dossier installé `dist/WindWakerHD-v0.3.0-online-windows-x86_64`** (celui que les amis
+  copient, resté au runtime du 18 octobre en 0.3.61 : pseudos à 30 im/s, skins) : paquet recopié
+  par-dessus, `setup.py --yes --no-launch --skip-shader-prebuild --game-dir <dump EUR>` relancé
+  (6/6), `data/bin/wwhd.exe` du 22 octobre 18:33, contient `wwhd_net_connect` / `wwhd_hud_emit`.
+  `data/user` gardé. Mod 0.3.89 copié dans son `ModManager/Mods`. Préparation des shaders sautée :
+  shaders compilés au premier passage en jeu (saccades possibles la première fois).
+  Note : `Wind Waker HD.exe --console-setup` lancé depuis un outil rend la main et s'arrête :
+  lancer `tools/python/python.exe tools/installer/setup.py` directement.
+- `multiplayer-connection-0.3.89.wwhdmod` (remplace 0.3.61) ; `LISEZMOI.txt` mis à jour.
+- Launcher : sources recompilées `--release 17`, `stage` (JavaFX, JNA) avec les classes et
+  ressources à jour (launcher-dark.css, police Sherwood, images), jar 24 Mo ; `Resources/WWServer/
+  actorList.ktml` avec les enfants de Mercantîle. Lancé 12 s sans erreur.
+- Non testé en jeu depuis la dist.
+
+## 0.3.90 : clés de couleur gardées entre les stages, posées au sol ; animations des puppets ; bâtons (journal)
+
+- **Clés perdues en quittant le donjon ou en entrant chez le miniboss** (signalé par l'utilisateur).
+  **Vérifié** : `ck_step` effaçait toutes les clés quand `ck_active` passait à faux, et `ck_active`
+  exige `local_uid`, que `enter_area -> clear_area_state` (mod.c) remet à MP_NO_ID à chaque
+  changement de stage ; le serveur ne renvoie les clés qu'à la connexion (`WWClient.sendColorKeys`
+  dans `receiveInit`). **Corrigé** : les clés ne sont oubliées qu'à la fin de la connexion
+  (`state != READY`).
+- **Stages d'un même donjon** : les clés étaient comptées par nom de stage (0 dans la salle du
+  miniboss ou du boss, autres stages). **Vérifié** (décompilé `d_stage_3.cpp dStage_stagInfoInit`
+  025C1E44, `d_a_warpf.cpp`, `d_stage.h stage_stag_info_class` mProp +0x09) : table de sauvegarde
+  = (octet +9 >> 1) & 0x7F, partagée par les stages d'un donjon (petites clés, bits du donjon).
+  **Implémenté** : table de chaque stage apprise à son chargement, gardée dans
+  `color_key_tables.bin` (fichier du mod) ; deux stages sont du même donjon s'ils ont la même table
+  et qu'un stage de type donjon l'a eue. Compte, HUD et porte du boss l'utilisent. **Déduit, non
+  testé** : un stage hors donjon qui aurait la table d'un donjon compterait comme ce donjon.
+- **Clés lâchées invisibles / clé qui vole** : la clé était à la place de l'ennemi au moment de sa
+  suppression (+25). Maintenant posée au sol (`dBgS_ObjGndChk_Func` 024F1350, un `cXyz*`, hauteur
+  ou -1e9 : `d_bg_s_func.cpp`), sous Link s'il n'y a pas de sol ; une clé d'ennemi saute et tombe
+  avec gravité et deux rebonds (aussi chez les autres pour une clé reçue en direct). Les clés déjà
+  sur le serveur sont posées au sol à l'affichage (sol trouvé à moins de 400 sous leur place).
+  Journal « made this high over the ground ». Non testé en jeu.
+- **Animations des puppets**. **Vérifié** (décompilé) :
+  - relevé après la roulade contre un mur : `procFrontRollCrash_init` (0241B904) lance ANM_ROLLFMIS
+    à vitesse 0, `procFrontRollCrash` (0241BC90) met `mFrameCtrlUnder[0]` à 0.7 à l'atterrissage,
+    sans appel d'animation ;
+  - rampement : `procCrawlMove` (d_a_player_main_06.cpp) règle la vitesse à chaque pas (stick),
+    0 et une image à l'arrêt ;
+  - tornade : `procCutRoll` (02441DC0) tourne `m34EC` (+0x6934) de -0x36B0 par pas, ajouté à
+    shape_angle.y par `setWorldMatrix` (hors ModeFlg_CLIMB 0x10000), shape_angle.y seulement à la fin.
+  **Implémenté** : après l'execute du Link local, un changement de vitesse de l'animation du dernier
+  `setSingleMoveAnime` est envoyé comme un événement d'animation simple de plus (index + 0x100,
+  vitesse, image en start, image de boucle en end, morf 0 ; un ancien mod l'ignore : index hors
+  table ; le serveur relaie les animations simples telles quelles) ; le puppet prend la vitesse,
+  l'image à l'arrêt ou si l'écart dépasse 3 images (`anim_rate_check` / `anim_rate_apply`).
+  L'angle envoyé est shape_angle.y + m34EC (hors escalade) : le puppet tourne. Protocole inchangé ;
+  `mp_protocol_test` : `test_rate_event` ajouté, passe.
+- **Cœur et magie jaunes** : 0,5 % chacun (`BONUS_DROP_HEART/MAGIC` 5 pour mille ; launcher :
+  valeur par défaut et bouton DEFAULT).
+- **Bâtons** : journaux de la session du 22 octobre (instances 1 et 3) : chez celui qui regarde, la
+  copie est demandée, créée et placée dans la main du puppet (« carry: a copy in a puppet's hands »),
+  puis redemandée plus tard (la première a disparu) ; rien ne dit pourquoi. Journal ajouté
+  « weapon diag » (40 lignes au plus) : chaque seconde par copie, mode du bâton, bits de port, état
+  du slot, distance à la main droite du puppet et au Link local ; et la suppression d'une copie.
+Mod 0.3.90 compilé (347 fonctions, 131 hooks), installé instances 1 et 3. Launcher compilé (javac,
+dossier de contrôle). **Rien testé en jeu.** Le launcher lancé doit être reconstruit pour la valeur
+0,5 % ; le serveur n'est pas modifié.
+
+## 0.3.91 : bâtons portés visibles sur les puppets (cause trouvée)
+
+Journal 0.3.90 (instance 3, celle qui regarde) : la copie est créée, à 0 de la main droite du puppet,
+mais en mode 2 (ENEMY_CARRY), statut 00046100 (bit de port 0x2000), puis plus aucune ligne : le
+slot a été libéré. **Vérifié** (décompilé) : quand Link prend un bâton, c'est son code qui met le
+bâton en mode PLAYER_CARRY (`d_a_player_main_02.cpp`, `setNowMode(Mode_PLAYER_CARRY_e)`) ; le code
+du bâton (`d_a_boko.cpp`), voyant le bit 0x2000 sans ce mode, passe en ENEMY_CARRY ; `as_boko_after`
+prenait alors la copie pour celle d'un ennemi et la libérait (`as_free`). **Corrigé** :
+- `as_apply_carry` : une copie de bâton portée met son mode à PLAYER_CARRY, comme Link (son code
+  tourne déjà avec le puppet du porteur comme joueur 0, `as_swap_in`) ;
+- `as_boko_after` : une copie portée par un autre joueur n'est plus jugée ; « le Link local a pris
+  la copie » exige `mActorKeepGrab` du Link local (`as_carried_by_local`).
+Déduit, non testé : avec PLAYER_CARRY, le dessin du bâton (`checkNoDraw`, `bokoPlayerNoDraw`) lit
+l'état du joueur local au moment du dessin ; la copie pourrait se cacher quand le Link local est
+caché (vue à la première personne).
+Mod 0.3.91 compilé (347 fonctions, 131 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.92 : compteur de morts (launcher), mutateur « vie partagée », passager sur le bateau d'un ami
+
+- **Compteur de morts** (`death_count.h`, serveur `WWClient.java`, launcher World Map). Une mort =
+  début de `dh_local_dead()` (fantôme ou mort du jeu sans fée en bouteille), comptée une fois.
+  Événements de salle : « #DN_<nom> » à chaque connexion (joueur listé à 0), « #DT_<nom> » à chaque
+  mort. Le serveur garde les comptes par nom (`User/Deaths.txt`), envoie « #DC_<compte>_<nom> »
+  (expéditeur 0) à tous à chaque changement et tous à celui qui se connecte ; non relayés comme
+  événements. players.txt : lignes « deaths=compte|nom » (tampon porté à 6144 octets). Launcher :
+  section DEATHS sous PLAYERS dans le panneau de gauche, icône `images/dead.png`, triés du plus
+  grand compte.
+- **Vie partagée** (`life_share.h`, mutateur serveur). Drapeau : entrée d'init « #shared_life=1 »
+  et un octet de plus dans SERVER_MUTATORS après le PvP (`mp_read_mutators_life` ; un mod plus
+  ancien refuse ce paquet plus long, changement à chaud seulement). Commande console « mutators »
+  à 7 mots, propriété `ww.sharedLife`, réglage `sharedLife`. Launcher : carte SHARED LIFE (heart.jpg).
+  Le serveur garde la vie (quarts de cœur) et les cœurs jaunes : « #HD_<Δvie>_<Δjaunes>_<vie>_<jaunes>_<max> »
+  ajoute (le premier fixe), bornes 0..max et 0..20 ; « #HR_<vie>_<jaunes>_<max> » la fixe quand
+  elle est à 0 (retour après la mort) ; réponse « #HS_<vie>_<jaunes> » à tous. Côté jeu : vie
+  observée = vie de la sauvegarde + vie en attente (`mItemLifeCount` play + 0x5B44, vérifié dans
+  bonus.h / death.h), jaunes = `bonus_hearts` ; la vie reçue est donnée par la vie en attente
+  (le compteur l'applique, comme le réveil de death.h). Rien n'est compté entre deux zones ni mort.
+  À 0, chaque Link meurt (mort du jeu, pas de survivant). Le mutateur coupé oublie la vie.
+  **Déduit, non testé** : un écart bref si deux coups arrivent pendant l'aller-retour serveur.
+- **Passager** (`ship_ride.h`). Près (3,2 m) du bateau d'un autre joueur qui est dessus
+  (MP_SHIP_RIDING de son bloc bateau), debout, en marche ou à la nage (procs 0x35-0x37,
+  d_a_player_main_03.h) : « A: board <nom>'s boat ». A : le Link est tenu à
+  matrice du bateau × {0, 15, 45} (le pilote à l_ship_offset {0, 15, -35}, 10034F84, vérifié),
+  cap du bateau, comme un Link porté (carry.h : copies l_debug_keep_* et ModeFlg_CAUGHT,
+  procWait_init à l'embarquement). A de nouveau : saut (procAutoJump_init). Descente automatique si
+  le propriétaire quitte le bateau, bateau absent, événement, mort, changement de zone. Les autres :
+  « #SB_<uid du propriétaire> » (répété toutes les 2 s) et « #SL » ; chaque jeu pose le puppet du
+  passager sur sa copie du bateau (chez le propriétaire : son propre bateau). `ship_puppet.h` :
+  l'avance d'un bateau puppet est faite une fois par pas (`ship_slot_sync`, numéro du pas) au lieu
+  des drapeaux ship_ahead / link_ahead (un seul cavalier). **Déduit, non testé** : le Link tenu
+  au-dessus de l'eau peut passer en nage ou en chute (procs du jeu) ; à vérifier en jeu.
+- `mp_protocol_test` : test de l'octet de vie partagée ajouté, passe.
+Mod 0.3.92 compilé (352 fonctions, 131 hooks), installé instances 1 et 3. Serveur et launcher
+compilés (javac, dossier de contrôle, avec mmb et MMBServerCommon). **Rien testé en jeu.** Le
+serveur et le launcher lancés doivent être reconstruits.
+
+## Launcher : image de DYNAMIC SCALING
+
+La carte DYNAMIC SCALING prend `images/scalling.png` (fournie par l'utilisateur, copiée de
+`src/resources/images` dans `src/main/resources/images`) au lieu de heart.jpg. Compilé (javac).
+
+## 0.3.93 : bâton dans la main du puppet (cause du modèle), passager assis à côté du pilote
+
+- **Bâtons** : journal 0.3.92 (instance 3) : copie en mode 3, à 0 de la main droite du puppet,
+  état synchronisé, portée : bien placée, rien de vu. **Vérifié** (décompilé) : portée, la copie
+  prend sa place de la matrice de son modèle (`daBoko_c::procCarry` 020C3480) ; cette matrice est
+  écrite par `daPy_lk_c::setItemModel` (02403C24, d_a_player_main_04.cpp) depuis la main GAUCHE
+  quand `mActorKeepEquip.mActor` (+0x6594, mID +0x6590) est le bâton et `mEquipItem` 0x101.
+  Le puppet reçoit bien 0x101 de son joueur mais `puppet_apply_item` le remplaçait par « rien »
+  (pas de modèle à faire) : le modèle de la copie restait là où elle avait été créée.
+  **Corrigé** (`puppet.h`) : 0x101 gardé ; à chaque pas le puppet tient dans `mActorKeepEquip`
+  la copie du bâton de son joueur (`as_boko_copy_of`), et son `setItemModel` la place. Avant tout
+  changement d'objet, `mActorKeepEquip` est vidé : `deleteEquipItem` (023DC7AC) supprime l'acteur
+  tenu si l'objet n'est pas un bâton. Place de la copie pour le mod (`as_carried_place`) : main
+  gauche. Journal « a stick in a puppet's hand (setItemModel) ».
+- **Passager assis** : comme `dProcShipSit_init` (02425E98, cinématique : Link assis sur son
+  bateau) : proc DEMO_SHIP_SIT 0xD7 (`commonProcInit`) et ANM_KOSHIKAKE 0xDC, sans appeler la
+  fonction (elle marque le bateau du joueur local). `dProcShipSit` (02425FD8, un argument : code
+  généré, r3 seul) remplacé : ne fait rien pour le passager. Place : à côté du pilote
+  {48, 15, -35} (pilote {0, 15, -35}). L'animation passe par anim_sync : les puppets s'assoient
+  aussi. Si un proc du jeu reprend la main, le passager est rassis.
+  **Déduit, non testé** : la hauteur de l'assise (y 15) et le côté sont à ajuster en jeu.
+Mod 0.3.93 compilé (353 fonctions, 132 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.94 : passager, caméra, tourné à droite, B pour sauter
+
+- **Caméra partie sur un autre bateau à l'embarquement** (signalé). **Vérifié** : la caméra bateau
+  (`d_camera_mode.cpp` mCamTypeBoat, puis `rideCamera` 0250D4E8 qui suit le premier bateau trouvé
+  par nom de process) est choisie d'après l'état du joueur 0 : status0 0x1000000 | SHIP_RIDE 0x10000
+  (play + 0x5CD8), status1 0x80 (+0x5CDC ; rideCamera lit aussi 2 et 4). **Non trouvé** : ce qui
+  pose ces bits pour le passager. **Implémenté (défensif)** : effacés à chaque pas, avant et après
+  l'execute du Link, tant qu'il est passager (il ne monte jamais son propre bateau à ce moment) ;
+  journal « player status0/1 at boarding » et « boat camera statuses cleared » pour trouver la
+  cause.
+- **Tourné de 90° à droite** (cap - 0x4000, comme `setShipRidePosUseItem`), assis à droite du pilote
+  {-48, 15, -35} (le bateau regarde +z, +x est sa gauche). Les puppets du passager aussi.
+- **B saute du bateau à tout moment** (mItemTrigger 0x02 : BTN_B, `checkSubjectEnd`) ; A ne fait
+  plus rien une fois assis. « B: jump off » affiché au-dessus du Link assis.
+Mod 0.3.94 compilé (353 fonctions, 132 hooks), installé instances 1 et 3. **Non testé en jeu.**
+
+## Launcher : scalling.png transparent ; 0.3.95 : passager de l'autre côté
+
+- `images/scalling.png` (836x810) : fond blanc rendu transparent comme link.png (remplissage depuis
+  les bords, tolérance 40, bande de 2 px), les deux copies (`src/resources`, `src/main/resources`)
+  remplacées, original dans le scratchpad (img_backup). Aperçu sur fond sombre vérifié.
+- Passager : vu en jeu (0.3.94) à gauche du pilote, tourné à droite ; demandé : à droite, tourné à
+  gauche. Inversé : {+48, 15, -35}, cap + 0x4000 (les côtés déduits des axes en 0.3.94 étaient
+  inversés). Mod 0.3.95 compilé, installé instances 1 et 3. **Non testé en jeu.**
+
+## Launcher : icône SHARED LIFE ; 0.3.96 : passager à droite, sans proc de cinématique
+
+- `images/sharedlife.png` (2266x1888) : heart.jpg au fond blanc rendu transparent (même méthode que
+  scalling.png), les deux copies de resources ; la carte SHARED LIFE l'utilise. heart.jpg inchangé.
+  Compilé (javac).
+- Journal 0.3.95 (instance 3, build de 23:45 chargé) : status0 et status1 à 0 à l'embarquement,
+  jamais effacés : la caméra « restée sur le bateau » n'est pas la caméra bateau. **Vérifié** : la
+  caméra ne lit pas le proc de Link. **Déduit, non testé** : le proc de cinématique DEMO_SHIP_SIT
+  (0xD7) en est la cause. Le passager reste maintenant dans procWait (`procWait_init`) ; ses appels
+  d'animation (setMoveAnime, setSingleMoveAnime) sont refusés tant qu'il est assis
+  (`sr_anim_locked`, anim_sync.h), sauf ANM_KOSHIKAKE ; un autre proc (stick, jeu) est ramené à
+  procWait.
+- Côté : vu en 0.3.95, +48 est la GAUCHE du bateau. Passager à -48 (droite), tourné de 90° à
+  gauche (cap + 0x4000). Mod 0.3.96 compilé, installé instances 1 et 3. **Non testé en jeu.**
+
+## 0.3.97 : passager assis dans procWait
+
+Testé 0.3.96 : **caméra correcte** (le proc de cinématique DEMO_SHIP_SIT 0xD7 en était bien la
+cause, confirmé par le test), mais Link debout. **Vérifié** : `procWait` (d_a_player_main_04b.cpp)
+appelle `setBlendMoveAnime` (023E14A0, d_a_player_main_02.cpp ; code généré : this et un float,
+rien rendu) à chaque pas, qui mélange lui-même attente et marche (contrôles d'images et poids des
+emplacements « under »), pas seulement par setMoveAnime. Remplacée : ne fait rien pour le passager
+assis. Mod 0.3.97 compilé (354 fonctions, 133 hooks), installé instances 1 et 3. **Non testé.**
+
+## 0.3.98 : passager toujours debout (0.3.97), indication B 2 s
+
+Testé 0.3.97 : Link toujours debout, aucun journal du proc. **Déduit** : si le jeu sort Link de
+procWait à chaque pas, `sr_before` le remettait par `procWait_init` SANS le blocage des animations
+(celle d'attente remise à chaque pas). Maintenant le retour à procWait se fait sous blocage, puis
+ANM_KOSHIKAKE est redonnée (`sr_sit`). Journal ajouté : 8 pas après l'embarquement, proc après
+l'execute, vitesse / image / fin de l'animation « under » et sa ressource, et chaque proc où le jeu
+emmène Link. « B: jump off » affiché 2 s après l'embarquement seulement. Mod 0.3.98 compilé (354
+fonctions, 133 hooks), installé instances 1 et 3. **Non testé.**
+
+## 0.3.99 : passager assis (testé), assise abaissée ; push
+
+Testé 0.3.98 par l'utilisateur : **le passager est assis**, caméra correcte. Assise un peu trop haute :
+y 15 -> 7 ({-48, 7, -35}). Mod 0.3.99 compilé, installé instances 1 et 3.
+Push de `ZeldaWWHDRecomp` (mod 0.3.77-0.3.99, ce fichier dans docs/multiplayer, mp_protocol_test).
+Laissés de côté comme avant : les caches `.gradle` et `tools/skin/*` (skins tirés des fichiers du jeu).
+`WindWakerServer` (serveur, launcher : morts, vie partagée, images, 0,5 %) n'est dans aucun dépôt :
+non poussé.
